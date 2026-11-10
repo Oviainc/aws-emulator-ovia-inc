@@ -60,6 +60,48 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// `resourceArn` label.
 pub const UNRECOGNIZED_RESOURCE_ARN: &str = "Unrecognized Agent Registry resource ARN: ";
 
+/// How this service states that the REGISTRY an identifier named is not there.
+///
+/// The ONE place this sentence is written, so no two operations of this service word the
+/// same error class differently. Its fixed text names the resource class and the kind of
+/// identifier the registry is addressed by, as a capitalised sentence ending in a period;
+/// the one variable part is the identifier exactly as the request supplied it, since
+/// `RegistryIdentifier` admits either the bare id or the full ARN and the value that
+/// resolved to nothing is the value the caller sent.
+pub fn registry_not_found_message(registry_identifier: &str) -> String {
+    format!("Registry with ARN {registry_identifier} not found.")
+}
+
+/// How this service states that the REGISTRY RECORD an identifier named is not there, in
+/// the same form as [`registry_not_found_message`] and for the same reason. Its one
+/// variable part is the record's ID — the sentence says so — which is what a
+/// `RecordIdentifier` carries whether it was given bare or as the record's ARN
+/// ([`identifier_to_id`]). It names the record alone: the registry that was searched is
+/// not part of this sentence, so the refusal carries no identifier of another resource.
+pub fn record_not_found_message(record_id: &str) -> String {
+    format!("Registry record with ID {record_id} not found.")
+}
+
+/// How this service states that a name a create asked for is already held by a live
+/// resource of the same class in the same scope: the class, the requested name in single
+/// quotes so a client can read it back out of the sentence, and the scope the name has to
+/// be unique within. The ONE place this sentence is written, for the same reason as the
+/// not-found sentences above.
+fn duplicate_name_message(resource: &str, name: &str, scope: &str) -> String {
+    format!("A {resource} with name '{name}' already exists in {scope}")
+}
+
+/// [`duplicate_name_message`] for a record, whose name is unique within its registry —
+/// named by the identifier the request addressed that registry by.
+pub fn duplicate_record_name_message(name: &str, registry_identifier: &str) -> String {
+    duplicate_name_message("record", name, &format!("registry {registry_identifier}"))
+}
+
+/// [`duplicate_name_message`] for a registry, whose name is unique within the account.
+pub fn duplicate_registry_name_message(name: &str) -> String {
+    duplicate_name_message("registry", name, "this account")
+}
+
 /// `ValidationExceptionReason`'s modelled default, which the member carries for a request
 /// refused because one of its fields did not satisfy a requirement. The whole catalogue is
 /// `crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`.
@@ -608,15 +650,13 @@ fn is_record_id(id: &str) -> bool {
 }
 
 impl TaggableResource {
-    /// How this service states that the resource an ARN named is not there, in the wording
-    /// it states that error class in: a registry by the identifier the request supplied, a
-    /// record by its id, both as one sentence ending in a period.
+    /// How this service states that the resource an ARN named is not there: the same two
+    /// sentences every other operation of this service states that error class in — a
+    /// registry by the identifier the request supplied (here its ARN), a record by its id.
     pub fn not_found_message(&self, resource_arn: &str) -> String {
         match self {
-            Self::Registry { .. } => format!("Registry with ARN {resource_arn} not found."),
-            Self::Record { record_id, .. } => {
-                format!("Registry record with ID {record_id} not found.")
-            }
+            Self::Registry { .. } => registry_not_found_message(resource_arn),
+            Self::Record { record_id, .. } => record_not_found_message(record_id),
         }
     }
 }

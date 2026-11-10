@@ -204,16 +204,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let registry_id = crate::state::identifier_to_id(&input.registry_id);
         let record_id = crate::state::identifier_to_id(&input.record_id);
-        let record = state
-            .registries
-            .get(registry_id)
-            .and_then(|registry| registry.records.get(record_id));
-        let Some(record) = record else {
+        let Some(registry) = state.registries.get(registry_id) else {
+            // The identifier is stated back exactly as the request supplied it: the label
+            // admits the bare id or the full ARN, and the one that resolved to nothing is
+            // the one the caller sent.
             return Err(GetRegistryRecordErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "record {record_id} was not found in registry {registry_id}"
+                    message: Some(crate::state::registry_not_found_message(
+                        &input.registry_id,
                     )),
+                },
+            )
+            .into());
+        };
+        let Some(record) = registry.records.get(record_id) else {
+            return Err(GetRegistryRecordErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::record_not_found_message(record_id)),
                 },
             )
             .into());

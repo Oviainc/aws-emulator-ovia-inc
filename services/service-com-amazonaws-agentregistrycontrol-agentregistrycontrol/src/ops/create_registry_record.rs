@@ -203,7 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(registry) = state.registries.get(&registry_id) else {
                 return Err(CreateRegistryRecordErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("registry {registry_id} was not found")),
+                        message: Some(crate::state::registry_not_found_message(
+                            &input.registry_id,
+                        )),
                     },
                 )
                 .into());
@@ -284,9 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(CreateRegistryRecordErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(format!(
-                            "a record named {} already exists in registry {registry_id}",
-                            input.name
+                        message: Some(crate::state::duplicate_record_name_message(
+                            &input.name,
+                            &input.registry_id,
                         )),
                     },
                 )

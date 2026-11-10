@@ -189,9 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // one that resolved to nothing is the one the caller sent.
             return Err(GetRegistryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Registry with ARN {} not found.",
-                        input.registry_id
+                    message: Some(crate::state::registry_not_found_message(
+                        &input.registry_id,
                     )),
                 },
             )

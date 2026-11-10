@@ -181,7 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 SubmitRegistryRecordForApprovalErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("registry {registry_id} was not found")),
+                        message: Some(crate::state::registry_not_found_message(
+                            &input.registry_id,
+                        )),
                     },
                 )
                 .into(),
@@ -191,9 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 SubmitRegistryRecordForApprovalErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "record {record_id} was not found in registry {registry_id}"
-                        )),
+                        message: Some(crate::state::record_not_found_message(&record_id)),
                     },
                 )
                 .into(),

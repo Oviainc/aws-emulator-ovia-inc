@@ -241,10 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot take a name a live registry already holds.
         if state.registry_name_index.contains_key(&input.name) {
             return Err(CreateRegistryErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "a registry named {} already exists in this account",
-                    input.name
-                )),
+                message: Some(crate::state::duplicate_registry_name_message(&input.name)),
             })
             .into());
         }

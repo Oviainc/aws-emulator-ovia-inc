@@ -157,19 +157,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
         let record_id = crate::state::identifier_to_id(&input.record_id).to_string();
-        let removed = state
-            .registries
-            .get_mut(&registry_id)
-            .and_then(|registry| registry.records.remove(&record_id));
+        let removed = {
+            // The parent is resolved first, so a request that names no registry at all is
+            // told that, rather than being told its record is missing from a registry that
+            // is not there either.
+            let Some(registry) = state.registries.get_mut(&registry_id) else {
+                return Err(DeleteRegistryRecordErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::registry_not_found_message(
+                            &input.registry_id,
+                        )),
+                    },
+                )
+                .into());
+            };
+            registry.records.remove(&record_id)
+        };
 
         // A record that is not there cannot be deleted: an unknown record is the
         // modelled 404, not a silent success.
         let Some(removed) = removed else {
             return Err(DeleteRegistryRecordErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "record {record_id} was not found in registry {registry_id}"
-                    )),
+                    message: Some(crate::state::record_not_found_message(&record_id)),
                 },
             )
             .into());
