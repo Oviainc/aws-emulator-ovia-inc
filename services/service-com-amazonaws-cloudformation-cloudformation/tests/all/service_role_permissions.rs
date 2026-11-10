@@ -38,7 +38,7 @@ use crate::update_rollback_recovery::{
 /// The trust policy a stack's service role must carry: CloudFormation has to be able to
 /// assume it at all before its permissions decide anything
 /// (`state::role_trust_refusal`).
-fn trusts_cloudformation() -> String {
+pub(crate) fn trusts_cloudformation() -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -52,7 +52,11 @@ fn trusts_cloudformation() -> String {
 
 /// A role trusting CloudFormation and carrying `statements` as its one inline permissions
 /// policy, answered with the ARN IAM persisted for it.
-async fn service_role(router: &MultiServiceRouter, name: &str, statements: Value) -> String {
+pub(crate) async fn service_role(
+    router: &MultiServiceRouter,
+    name: &str,
+    statements: Value,
+) -> String {
     let (http_status, created) = iam(
         router,
         "CreateRole",
@@ -73,7 +77,11 @@ async fn service_role(router: &MultiServiceRouter, name: &str, statements: Value
 }
 
 /// Install (or replace) the inline permissions policy of `name`.
-async fn put_role_policy(router: &MultiServiceRouter, name: &str, statements: Value) {
+pub(crate) async fn put_role_policy(
+    router: &MultiServiceRouter,
+    name: &str,
+    statements: Value,
+) {
     let document = json!({"Version": "2012-10-17", "Statement": statements}).to_string();
     let (http_status, body) = iam(
         router,
@@ -93,7 +101,7 @@ async fn put_role_policy(router: &MultiServiceRouter, name: &str, statements: Va
 
 /// Everything the role is allowed, which every row grants: the deny rows are about what one
 /// statement takes back out of it.
-fn allows_everything() -> Value {
+pub(crate) fn allows_everything() -> Value {
     json!([{"Effect": "Allow", "Action": "*", "Resource": "*"}])
 }
 

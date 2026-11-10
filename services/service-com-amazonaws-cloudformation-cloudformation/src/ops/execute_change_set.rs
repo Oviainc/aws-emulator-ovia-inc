@@ -595,7 +595,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack.capabilities = capabilities;
             stack.tags = tags;
             stack.notification_arns = notification_arns;
-            stack.role_arn = role_arn;
+            // "CloudFormation uses this role for all future operations on the stack … If you
+            // don't specify a value, CloudFormation uses the role that was previously
+            // associated with the stack": a change set that named no `RoleARN` states nothing
+            // about the stack's service role, so the one already associated with the stack
+            // stays associated with it and is what this execution acts as — the same reading
+            // `UpdateStack` gives its own member.
+            stack.role_arn = role_arn.or_else(|| stack.role_arn.clone());
             // The same role, kept for the deployment below: it is what the calls this
             // execution makes in the services that own the stack's resources are made
             // under ([`crate::state::service_role`]).
