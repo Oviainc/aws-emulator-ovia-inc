@@ -473,4 +473,9 @@ mod client_certificates;
 // `$util` methods this emulator still resolves nothing for.
 #[path = "all/stage_template_url_conversions.rs"]
 mod stage_template_url_conversions;
+// Appended for the reason the note above gives: the QUOTA a usage plan enforces at a
+// deployed stage — the budget of requests each of its API keys may send in a metering
+// period, and the `QUOTA_EXCEEDED` refusal every request past it earns.
+#[path = "all/usage_plan_quota_enforcement.rs"]
+mod usage_plan_quota_enforcement;
 
