@@ -151,9 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this request was signed for.
         let region = crate::state::request_region(ctx.parts());
 
-        // PURE READ: this operation "Retrieves the specified cloudwatch alarm
-        // template group", so it changes nothing a later caller would see.
-        let state = state.lock();
+        // Reporting only: this operation "Retrieves the specified cloudwatch
+        // alarm template group", so it writes none of it. `settle` first, as
+        // every operation of this service does: it materialises only the
+        // transitions the clock had already made due, so it never changes what
+        // a later caller would otherwise have seen.
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
         let group = state
             .alarm_template_group(&region, &input.identifier)
             .ok_or_else(not_found)?;

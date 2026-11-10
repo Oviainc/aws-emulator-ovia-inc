@@ -233,6 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does: the
+        // transitions that were already due at this instant were owed whether
+        // or not this update ran, so the resolution and the write below see the
+        // store a reader would.
+        state.settle(now);
 
         // The identifier resolution, the group resolution, the name-uniqueness
         // rule and the partial write are one step in the store, so nothing can

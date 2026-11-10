@@ -162,9 +162,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         // Reporting only, and not even the one write the channel readers make:
         // the catalogue holds what the service published to this account and no
-        // request path writes it, so this guard is only ever read through. An
+        // request path writes it, so the versions below are only ever read.
+        // `settle` first all the same, as every operation of this service does:
+        // it materialises only the transitions the clock had already made due,
+        // so it never changes what a later caller would otherwise have seen. An
         // account with no published version reports none.
-        let state = state.lock();
+        let mut state = state.lock();
+        state.settle(now);
         Ok(ListVersionsOutput {
             versions: Some(state.channel_engine_versions.available_at(now)),
         })

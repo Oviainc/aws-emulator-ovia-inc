@@ -28,7 +28,12 @@ visible with the code rather than only in a review:
   `unsafe_code = "forbid"` lint. The native component is a third-party dependency, and it
   is the same engine this workspace already links through `vendor/emulator-telemetry`,
   which depends on `rusqlite` with the same `bundled` feature — so this introduces no new
-  native library to the emulator process, only a second user of one already linked.
+  native library to the emulator process, only a second user of one already linked. The
+  two components the engine crate adds to `Cargo.lock` beside it — `sqlite-wasm-rs`, a
+  `cc`-built SQLite for the browser, and the `rsqlite-vfs` filesystem shim it uses —
+  belong to its `wasm32` targets: `cargo tree -i sqlite-wasm-rs` (and `-i rsqlite-vfs`)
+  finds no dependant on this host at all and reaches them only under `--target all`, so
+  neither is built or linked here.
 * **What bounds it.** Caller-supplied SQL reaches the engine only through
   `Database::open`, which installs, BEFORE any request is served: a default-deny
   authorizer (every host-reaching action — `ATTACH`/`DETACH`, `VACUUM INTO`, `PRAGMA`,

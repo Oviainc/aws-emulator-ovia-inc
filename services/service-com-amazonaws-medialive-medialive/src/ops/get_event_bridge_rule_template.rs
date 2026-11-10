@@ -157,9 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
         let region = crate::state::request_region(ctx.parts());
 
-        // "Retrieves the specified eventbridge rule template" — a pure read:
-        // nothing here writes, so what a later caller sees is unchanged.
-        let state = state.lock();
+        // "Retrieves the specified eventbridge rule template" — reporting only:
+        // nothing here writes the template. `settle` first, as every operation
+        // of this service does: it materialises only the transitions the clock
+        // had already made due, so it never changes what a later caller would
+        // otherwise have seen.
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
         let template = state
             .event_bridge_rule_template(&region, &input.identifier)
             .ok_or_else(not_found)?;

@@ -169,10 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => crate::state::template_scope::ALL,
         };
 
-        // A pure read: a group has no status and no transient state, so the clock
-        // owes this listing nothing to materialise, and what a later caller sees
-        // is unchanged by this call.
-        let state = state.lock();
+        // Reporting only: a group carries no clock-owed member of its own, so
+        // nothing here writes one. `settle` first all the same, as every
+        // operation of this service does: it materialises only the transitions
+        // the clock had already made due — the signal map deployments this
+        // listing's own filter is derived from included — so it never changes
+        // what a later caller would otherwise have seen.
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
 
         // A signal map identifier narrows the listing to the groups THAT map is
         // associated with: a signal map records the cloudwatch alarm template

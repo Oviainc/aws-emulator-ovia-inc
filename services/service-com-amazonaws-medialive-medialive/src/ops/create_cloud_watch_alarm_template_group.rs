@@ -173,6 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does: the
+        // transitions that were already due at this instant were owed whether
+        // or not this create ran, so the token lookup and the mint below see
+        // the store a reader would.
+        state.settle(now);
 
         // A retried create (same `@idempotencyToken` `RequestId`) must return the
         // group the first one created, not a second group.

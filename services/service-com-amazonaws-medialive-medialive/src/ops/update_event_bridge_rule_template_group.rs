@@ -167,6 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does: the
+        // transitions that were already due at this instant were owed whether
+        // or not this update ran, so the resolution and the write below see the
+        // store a reader would.
+        state.settle(now);
 
         // "Updates the specified eventbridge rule template group": this call
         // MUTATES the stored group — every member the request supplies replaces
