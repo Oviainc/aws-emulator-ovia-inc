@@ -25,6 +25,8 @@ mod list_service_network_service_associations;
 mod listener_conflict_deletion_and_error_shape;
 #[path = "all/listeners.rs"]
 mod listeners;
+#[path = "all/minted_id_alphabet.rs"]
+mod minted_id_alphabet;
 #[path = "all/referential_integrity_conflict_messages.rs"]
 mod referential_integrity_conflict_messages;
 #[path = "all/resource_not_found_messages.rs"]

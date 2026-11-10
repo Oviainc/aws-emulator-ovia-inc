@@ -61,6 +61,13 @@ pub const PREFIX_RESOURCE_CONFIGURATION: &str = "rcfg-";
 /// Every modelled id of this service is its prefix plus 17 `[0-9a-z]` characters.
 const ID_SUFFIX_LEN: usize = 17;
 
+/// The first character of a minted id's suffix, which is fixed: see [`mint_id`].
+const ID_LEADING_CHARACTER: char = '0';
+
+/// How many drawn characters follow [`ID_LEADING_CHARACTER`] in a minted id's suffix: the
+/// 16 hex digits of a 64-bit value.
+const ID_ENTROPY_LEN: usize = ID_SUFFIX_LEN - 1;
+
 /// A resource kind of this service, and the spellings the wire needs of it.
 ///
 /// One kind is spelled THREE different ways on the wire and they are not
@@ -363,12 +370,10 @@ pub const UNSUPPORTED_STATUS_CODE_MESSAGE: &str = "Provided status code is not s
 /// status; nothing sleeps for it — the due instant is stored and compared on read.
 pub const CREATE_TRANSITION: Duration = Duration::from_millis(500);
 
-/// The lowercase base-36 alphabet the modelled id patterns allow (`[0-9a-z]`).
-const BASE36_LOWER: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 /// The uppercase base-36 alphabet a Route 53 hosted-zone id is drawn from (`[0-9A-Z]`).
 const BASE36_UPPER: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-/// The lowercase hex alphabet a rule's and a target group's id suffix is drawn from
-/// (`[0-9a-f]`); see [`id_alphabet`].
+/// The lowercase hex alphabet every minted resource id's suffix is drawn from
+/// (`[0-9a-f]`); see [`mint_id`].
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
 /// A service network: the logical boundary services and VPCs associate with.
@@ -1505,27 +1510,26 @@ pub fn rule_arn(region: &str, service_id: &str, listener_id: &str, rule_id: &str
     )
 }
 
-/// Mint a fresh resource id: `prefix` plus 17 characters of that kind's own alphabet
-/// ([`id_alphabet`]), which is inside the `[0-9a-z]` every modelled id pattern allows.
+/// Mint a fresh resource id: `prefix` plus the 17-character suffix every id of this
+/// service wears — the fixed leading [`ID_LEADING_CHARACTER`] and then
+/// [`ID_ENTROPY_LEN`] characters of the LOWERCASE HEX alphabet ([`HEX_LOWER`]) — whatever
+/// the kind.
+///
+/// SOURCE: recorded AWS behaviour. Every modelled id pattern of this service admits the
+/// wider `[0-9a-z]` (`^svc-[0-9a-z]{17}$`, `^listener-[0-9a-z]{17}$`, …), so neither the
+/// restriction to `[0-9a-f]` nor the leading character is modelled; every recorded id of
+/// every kind — service network, service, association, listener, rule, target group —
+/// renders a 64-bit value as 16 hex digits behind that one fixed character, the same
+/// shape the EC2-family ids wear, and that form satisfies each modelled pattern and
+/// length. The suffix also travels into every value that embeds an id: the resource ARNs
+/// ([`arn_for`], [`listener_arn`], [`rule_arn`]), an error's `resourceId`, and the
+/// generated DNS name ([`service_domain_name`]), so minting it here is the one place that
+/// form is decided.
 pub fn mint_id(prefix: &str) -> String {
     format!(
-        "{prefix}{}",
-        encode_in(fresh_entropy(), ID_SUFFIX_LEN, id_alphabet(prefix))
+        "{prefix}{ID_LEADING_CHARACTER}{}",
+        encode_in(fresh_entropy(), ID_ENTROPY_LEN, HEX_LOWER)
     )
-}
-
-/// The alphabet the 17-character suffix of an id of `prefix`'s kind is drawn from.
-///
-/// A RULE and a TARGET GROUP are minted from lowercase hex; every other kind from base
-/// 36. Both sit inside the `[0-9a-z]` the modelled id patterns allow, so which of the two
-/// a kind uses is RECORDED AWS behaviour rather than a modelled requirement: a recorded
-/// rule id and target-group id carry only `[0-9a-f]`, while a recorded service, listener
-/// and association id carry the wider set.
-fn id_alphabet(prefix: &str) -> &'static [u8] {
-    match prefix {
-        PREFIX_RULE | PREFIX_TARGET_GROUP => HEX_LOWER,
-        _ => BASE36_LOWER,
-    }
 }
 
 /// Mint the Route 53 hosted-zone id of a service's DNS entry: `Z` plus 19 `[0-9A-Z]`

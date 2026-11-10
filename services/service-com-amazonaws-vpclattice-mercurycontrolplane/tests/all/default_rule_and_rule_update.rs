@@ -43,8 +43,8 @@
 //!    including a rule updated through the wrong listener or the wrong service — and an
 //!    action outside the documented fixed-response catalog is a 400.
 //! 7. A RULE's and a TARGET GROUP's minted id draws its 17-character suffix from
-//!    lowercase hex, while a service's and a listener's draws from the wider `[0-9a-z]`
-//!    every modelled id pattern allows.
+//!    lowercase hex, as every minted id of this service does (`minted_id_alphabet.rs`
+//!    asserts that over every kind).
 
 use crate::batch_update_rule::instant_of;
 use crate::list_rules::{default_rule_id, items_of, list_page};
@@ -948,12 +948,11 @@ async fn a_refused_update_carries_the_modelled_error() {
     );
 }
 
-/// Rule 7: which alphabet a minted id's 17-character suffix is drawn from, per kind.
+/// Rule 7: which alphabet a minted id's 17-character suffix is drawn from.
 ///
-/// A rule's and a target group's suffix is lowercase hex; a service's and a listener's is
-/// the wider `[0-9a-z]` every modelled id pattern allows, so the narrower set is NOT
-/// asserted for them. The rows span the kinds and, for a rule, several mints of one
-/// listener plus the default rule the create materialised.
+/// A rule's and a target group's suffix is lowercase hex, and so is the suffix of the
+/// service and the listener they hang off. The rows span the kinds and, for a rule,
+/// several mints of one listener plus the default rule the create materialised.
 #[tokio::test]
 async fn a_rule_and_a_target_groups_minted_id_is_hex() {
     /// Whether `id`'s suffix after `prefix` is 17 lowercase-hex characters.
@@ -1021,8 +1020,8 @@ async fn a_rule_and_a_target_groups_minted_id_is_hex() {
         );
     }
 
-    // The service's and the listener's own ids keep the wider modelled set, so the
-    // narrower alphabet belongs to the two kinds above rather than to every id.
+    // The service's and the listener's own ids are minted from the same alphabet, and
+    // satisfy the wider modelled pattern as well.
     for (case, id, prefix) in [
         ("the service", service_id.clone(), state::PREFIX_SERVICE),
         ("the listener", listener_id.clone(), state::PREFIX_LISTENER),
@@ -1030,6 +1029,10 @@ async fn a_rule_and_a_target_groups_minted_id_is_hex() {
         assert!(
             is_lattice_id(&id, prefix),
             "case {case}: expected a modelled {prefix} id, got {id:?}"
+        );
+        assert!(
+            is_hex_id(&id, prefix),
+            "case {case}: expected {prefix} plus 17 lowercase-hex characters, got {id:?}"
         );
     }
 }
