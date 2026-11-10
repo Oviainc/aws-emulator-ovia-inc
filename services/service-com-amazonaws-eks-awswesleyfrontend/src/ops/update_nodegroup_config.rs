@@ -390,11 +390,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let min_size = scaling.min_size.unwrap_or(DEFAULT_SCALING_MIN_SIZE);
             let max_size = scaling.max_size.unwrap_or(DEFAULT_SCALING_MAX_SIZE);
             let desired_size = scaling.desired_size.unwrap_or(DEFAULT_SCALING_DESIRED_SIZE);
-            if min_size > max_size || desired_size < min_size || desired_size > max_size {
-                return Err(invalid_parameter(format!(
-                    "scalingConfig must satisfy minSize <= desiredSize <= maxSize, got minSize \
-                     {min_size}, desiredSize {desired_size}, maxSize {max_size}"
-                )));
+            // The refusal names the bound the desired size falls outside of, and the
+            // capacities it was asked for, the way Amazon EKS words each relation
+            // ([`state::scaling_capacity_violation`]).
+            if let Some(why) = state::scaling_capacity_violation(min_size, max_size, desired_size) {
+                return Err(invalid_parameter(why));
             }
         }
 

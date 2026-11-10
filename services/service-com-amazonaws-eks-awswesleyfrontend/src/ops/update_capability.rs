@@ -97,8 +97,9 @@
 use super::types::*;
 use crate::state::{
     self, PendingCapabilityUpdate, UpdateRecord, UpdateScope, CAPABILITY_ACTIVATION_DELAY,
+    CAPABILITY_CONFIGURATION_MISMATCH_MESSAGE, CAPABILITY_ROLE_PRINCIPALS,
     CAPABILITY_STATUSES_AN_UPDATE_STARTS_FROM, CAPABILITY_STATUS_UPDATING, CAPABILITY_TYPE_ACK,
-    CAPABILITY_TYPE_ARGOCD, EKS_SERVICE_PRINCIPAL, STATUS_ACTIVE, UPDATE_IN_PROGRESS,
+    CAPABILITY_TYPE_ARGOCD, STATUS_ACTIVE, UPDATE_IN_PROGRESS,
     UPDATE_PARAM_DISABLED_SERVICES, UPDATE_PARAM_ENABLE_CROSS_NAMESPACE,
     UPDATE_PARAM_NETWORK_ACCESS, UPDATE_PARAM_ROLE_ARN,
     UPDATE_PARAM_ROLE_MAPPINGS_TO_ADD_OR_UPDATE, UPDATE_PARAM_ROLE_MAPPINGS_TO_REMOVE,
@@ -271,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 &region,
                 role_arn,
-                EKS_SERVICE_PRINCIPAL,
+                CAPABILITY_ROLE_PRINCIPALS,
             )
             .await
             {
@@ -287,19 +288,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // type is the STORED one — a capability's type is fixed when it is created and
         // this operation does not change it.
         if let Some(configuration) = input.configuration.as_ref() {
-            for (member, owning_type, supplied) in [
-                (
-                    "argoCd",
-                    CAPABILITY_TYPE_ARGOCD,
-                    configuration.argo_cd.is_some(),
-                ),
-                ("ack", CAPABILITY_TYPE_ACK, configuration.ack.is_some()),
+            for (owning_type, supplied) in [
+                (CAPABILITY_TYPE_ARGOCD, configuration.argo_cd.is_some()),
+                (CAPABILITY_TYPE_ACK, configuration.ack.is_some()),
             ] {
                 if supplied && capability_type != owning_type {
-                    return Err(invalid_parameter(format!(
-                        "configuration.{member} applies only to a capability of type \
-                         {owning_type}, not to type {capability_type}"
-                    )));
+                    return Err(invalid_parameter(
+                        CAPABILITY_CONFIGURATION_MISMATCH_MESSAGE.to_string(),
+                    ));
                 }
             }
         }

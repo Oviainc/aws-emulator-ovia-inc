@@ -494,8 +494,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DescribeCertificateAuthority` reads and `CreateCertificateAuthority`
         // counts against the cluster's two-CA ceiling — and the cluster's
         // `certificateAuthority.data` is that record's `data`, not a second copy.
-        let initial_authority =
-            CertificateAuthorityRecord::initial_for_cluster(&arn, &resource_id, now);
+        //
+        // A cluster is reachable only through the certificate its clients verify it
+        // by, so material that does not issue is reported rather than provisioning a
+        // control plane nothing could trust. Nothing is written at this point.
+        let initial_authority = CertificateAuthorityRecord::initial_for_cluster(&arn, now)
+            .ok_or_else(|| {
+                CreateClusterError::from(CreateClusterErrorModeled::ServerException(
+                    ServerException {
+                        cluster_name: Some(input.name.clone()),
+                        message: Some(
+                            "the cluster certificate authority's certificate could not be issued"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    },
+                ))
+            })?;
 
         let record = ClusterRecord {
             name: input.name.clone(),

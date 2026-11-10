@@ -189,13 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => Err(
                 DescribeCertificateAuthorityErrorModeled::ResourceNotFoundException(
-                    // The certificate authority is the resource reported missing, so
-                    // the payload names no cluster: see
+                    // The certificate-authority plane is what answered that it holds
+                    // no such certificate authority, and a refusal this service
+                    // carries through from another is reported WRAPPED, naming that
+                    // service, the status it answered, the id of the call and how many
+                    // attempts were made: see
+                    // [`crate::state::certificate_authority_not_found`]. The payload
+                    // names no cluster — see
                     // [`crate::state::child_resource_not_found`].
-                    crate::state::child_resource_not_found(format!(
-                        "No certificate authority found with id: {} for cluster: {}.",
-                        input.certificate_authority_id, input.cluster_name
-                    )),
+                    crate::state::certificate_authority_not_found(),
                 )
                 .into(),
             ),

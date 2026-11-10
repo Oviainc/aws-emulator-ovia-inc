@@ -55,14 +55,26 @@ service-common = { path = "../common" }
 # whether a body parses as YAML at all. yaml-rust2 is the pure-Rust YAML 1.2
 # implementation the other services that read caller-supplied YAML already use.
 yaml-rust2 = { version = "0.10", default-features = false }
+# A cluster's `certificateAuthority.data` is "the Base64-encoded certificate data
+# required to communicate with your cluster", so this service issues a REAL
+# self-signed X.509 certificate for every certificate authority it provisions
+# (`src/state/certificate_material.rs`). rcgen is the generator this tree already
+# uses for certificate material.
+rcgen = "0.13"
+# The validity window rcgen stamps on that certificate is the one the certificate
+# authority record reports, so the two instants are converted from the record's
+# `SystemTime`s into the date-time type rcgen takes.
+time = { version = "0.3.55", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # The clock-owed `CREATING` -> `ACTIVE` test waits with `tokio::time::sleep`, so
 # this target declares tokio's `time` feature rather than inheriting it
-# transitively from another crate's feature set. Nothing else is added here: a
-# new dependency would mean a Cargo.lock entry, and this crate's fix must not
-# touch the one file every concurrent fix also edits.
+# transitively from another crate's feature set.
 tokio = { workspace = true, features = ["time"] }
+# The certificate-authority suite decodes what a cluster reports as its
+# `certificateAuthority.data` and reads the X.509 certificate inside it the way a
+# TLS client would, rather than matching on its text.
+x509-cert = "0.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

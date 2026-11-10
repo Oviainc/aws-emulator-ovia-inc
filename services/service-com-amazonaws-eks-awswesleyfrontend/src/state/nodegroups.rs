@@ -236,3 +236,34 @@ impl NodegroupRecord {
         }
     }
 }
+
+/// Why the capacities a `scalingConfig` change would leave the node group with
+/// are not ones it can scale between, or `None` when they are.
+///
+/// "The Cluster Autoscaler doesn't scale a managed node group lower than
+/// `minSize` or higher than `maxSize`" (`NodegroupScalingConfig$desiredSize`), so
+/// the desired size has to sit between the two bounds — and the refusal names the
+/// BOUND the desired size falls outside of, with the capacities themselves, the
+/// way Amazon EKS words each one. Each member's own lower bound is modelled and
+/// so already refused before a handler asks this.
+///
+/// The two relations are the whole rule: a `minSize` above `maxSize` leaves no
+/// desired size between them, so such a triple always falls outside one of the
+/// two bounds and is reported as that bound.
+pub fn scaling_capacity_violation(
+    min_size: i32,
+    max_size: i32,
+    desired_size: i32,
+) -> Option<String> {
+    if desired_size < min_size {
+        return Some(format!(
+            "Minimum capacity {min_size} can't be greater than desired size {desired_size}"
+        ));
+    }
+    if desired_size > max_size {
+        return Some(format!(
+            "Maximum capacity {max_size} can't be less than desired size {desired_size}"
+        ));
+    }
+    None
+}

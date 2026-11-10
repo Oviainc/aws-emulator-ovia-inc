@@ -169,27 +169,6 @@ pub fn derive_service_ipv6_cidr(resource_id: &str) -> String {
     format!("fd{}:{}:{}::/108", hextet(0..2), hextet(2..6), hextet(6..10))
 }
 
-/// A certificate authority's `data`, which a cluster also reports as its
-/// `certificateAuthority.data`.
-///
-/// A real cluster reports the base64 of the PEM bundle its API server is fronted
-/// by. This emulator runs no certificate authority, so rather than synthesise
-/// bytes that look like a certificate it stores an explicitly labelled
-/// placeholder: a caller that base64-decodes it reads, in plain text, that no CA
-/// exists here. It is written once at create time and read back unchanged.
-/// `subject` names what the certificate would have been issued for (a cluster id,
-/// a certificate authority id), so two certificate authorities never report the
-/// same blob.
-pub fn derive_certificate_authority_data(subject: &str) -> String {
-    let placeholder = format!(
-        "-----BEGIN CERTIFICATE-----\n\
-         EMULATOR PLACEHOLDER: this emulator runs no certificate authority, so this\n\
-         is not a usable certificate for {subject}.\n\
-         -----END CERTIFICATE-----\n"
-    );
-    ::aws_smithy_types::base64::encode(placeholder)
-}
-
 /// The node group's own identifier, the last segment of its `nodegroupArn`.
 ///
 /// An EKS node group ARN is

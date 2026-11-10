@@ -43,6 +43,27 @@ pub const CONNECTOR_SERVICE_PRINCIPAL: &str = "ssm.amazonaws.com";
 /// principal to assume it" (`CreateCapabilityRequest$roleArn`).
 pub const EKS_SERVICE_PRINCIPAL: &str = "eks.amazonaws.com";
 
+/// The service principal Amazon EKS assumes a managed CAPABILITY's role as.
+///
+/// A capability runs outside the cluster — "Amazon EKS provisions and manages the
+/// infrastructure required to run the capability outside of your cluster"
+/// (`CreateCapability`) — and the plane that runs it speaks for the cluster's
+/// capabilities rather than for the control plane, so it is its own service
+/// principal under the Amazon EKS domain.
+pub const CAPABILITY_SERVICE_PRINCIPAL: &str = "capabilities.eks.amazonaws.com";
+
+/// The service principals a role named for a managed capability may let assume
+/// it: the capability plane's own principal, and the Amazon EKS control plane's.
+///
+/// The model states the rule as one principal ("a trust policy that allows the
+/// EKS service principal to assume it", `CreateCapabilityRequest$roleArn`) and
+/// Amazon EKS publishes more than one principal under that one name, so a role
+/// whose trust policy admits ANY of them is a role Amazon EKS can assume for the
+/// capability; a `roleArn` refusal is reserved for a role that is absent or that
+/// admits none of them.
+pub const CAPABILITY_ROLE_PRINCIPALS: &[&str] =
+    &[CAPABILITY_SERVICE_PRINCIPAL, EKS_SERVICE_PRINCIPAL];
+
 /// The EC2 error code for a subnet id no subnet of the account carries.
 pub const EC2_INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
 

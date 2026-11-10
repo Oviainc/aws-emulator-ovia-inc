@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ctx,
             &region,
             &role_arn,
-            CONNECTOR_SERVICE_PRINCIPAL,
+            &[CONNECTOR_SERVICE_PRINCIPAL],
         )
         .await
         {

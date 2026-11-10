@@ -117,6 +117,49 @@ pub const UPDATE_PARAM_SIGNING_STATUS: &str = "SigningStatus";
 /// The closing instant is stored on the record; nothing sleeps for it.
 pub const CA_ROLLBACK_WINDOW: Duration = Duration::from_millis(750);
 
+/// The internal service that answers for a cluster's CERTIFICATE AUTHORITIES.
+///
+/// `DescribeCertificateAuthority` is served by that plane, so a certificate
+/// authority it cannot resolve is a refusal Amazon EKS carries through from it —
+/// reported WRAPPED, naming the service, the status it answered, the id of that
+/// call and how many attempts were made ([`wrapped_peer_tail`]).
+pub const CERTIFICATE_AUTHORITY_MANAGER: &str = "EksCertificateAuthority";
+
+/// The sentence behind that wrapped refusal: what the certificate-authority
+/// plane says about an id it does not hold.
+///
+/// Entirely fixed text, and it names NEITHER the certificate authority nor the
+/// cluster: both are the request's own `@httpLabel`s, so there is nothing about
+/// them the caller could not know.
+pub const CERTIFICATE_AUTHORITY_NOT_FOUND_DETAIL: &str = "certificate authority not found";
+
+/// The HTTP status that plane answers an unresolvable certificate authority
+/// with, which the wrapped tail reports.
+pub(super) const CERTIFICATE_AUTHORITY_NOT_FOUND_STATUS: u16 = 404;
+
+/// The `ResourceNotFoundException` a READ of a certificate authority the named
+/// cluster does not hold — one never appended, or one a deletion has taken out
+/// of the trust bundle — is refused with.
+///
+/// The request-id in the tail is drawn afresh per call, because that is what a
+/// request id IS: it identifies the call that was made, and nothing in the
+/// request decides it.
+///
+/// It is this operation's own refusal rather than the service's generic one:
+/// `ActivateCertificateAuthority` and `DeleteCertificateAuthority` each word the
+/// same absence as their own recordings show — the activation as the CA not
+/// being in the cluster's trusted list — so the three are not routed through one
+/// sentence.
+pub fn certificate_authority_not_found() -> ResourceNotFoundException {
+    child_resource_not_found(format!(
+        "{CERTIFICATE_AUTHORITY_NOT_FOUND_DETAIL}{}",
+        wrapped_peer_tail(
+            CERTIFICATE_AUTHORITY_MANAGER,
+            CERTIFICATE_AUTHORITY_NOT_FOUND_STATUS
+        )
+    ))
+}
+
 /// The id of the `seq`th certificate authority of the cluster `cluster_arn`
 /// identifies.
 ///
@@ -188,8 +231,14 @@ impl CertificateAuthorityRecord {
     /// signing (`IN_USE`) and already distributed (`COMPLETE`) when the cluster
     /// is created. Its `data` is the cluster's own `certificateAuthority.data`,
     /// so the two are one value rather than two copies.
-    pub fn initial_for_cluster(cluster_arn: &str, resource_id: &str, now: SystemTime) -> Self {
-        Self {
+    ///
+    /// `None` when the certificate material does not issue
+    /// ([`mint_certificate_authority_data`]): a cluster whose root of trust could
+    /// not be issued has no certificate authority to report, so the create says
+    /// so rather than seeding one with nothing in it.
+    pub fn initial_for_cluster(cluster_arn: &str, now: SystemTime) -> Option<Self> {
+        let not_after = now + CA_VALIDITY;
+        Some(Self {
             id: derive_certificate_authority_id(cluster_arn, 0),
             created_at: now,
             created_by: CA_BY_EKS.to_string(),
@@ -199,12 +248,12 @@ impl CertificateAuthorityRecord {
             distribution_status: CA_DISTRIBUTION_COMPLETE.to_string(),
             distribution_complete_at: None,
             not_before: now,
-            not_after: now + CA_VALIDITY,
+            not_after,
             rollback_available_until: None,
-            data: derive_certificate_authority_data(&format!("cluster id {resource_id}")),
+            data: mint_certificate_authority_data(now, not_after)?,
             client_request_token: None,
             update_id: None,
-        }
+        })
     }
 
     /// A successor CA appended to a cluster's trust bundle by the caller, so
@@ -216,18 +265,19 @@ impl CertificateAuthorityRecord {
     ///
     /// `seq` is how many CAs the cluster has ever had, so the id is distinct from
     /// every id that cluster has already used, and `update_id` names the update
-    /// that appends it.
+    /// that appends it. `None` for material that does not issue, the same answer
+    /// [`Self::initial_for_cluster`] gives.
     pub fn successor(
         cluster_arn: &str,
         seq: u64,
         now: SystemTime,
         client_request_token: Option<String>,
         update_id: String,
-    ) -> Self {
-        let id = derive_certificate_authority_id(cluster_arn, seq);
-        Self {
-            data: derive_certificate_authority_data(&format!("certificate authority {id}")),
-            id,
+    ) -> Option<Self> {
+        let not_after = now + CA_VALIDITY;
+        Some(Self {
+            data: mint_certificate_authority_data(now, not_after)?,
+            id: derive_certificate_authority_id(cluster_arn, seq),
             created_at: now,
             created_by: CA_BY_CUSTOMER.to_string(),
             activated_at: None,
@@ -236,11 +286,11 @@ impl CertificateAuthorityRecord {
             distribution_status: CA_DISTRIBUTION_IN_PROGRESS.to_string(),
             distribution_complete_at: Some(now + CA_DISTRIBUTION_DELAY),
             not_before: now,
-            not_after: now + CA_VALIDITY,
+            not_after,
             rollback_available_until: None,
             client_request_token,
             update_id: Some(update_id),
-        }
+        })
     }
 
     /// Materialise the distribution move the clock already owes at `now`.

@@ -335,7 +335,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // retry can match on: a blank token identifies nothing and is not kept.
             replayed_token.map(str::to_owned),
             update_id.clone(),
-        );
+        )
+        // A successor CA IS its public certificate — "appending a successor CA adds
+        // its public certificate to the cluster's trust bundle" — so material that
+        // does not issue is reported rather than appending a CA with nothing in it.
+        // Nothing has been written at this point, so the cluster is unchanged.
+        .ok_or_else(|| {
+            CreateCertificateAuthorityError::from(
+                CreateCertificateAuthorityErrorModeled::ServerException(ServerException {
+                    cluster_name: Some(cluster_name.clone()),
+                    message: Some(
+                        "the certificate authority's certificate could not be issued".to_string(),
+                    ),
+                    ..Default::default()
+                }),
+            )
+        })?;
         let update = authority.append_update_record(update_id.clone());
         let output = CreateCertificateAuthorityOutput {
             update: Some(update.to_update()),

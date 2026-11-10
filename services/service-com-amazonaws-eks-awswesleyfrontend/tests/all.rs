@@ -47,6 +47,8 @@ mod addon_versions;
 mod cancel_update;
 #[path = "all/capability_lifecycle.rs"]
 mod capability_lifecycle;
+#[path = "all/capability_request_refusals.rs"]
+mod capability_request_refusals;
 #[path = "all/capability_update.rs"]
 mod capability_update;
 #[path = "all/catalog_discovery.rs"]
@@ -59,8 +61,12 @@ mod certificate_authority_activation;
 mod certificate_authority_deletion;
 #[path = "all/certificate_authority_listing.rs"]
 mod certificate_authority_listing;
+#[path = "all/certificate_authority_material.rs"]
+mod certificate_authority_material;
 #[path = "all/certificate_authority_listing_order.rs"]
 mod certificate_authority_listing_order;
+#[path = "all/certificate_authority_read_refusal.rs"]
+mod certificate_authority_read_refusal;
 #[path = "all/certificate_authority_trust_list.rs"]
 mod certificate_authority_trust_list;
 #[path = "all/child_create_resolves_the_cluster_first.rs"]
@@ -117,6 +123,8 @@ mod list_pod_identity_associations;
 mod nodegroup_config_update;
 #[path = "all/nodegroup_lifecycle.rs"]
 mod nodegroup_lifecycle;
+#[path = "all/nodegroup_scaling_capacity_refusals.rs"]
+mod nodegroup_scaling_capacity_refusals;
 #[path = "all/not_found_payload.rs"]
 mod not_found_payload;
 #[path = "all/pass_role_authorization.rs"]

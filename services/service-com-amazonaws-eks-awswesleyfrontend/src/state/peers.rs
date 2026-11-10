@@ -31,10 +31,15 @@ pub(super) fn peer_endpoint(service: &str, region: &str) -> Option<String> {
     Some(format!("https://{service}.{region}.amazonaws.com"))
 }
 
-/// The refusal a role whose trust policy does not admit `principal` earns, or
-/// `None` when IAM holds the role and its trust policy lets `principal` assume
-/// it — and also when this emulator has no IAM to ask, because a refusal has to
-/// be grounded in what IAM answered rather than assumed from silence.
+/// The refusal a role whose trust policy admits NONE of `principals` earns, or
+/// `None` when IAM holds the role and its trust policy lets at least one of them
+/// assume it — and also when this emulator has no IAM to ask, because a refusal
+/// has to be grounded in what IAM answered rather than assumed from silence.
+///
+/// `principals` is every service principal AWS publishes for the purpose the
+/// role is named for, because one documented purpose can have more than one:
+/// admitting any of them makes the role usable, so a caller that followed any of
+/// AWS's own trust policies for that role is not refused.
 ///
 /// The trust document is read through the ONE evaluator every service that
 /// resolves a caller-supplied role shares
@@ -46,7 +51,7 @@ pub async fn service_principal_trust_violation(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     role_arn: &str,
-    principal: &str,
+    principals: &[&str],
 ) -> Option<String> {
     // Not an in-account role at all: `pass_role_refusal` is what reports that,
     // and it has already run by the time a handler asks this.
@@ -58,20 +63,22 @@ pub async fn service_principal_trust_violation(
     .await;
     match answer {
         Ok(output) => {
-            let trusted = output
+            let document = output
                 .role()
-                .and_then(::aws_sdk_iam::types::Role::assume_role_policy_document)
-                .is_some_and(|document| {
+                .and_then(::aws_sdk_iam::types::Role::assume_role_policy_document);
+            let trusted = document.is_some_and(|document| {
+                principals.iter().any(|principal| {
                     ::service_common::iam_trust_policy::admits_service_principal(
                         document, principal,
                     )
                     .unwrap_or(false)
-                });
-            (!trusted).then(|| trust_policy_refusal(role_arn, principal))
+                })
+            });
+            (!trusted).then(|| trust_policy_refusal(role_arn, principals))
         }
         // IAM says this account holds no such role: the refusal is grounded.
         Err(error) if iam_role_is_absent(&error) => {
-            Some(trust_policy_refusal(role_arn, principal))
+            Some(trust_policy_refusal(role_arn, principals))
         }
         // Any other answer is this emulator failing to ask, not IAM reporting a
         // bad role, so it refuses nothing — and it is worth a warning, because a
@@ -87,13 +94,38 @@ pub async fn service_principal_trust_violation(
     }
 }
 
-/// The message a role that IAM does not hold, or whose trust policy does not let
-/// `principal` assume it, is refused with: the two cases are one refusal,
+/// The message a role that IAM does not hold, or whose trust policy lets none of
+/// `principals` assume it, is refused with: the two cases are one refusal,
 /// because a caller cannot tell them apart without a role it may not be allowed
 /// to read, and it names the role at fault.
-pub(super) fn trust_policy_refusal(role_arn: &str, principal: &str) -> String {
-    let service = principal.split('.').next().unwrap_or(principal);
-    format!("Nonexistent role or missing {service} service principal in trust policy: {role_arn}")
+///
+/// It names the SERVICE those principals speak for rather than one principal of
+/// it: the principals a purpose publishes all belong to one service, and the
+/// caller's fix is to trust that service. A purpose with no principal at all is
+/// not one a role can be refused FOR, so that case names no service rather than
+/// leaving a gap in the sentence.
+pub(super) fn trust_policy_refusal(role_arn: &str, principals: &[&str]) -> String {
+    match principals.first() {
+        Some(principal) => format!(
+            "Nonexistent role or missing {} service principal in trust policy: {role_arn}",
+            principal_service_label(principal)
+        ),
+        None => {
+            format!("Nonexistent role or missing service principal in trust policy: {role_arn}")
+        }
+    }
+}
+
+/// The service a service principal speaks for.
+///
+/// A service principal is a host name under AWS's own domain whose last label
+/// before that domain is the service: both `eks.amazonaws.com` and the
+/// capability plane's `capabilities.eks.amazonaws.com` speak for `eks`.
+pub(super) fn principal_service_label(principal: &str) -> &str {
+    let host = principal
+        .strip_suffix(".amazonaws.com")
+        .unwrap_or(principal);
+    host.split('.').next_back().unwrap_or(host)
 }
 
 /// The internal service that answers for a cluster REGISTRATION.

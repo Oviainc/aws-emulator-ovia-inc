@@ -486,6 +486,30 @@ pub const CAPABILITY_TYPE_ARGOCD: &str = "ARGOCD";
 /// [`crate::service::off_enum_member_contract`]).
 pub const INVALID_CAPABILITY_TYPE_MESSAGE: &str = "Invalid capability type";
 
+/// The sentence `CreateCapability` refuses a `capabilityName` outside the
+/// documented form with.
+///
+/// FIXED TEXT in its entirety, and it states the whole rule the member carries:
+/// "The name must be unique within your cluster and can contain alphanumeric
+/// characters, hyphens, and underscores" (`CreateCapability$capabilityName`),
+/// plus the leading-character half the sentence itself names. The value is not
+/// echoed: the caller sent it, and what it has to act on is the form, not the
+/// value.
+pub const INVALID_CAPABILITY_NAME_MESSAGE: &str =
+    "Capability name must start with a letter or number and contain only letters, numbers, \
+     hyphens, and underscores";
+
+/// The sentence a `configuration` that belongs to another `CapabilityType` than
+/// the one the capability has is refused with.
+///
+/// FIXED TEXT in its entirety: "The structure of this object varies depending on
+/// the capability type" (`CapabilityConfigurationRequest`), so the fault is the
+/// PAIR — the type and the configuration — and both halves are in the request
+/// the caller already has. It is the same sentence whichever member of the
+/// configuration was the mismatched one, for a create and for an update alike.
+pub const CAPABILITY_CONFIGURATION_MISMATCH_MESSAGE: &str =
+    "Mismatch between capability type and configuration";
+
 /// How long a connected cluster has to apply its connector manifest before the
 /// registration lapses.
 ///
@@ -4369,10 +4393,16 @@ pub fn capability_arn(region: &str, cluster_name: &str, capability_name: &str) -
 /// The rule is the one the model states for the member: "A unique name for the
 /// capability. The name must be unique within your cluster and can contain
 /// alphanumeric characters, hyphens, and underscores"
-/// (`CreateCapability$capabilityName`). The shape carries no `@pattern`, so the
-/// boundary validator does not enforce it and the handler does.
+/// (`CreateCapability$capabilityName`), with the leading character an
+/// alphanumeric one — the half the refusal sentence states
+/// ([`INVALID_CAPABILITY_NAME_MESSAGE`]), and the same rule
+/// `CreateCluster$name`'s own `@pattern` carries for a cluster name. The shape
+/// carries no `@pattern`, so the boundary validator does not enforce it and the
+/// handler does.
 pub fn is_valid_capability_name(name: &str) -> bool {
-    !name.is_empty()
+    name.chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
         && name
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
@@ -4465,6 +4495,7 @@ macro_rules! callback_client {
 mod tests;
 mod addon_catalog;
 mod certificate_authority;
+mod certificate_material;
 mod cluster_creator_access;
 mod cluster_record;
 mod control_plane_logs;
@@ -4476,6 +4507,7 @@ mod peers;
 mod store;
 pub use addon_catalog::*;
 pub use certificate_authority::*;
+pub use certificate_material::*;
 pub use cluster_creator_access::*;
 pub use cluster_record::*;
 pub use control_plane_logs::*;

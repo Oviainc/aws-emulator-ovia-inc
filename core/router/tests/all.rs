@@ -768,6 +768,12 @@ mod eks_wrapped_peer_refusals;
 // reason their entries record: the appended tail at the end of this file and the `e…` span
 #[path = "all/eks_bootstrap_cluster_creator_access_entry.rs"]
 mod eks_bootstrap_cluster_creator_access_entry;
+// Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
+// reason their entries record: the appended tail at the end of this file and the `e…` span
+// beside the other `eks_*` suites are both regions every concurrently landing router suite
+// puts its line in.
+#[path = "all/eks_capability_role_trust.rs"]
+mod eks_capability_role_trust;
 // Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail at the end
 // of this file or beside the sibling `logs_emf_*` suite in it: both of those are where every
 // concurrently landing router suite puts its line.

@@ -141,8 +141,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, CapabilityRecord, CAPABILITY_ACTIVATION_DELAY, CAPABILITY_STATUS_CREATING,
-    CAPABILITY_TYPE_ACK, CAPABILITY_TYPE_ARGOCD, EKS_SERVICE_PRINCIPAL, STATUS_ACTIVE,
+    self, CapabilityRecord, CAPABILITY_ACTIVATION_DELAY, CAPABILITY_CONFIGURATION_MISMATCH_MESSAGE,
+    CAPABILITY_ROLE_PRINCIPALS, CAPABILITY_STATUS_CREATING, CAPABILITY_TYPE_ACK,
+    CAPABILITY_TYPE_ARGOCD, INVALID_CAPABILITY_NAME_MESSAGE, STATUS_ACTIVE,
 };
 use std::time::SystemTime;
 
@@ -376,13 +377,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cluster resolved, so the role it names can be resolved too: IAM holds the
         // role and its trust policy must let the Amazon EKS service principal assume it
         // ("This role must have a trust policy that allows the EKS service principal to
-        // assume it" — [`state::service_principal_trust_violation`]). It runs with no
-        // lock held: it is a call out to another service.
+        // assume it" — [`state::service_principal_trust_violation`]). A capability runs
+        // outside the cluster, and the plane that runs it has its own principal under
+        // that one name, so every principal Amazon EKS publishes for a capability role
+        // satisfies the rule ([`CAPABILITY_ROLE_PRINCIPALS`]). It runs with no lock
+        // held: it is a call out to another service.
         if let Some(why) = state::service_principal_trust_violation(
             ctx,
             &region,
             &input.role_arn,
-            EKS_SERVICE_PRINCIPAL,
+            CAPABILITY_ROLE_PRINCIPALS,
         )
         .await
         {
@@ -407,13 +411,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name must be unique within your cluster and can contain alphanumeric
         // characters, hyphens, and underscores." The shape carries no `@pattern`, so
-        // the charset half of that rule is not refused before this handler runs.
+        // the charset half of that rule is not refused before this handler runs, and
+        // the refusal is the one fixed sentence that states the whole rule
+        // ([`INVALID_CAPABILITY_NAME_MESSAGE`]).
         if !state::is_valid_capability_name(&input.capability_name) {
-            return Err(invalid_parameter(format!(
-                "capabilityName must be a non-empty string of alphanumeric characters, \
-                 hyphens and underscores, got {:?}",
-                input.capability_name
-            )));
+            return Err(invalid_parameter(
+                INVALID_CAPABILITY_NAME_MESSAGE.to_string(),
+            ));
         }
 
         // "The structure of this object varies depending on the capability type": each
@@ -421,20 +425,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // configuration the requested type has no use for is a bad parameter rather
         // than something to store and report back unused.
         if let Some(configuration) = input.configuration.as_ref() {
-            for (member, owning_type, supplied) in [
-                (
-                    "argoCd",
-                    CAPABILITY_TYPE_ARGOCD,
-                    configuration.argo_cd.is_some(),
-                ),
-                ("ack", CAPABILITY_TYPE_ACK, configuration.ack.is_some()),
+            for (owning_type, supplied) in [
+                (CAPABILITY_TYPE_ARGOCD, configuration.argo_cd.is_some()),
+                (CAPABILITY_TYPE_ACK, configuration.ack.is_some()),
             ] {
                 if supplied && input.r#type != owning_type {
-                    return Err(invalid_parameter(format!(
-                        "configuration.{member} applies only to a capability of type \
-                         {owning_type}, not to type {}",
-                        input.r#type
-                    )));
+                    return Err(invalid_parameter(
+                        CAPABILITY_CONFIGURATION_MISMATCH_MESSAGE.to_string(),
+                    ));
                 }
             }
         }
