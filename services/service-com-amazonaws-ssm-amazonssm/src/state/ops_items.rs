@@ -2,10 +2,10 @@
 
 //! The OpsItems OpsCenter holds, and the rules a create of one is held to.
 //!
-//! An OpsItem is "an operational work item" OpsCenter tracks. `CreateOpsItem` mints one
-//! and `GetOpsItem` reports it, both through the one store below ([`OpsItemRecord`]), so
-//! whatever a create persisted is what a later read reports: nothing in a response is
-//! invented at read time.
+//! An OpsItem is "an operational work item" OpsCenter tracks. `CreateOpsItem` mints one,
+//! `UpdateOpsItem` edits it and `GetOpsItem` reports it, all through the one store below
+//! ([`OpsItemRecord`]), so whatever the last write persisted is what a later read reports:
+//! nothing in a response is invented at read time.
 //!
 //! An OpsItem is identified by a server-minted id of the modelled `OpsItemId` form
 //! (`^(oi)-[0-9a-f]{12}$`, [`mint_ops_item_id`]) and is reached through the endpoint of
@@ -98,6 +98,16 @@ pub const DEDUP_STRING_MEMBER: &str = "dedupString";
 /// key's own 1..128 length is MODELLED, so the boundary walk already refuses it.
 pub const MAX_OPERATIONAL_DATA_VALUE: usize = 20 * 1024;
 
+/// How many operational-data keys ONE OpsItem holds at most.
+///
+/// Emulator resource guard, NOT a published quota: nothing in the model bounds the
+/// `OpsItemOperationalData` map, and an OpsItem can be edited without end with every edit
+/// free to add keys to it, so without this bound one OpsItem's map would grow without end
+/// over a caller-chosen key space. It is enforced by the ONE rule both writes of an OpsItem
+/// hold their map against ([`operational_data_rejection`]), so it holds however a caller
+/// reached the store, and the refusal says the bound is the emulator's own.
+pub const MAX_OPERATIONAL_DATA_KEYS: usize = 100;
+
 /// The `OpsItemDataType` values the model's enum declares, and so the types an
 /// operational-data value may name.
 pub const OPS_ITEM_DATA_TYPE_SEARCHABLE_STRING: &str = "SearchableString";
@@ -180,7 +190,12 @@ pub fn source_rejection(source: &str) -> Option<ParameterRejection> {
 /// Two documented rules, in the order a caller hits them: a key may not begin with one of
 /// the reserved prefixes unless it is a key the service itself defines, and a value is at
 /// most 20 KB. The key's own length and the value's own pattern are modelled, so the
-/// boundary walk has already refused anything outside them.
+/// boundary walk has already refused anything outside them. Beside them is the emulator's
+/// own bound on how many keys one map holds ([`MAX_OPERATIONAL_DATA_KEYS`]).
+///
+/// This is the one rule a write of an OpsItem holds its operational data against, so a
+/// create and an edit admit exactly the same maps — an edit is held against the map it
+/// would leave behind, not against the keys it names.
 ///
 /// A key is held against the reserved prefixes case-insensitively, so no casing of a
 /// reserved prefix slips through, but the exemption is EXACT: a key is admitted only when
@@ -189,6 +204,16 @@ pub fn source_rejection(source: &str) -> Option<ParameterRejection> {
 pub fn operational_data_rejection(
     operational_data: &BTreeMap<String, OpsItemDataValue>,
 ) -> Option<ParameterRejection> {
+    if operational_data.len() > MAX_OPERATIONAL_DATA_KEYS {
+        return Some(ParameterRejection::new(
+            "OperationalData",
+            format!(
+                "This emulator holds at most {MAX_OPERATIONAL_DATA_KEYS} operational data keys \
+                 per OpsItem, and this one would hold {}",
+                operational_data.len()
+            ),
+        ));
+    }
     for (key, value) in operational_data {
         let folded = key.to_ascii_lowercase();
         let reserved = RESERVED_OPERATIONAL_DATA_PREFIXES
@@ -261,6 +286,33 @@ pub fn category_rejection(category: &str) -> Option<ParameterRejection> {
             ),
         )
     })
+}
+
+/// The `OperationalData` map an edit of an OpsItem leaves behind.
+///
+/// An edit "adds new keys or edits existing key-value pairs of the OperationalData map"
+/// (`UpdateOpsItem`'s `OperationalData` doc) and removes the keys `to_delete` names
+/// (`OperationalDataToDelete`: "keys that you want to remove from the OperationalData
+/// map"), so the result is a PATCH of what the OpsItem already holds rather than a
+/// replacement of it: a key neither side names keeps the value the OpsItem holds for it.
+///
+/// Removals are applied before additions, so a key an edit both deletes and supplies a
+/// value for is left carrying that value — the edit named it as data to hold. Deleting a
+/// key the map does not hold leaves it absent, so one edit replayed twice leaves the one
+/// map.
+pub fn merged_operational_data(
+    current: &BTreeMap<String, OpsItemDataValue>,
+    additions: &BTreeMap<String, OpsItemDataValue>,
+    to_delete: &[String],
+) -> BTreeMap<String, OpsItemDataValue> {
+    let mut merged = current.clone();
+    for key in to_delete {
+        merged.remove(key);
+    }
+    for (key, value) in additions {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
 }
 
 /// The dedup string `operational_data` carries, or `None` when it carries none.

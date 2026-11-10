@@ -59,7 +59,10 @@ async fn create(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
 }
 
 /// `CreateOpsItem`, asserting it succeeded, and returning its response.
-async fn create_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
+///
+/// Part of this suite's OpsItem harness, which `all/ops_item_updates.rs` reaches an
+/// OpsItem through rather than opening one its own way.
+pub(crate) async fn create_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
     let (status, response) = create(router, body).await;
     assert_eq!(
         status, 200,
@@ -69,7 +72,7 @@ async fn create_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Val
 }
 
 /// `GetOpsItem`'s `OpsItem`, asserting the read succeeded.
-async fn get_ok(router: &MultiServiceRouter, case: &str, ops_item_id: &str) -> Value {
+pub(crate) async fn get_ok(router: &MultiServiceRouter, case: &str, ops_item_id: &str) -> Value {
     let (status, response) = call(
         router,
         "GetOpsItem",
@@ -85,7 +88,7 @@ async fn get_ok(router: &MultiServiceRouter, case: &str, ops_item_id: &str) -> V
 
 /// A body carrying only `CreateOpsItem`'s three required members, with `title` as the
 /// title and the source and description derived from it.
-fn minimal(title: &str) -> Value {
+pub(crate) fn minimal(title: &str) -> Value {
     json!({
         "Title": title,
         "Description": format!("what {title} is about"),
@@ -102,7 +105,7 @@ fn is_ops_item_id(id: &str) -> bool {
 }
 
 /// The ARN the service must mint for the OpsItem `id` names in `region`.
-fn ops_item_arn(region: &str, id: &str) -> String {
+pub(crate) fn ops_item_arn(region: &str, id: &str) -> String {
     format!("arn:aws:ssm:{region}:{ACCOUNT}:opsitem/{id}")
 }
 

@@ -195,11 +195,9 @@ impl ComAmazonawsSsmAmazonssmState {
     /// at most [`MAX_EVENTS_PER_OPS_ITEM`] events and the store at most
     /// [`MAX_OPS_ITEM_EVENTS`], the oldest dropped first.
     ///
-    /// No handler of this crate reaches it yet, and that is not dead code: opening an
-    /// OpsItem records no event, and the write that does record one — an EDIT of an
-    /// OpsItem — is `UpdateOpsItem`, which still answers 501 under its own stub issue. The
-    /// trail is therefore empty until that write lands, and this is the path it appends
-    /// through.
+    /// Opening an OpsItem records no event, so the write that appends through here is an
+    /// EDIT of an OpsItem (`UpdateOpsItem`): a trail holds one entry per edit, and the
+    /// trail of an OpsItem nothing has edited yet is empty.
     pub fn record_ops_item_event(
         &mut self,
         region: &str,

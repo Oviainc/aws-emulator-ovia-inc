@@ -43,6 +43,8 @@ mod managed_node_information;
 mod ops_item_events;
 #[path = "all/ops_item_related_items.rs"]
 mod ops_item_related_items;
+#[path = "all/ops_item_updates.rs"]
+mod ops_item_updates;
 #[path = "all/ops_items.rs"]
 mod ops_items;
 #[path = "all/parameter_deletion.rs"]
