@@ -4,10 +4,8 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
-
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -17,8 +15,8 @@ mod app_block_builder;
 mod app_blocks;
 #[path = "all/associated_fleets.rs"]
 mod associated_fleets;
-#[path = "all/images.rs"]
-mod images;
+#[path = "all/associated_stacks.rs"]
+mod associated_stacks;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 #[path = "all/resource_tags.rs"]
@@ -39,3 +37,5 @@ mod usage_report_subscription;
 mod user_pool;
 #[path = "all/user_stack_associations.rs"]
 mod user_stack_associations;
+#[path = "all/images.rs"]
+mod images;

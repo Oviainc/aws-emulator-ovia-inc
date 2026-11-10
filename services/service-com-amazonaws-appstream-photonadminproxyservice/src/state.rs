@@ -6,8 +6,9 @@
 //! `UpdateStack` applies the members it is given to the stored record and clears the
 //! fields its `AttributesToDelete` names, `DescribeStacks`/`DescribeFleets` render the
 //! stored record back, `AssociateFleet` records the fleet/stack edge,
-//! `ListAssociatedFleets` reports the edges a stack has, and `DeleteStack`/`DeleteFleet`
-//! refuse while an edge still names the resource.
+//! `ListAssociatedFleets` reports the edges a stack has, `ListAssociatedStacks` reports
+//! the edges a fleet has, and `DeleteStack`/`DeleteFleet` refuse while an edge still
+//! names the resource.
 //!
 //! A stack's custom branding lives here as well: `CreateThemeForStack` writes one
 //! [`ThemeRecord`] under the stack it brands, `UpdateThemeForStack` applies the members
@@ -1139,6 +1140,18 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
             .iter()
             .filter(|(_, stack)| stack == stack_name)
             .map(|(fleet, _)| fleet.clone())
+            .collect()
+    }
+
+    /// The stacks associated with the named fleet, in the stable order a page of
+    /// `ListAssociatedStacks` walks. The mirror image of [`Self::fleets_for_stack`]: both
+    /// read the one stored edge set, so neither read can report an edge the other does
+    /// not.
+    pub fn stacks_for_fleet(&self, fleet_name: &str) -> BTreeSet<String> {
+        self.fleet_stack_associations
+            .iter()
+            .filter(|(fleet, _)| fleet == fleet_name)
+            .map(|(_, stack)| stack.clone())
             .collect()
     }
 
