@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetInstanceProtection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetInstanceProtection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetInstanceProtection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the scale-in protection of instances the named group holds, so the flag the
+//! group's own reader reports for each of them (`DescribeAutoScalingGroups`) is what
+//! this call wrote, and a scale-in leaves a protected instance in place.
+//!
+//! The instance ids are resolved AGAINST THAT GROUP: the ids this call accepts are
+//! exactly the ids the group reports, so an id of another group, or of no group at
+//! all, is refused and nothing is written. The request is one unit of work, so every
+//! id is checked before the first flag moves.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetInstanceProtection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetInstanceProtectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetInstanceProtection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SetInstanceProtectionErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let requested = input.instance_ids;
+        let protected = input.protected_from_scale_in;
+
+        // The operation's own documented bound on how many instances ONE call may
+        // name, which the model does not express as a length, so it is checked here
+        // rather than at the boundary — ahead of the group lookup, like the other
+        // per-call bound this service enforces.
+        if requested.len() > crate::state::MAX_INSTANCE_IDS_PER_CALL {
+            return Err(SetInstanceProtectionErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(crate::state::too_many_instance_ids_message()),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // A name no group answers to is refused with the wording this service's
+        // group-scoped WRITE paths answer with: the detail field after the dash is
+        // left unfilled, so no part of the request appears in the message.
+        let Some(group) = state.groups.get_mut(&name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+            ));
+        };
+
+        // Checked for EVERY named instance before any flag is written: one id this
+        // group does not hold refuses the whole call and leaves the protection of the
+        // instances it does hold exactly as it was.
+        let foreign: Vec<String> = requested
+            .iter()
+            .filter(|instance_id| {
+                !group
+                    .instances
+                    .iter()
+                    .any(|instance| instance.instance_id == **instance_id)
+            })
+            .cloned()
+            .collect();
+        if !foreign.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::instances_not_in_group_message(&foreign),
+            ));
+        }
+
+        for instance in group
+            .instances
+            .iter_mut()
+            .filter(|instance| requested.contains(&instance.instance_id))
+        {
+            instance.protected_from_scale_in = protected;
+        }
+
+        crate::state::audit(
+            ctx.parts(),
+            "SetInstanceProtection",
+            &name,
+            if protected {
+                "instances protected from scale in"
+            } else {
+                "instance scale-in protection removed"
+            },
+        );
+        Ok(SetInstanceProtectionOutput {})
     }
 }

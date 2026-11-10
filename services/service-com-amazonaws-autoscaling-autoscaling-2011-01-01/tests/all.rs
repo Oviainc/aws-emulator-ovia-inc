@@ -25,6 +25,8 @@ mod client_error_refusal_wording;
 mod error_envelope;
 #[path = "all/instance_refresh_lifecycle.rs"]
 mod instance_refresh_lifecycle;
+#[path = "all/instance_scale_in_protection.rs"]
+mod instance_scale_in_protection;
 #[path = "all/launch_configurations_are_unavailable.rs"]
 mod launch_configurations_are_unavailable;
 #[path = "all/launch_template_instance_profiles.rs"]

@@ -1848,6 +1848,40 @@ pub fn too_many_target_groups_message() -> String {
     )
 }
 
+/// The most instance IDs ONE `SetInstanceProtection` call may name.
+///
+/// From the model's own documentation for `SetInstanceProtection`: "If you exceed
+/// your maximum limit of instance IDs, which is 50 per Auto Scaling group, the call
+/// fails." The member carries no modelled length, so the bound is the service's own
+/// and is checked by the handler, which answers the operation's modelled
+/// `LimitExceededFault` past it.
+pub const MAX_INSTANCE_IDS_PER_CALL: usize = 50;
+
+/// The message a call naming more instance IDs than [`MAX_INSTANCE_IDS_PER_CALL`] is
+/// refused with, which quotes the bound the caller has to come back under.
+///
+/// Same shape as [`too_many_target_groups_message`]: this service reports a per-call
+/// bound by naming the resource the request named too many of and the limit itself.
+pub fn too_many_instance_ids_message() -> String {
+    format!("Trying to update too many Instances at once. The limit is {MAX_INSTANCE_IDS_PER_CALL}")
+}
+
+/// The message an instance-scoped update that names an instance the group does not
+/// hold is refused with, which names those instances.
+///
+/// Same shape as [`unattached_target_groups_message`], the refusal this service
+/// answers when a request names a resource of the same group-scoped kind that the
+/// group does not hold: the refusal is for the request as a WHOLE, so a call that
+/// mixes instances of the group with one that is not in it updates none of them, and
+/// the message says what was wrong with the request rather than reporting a partial
+/// result. The variable part is the instance ids the request named, in request order.
+pub fn instances_not_in_group_message(instance_ids: &[String]) -> String {
+    format!(
+        "Trying to update Instances that are not part of the group: {}",
+        instance_ids.join(", ")
+    )
+}
+
 /// The absent-group refusal whose detail QUOTES the name it was asked for.
 pub fn absent_group_message_quoting_name(name: &str) -> String {
     format!("{ABSENT_GROUP_PREFIX}AutoScalingGroup '{name}' not found")
