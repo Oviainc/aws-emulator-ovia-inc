@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let not_found = || {
             ListGroupsForMemberErrorModeled::ResourceNotFoundException(
-                crate::state::member_not_found(&input.directory_id, &input.sam_account_name),
+                crate::state::member_not_found(&input.directory_id),
             )
         };
         let Some(directory) = store.directories.get(&input.directory_id) else {

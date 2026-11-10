@@ -13,13 +13,16 @@
 //! every one of its operations answers a directory the caller cannot reach by refusing the
 //! call rather than by reporting anything about the directory.
 //!
-//! Three more facts of a directory are the control plane's alone, and the data plane's
+//! Four more facts of a directory are the control plane's alone, and the data plane's
 //! answers rest on them:
 //!
 //! * whether that plane has turned the directory's DATA API on, and from WHEN, which is
 //!   what decides whether the data plane may answer for it at all;
 //! * the directory's own DOMAIN NAME, which is the realm every object of it is reported in
 //!   and the suffix its principal and distinguished names are built on;
+//! * the directory's NetBIOS SHORT NAME, which names the organizational unit a managed
+//!   directory delegates to the account, and so the container the objects the data plane
+//!   creates are placed in;
 //! * whether an account's PASSWORD has been set, which is what makes a domain account
 //!   usable: an account the data plane creates has no password — its create carries none —
 //!   so the directory leaves it inactive until the control plane's password reset sets one.
@@ -127,6 +130,9 @@ struct DirectoryRecord {
     /// The fully qualified domain name the directory was created with, as the control
     /// plane's create named it. Empty for a directory registered without one.
     domain_name: String,
+    /// The NetBIOS (short) name the directory was created with, as the control plane's
+    /// create named it. Empty for a directory registered without one.
+    short_name: String,
     /// The directory's accounts the data plane created, keyed by the account name folded
     /// to lower case — a directory account name is case insensitive.
     accounts: BTreeMap<String, AccountRecord>,
@@ -180,18 +186,26 @@ impl AdDirectoryInventory {
         }
     }
 
-    /// [`Self::register`], with the DOMAIN the directory was created in: the `Name` the
+    /// [`Self::register`], with the two NAMES the directory was created with: the `Name` the
     /// control plane's create was called with, which the data plane reports as the realm of
-    /// every object inside it.
+    /// every object inside it, and the NetBIOS `ShortName` of the same create, which names
+    /// the organizational unit the directory delegates to the account. `None` for a create
+    /// that recorded no short name.
     ///
-    /// Idempotent in the same way: a re-registration leaves the domain, the toggle and the
+    /// Idempotent in the same way: a re-registration leaves the names, the toggle and the
     /// accounts as they stand.
-    pub fn register_in_domain(&mut self, directory_id: &str, domain_name: &str) {
+    pub fn register_in_domain(
+        &mut self,
+        directory_id: &str,
+        domain_name: &str,
+        short_name: Option<&str>,
+    ) {
         let fresh = !self.held.contains_key(directory_id);
         self.register(directory_id);
         if fresh {
             if let Some(record) = self.held.get_mut(directory_id) {
                 record.domain_name = domain_name.trim().to_string();
+                record.short_name = short_name.unwrap_or_default().trim().to_string();
             }
         }
     }
@@ -220,6 +234,16 @@ impl AdDirectoryInventory {
             .get(directory_id)
             .map(|record| record.domain_name.as_str())
             .filter(|domain_name| !domain_name.is_empty())
+    }
+
+    /// The NetBIOS short name `directory_id` was created with, or `None` for an id the
+    /// inventory holds nothing for and for one registered without a short name.
+    #[must_use]
+    pub fn short_name(&self, directory_id: &str) -> Option<&str> {
+        self.held
+            .get(directory_id)
+            .map(|record| record.short_name.as_str())
+            .filter(|short_name| !short_name.is_empty())
     }
 
     /// Record the control plane's ENABLE of the directory's data API: it is in service from
@@ -392,6 +416,12 @@ mod tests {
         format!("corp{rank}.example.com")
     }
 
+    /// The NetBIOS short name a directory of that rank was created with: a NetBIOS name is
+    /// written in upper case and is not a label of the domain name.
+    fn short_name(rank: usize) -> String {
+        format!("CORP{rank}")
+    }
+
     /// The span a control-plane toggle takes to fall due in these cases.
     const SETTLES_IN: Duration = Duration::from_millis(500);
 
@@ -445,23 +475,35 @@ mod tests {
         );
     }
 
-    /// RULE: the inventory reports the domain each directory was created in, and a
-    /// registration that named none reports none.
+    /// RULE: the inventory reports the two names each directory was created with — its
+    /// domain name and its NetBIOS short name — and a registration that named neither
+    /// reports neither.
     #[test]
     fn the_inventory_reports_the_domain_each_directory_was_created_in() {
         let mut inventory = AdDirectoryInventory::default();
-        inventory.register_in_domain(&directory(1), &domain(1));
-        inventory.register_in_domain(&directory(2), &domain(2));
-        // A re-registration leaves the domain as it stands.
-        inventory.register_in_domain(&directory(2), &domain(9));
+        inventory.register_in_domain(&directory(1), &domain(1), Some(&short_name(1)));
+        inventory.register_in_domain(&directory(2), &domain(2), Some(&short_name(2)));
+        // A re-registration leaves the names as they stand.
+        inventory.register_in_domain(&directory(2), &domain(9), Some(&short_name(9)));
         // A registration that named no domain reports none.
         inventory.register(&directory(3));
+        // Nor does a create that named a domain but no short name.
+        inventory.register_in_domain(&directory(5), &domain(5), None);
 
         for (case, id, expected) in [
-            ("a directory registered in a domain", directory(1), Some(domain(1))),
+            (
+                "a directory registered in a domain",
+                directory(1),
+                Some(domain(1)),
+            ),
             ("another one", directory(2), Some(domain(2))),
             ("a registration that named no domain", directory(3), None),
             ("a directory never registered", directory(4), None),
+            (
+                "a create that named no short name",
+                directory(5),
+                Some(domain(5)),
+            ),
         ] {
             assert_eq!(
                 inventory.domain_name(&id).map(str::to_string),
@@ -471,12 +513,37 @@ mod tests {
             );
         }
 
-        // A forgotten directory takes its domain with it.
+        for (case, id, expected) in [
+            (
+                "a directory registered with a short name",
+                directory(1),
+                Some(short_name(1)),
+            ),
+            ("another one", directory(2), Some(short_name(2))),
+            (
+                "a registration that named no short name",
+                directory(5),
+                None,
+            ),
+            ("a registration that named neither", directory(3), None),
+            ("a directory never registered", directory(4), None),
+        ] {
+            assert_eq!(
+                inventory.short_name(&id).map(str::to_string),
+                expected,
+                "case {case:?}: expected the short name the create named, got {:?}",
+                inventory.short_name(&id)
+            );
+        }
+
+        // A forgotten directory takes its names with it.
         inventory.forget(&directory(1));
         assert!(
-            inventory.domain_name(&directory(1)).is_none(),
-            "case a deleted directory: expected no domain, got {:?}",
-            inventory.domain_name(&directory(1))
+            inventory.domain_name(&directory(1)).is_none()
+                && inventory.short_name(&directory(1)).is_none(),
+            "case a deleted directory: expected no domain and no short name, got {:?} and {:?}",
+            inventory.domain_name(&directory(1)),
+            inventory.short_name(&directory(1))
         );
     }
 
@@ -492,6 +559,7 @@ mod tests {
                 && !inventory.holds(&directory(1))
                 && !inventory.data_access_is_in_service(&directory(1), at())
                 && inventory.domain_name(&directory(1)).is_none()
+                && inventory.short_name(&directory(1)).is_none()
                 && !inventory.holds_account(&directory(1), "someone")
                 && !inventory.record_password_set(&directory(1), "someone"),
             "case an unregistered directory: expected the inventory to hold nothing, got {} \
@@ -506,7 +574,7 @@ mod tests {
     fn an_accounts_password_is_recorded_under_any_spelling_of_its_name() {
         let mut inventory = AdDirectoryInventory::default();
         let id = directory(3);
-        inventory.register_in_domain(&id, &domain(3));
+        inventory.register_in_domain(&id, &domain(3), Some(&short_name(3)));
         inventory.record_account(&id, "Ada.Lovelace");
 
         // The rows are spellings of the one account name: a directory account name is case
@@ -564,7 +632,7 @@ mod tests {
     fn the_inventory_is_bounded_and_drops_its_oldest_registration() {
         let mut inventory = AdDirectoryInventory::default();
         for rank in 0..MAX_RECORDED_DIRECTORIES {
-            inventory.register_in_domain(&directory(rank), &domain(rank));
+            inventory.register_in_domain(&directory(rank), &domain(rank), Some(&short_name(rank)));
         }
         assert_eq!(
             inventory.len(),
@@ -577,6 +645,7 @@ mod tests {
         inventory.register_in_domain(
             &directory(MAX_RECORDED_DIRECTORIES),
             &domain(MAX_RECORDED_DIRECTORIES),
+            Some(&short_name(MAX_RECORDED_DIRECTORIES)),
         );
         assert_eq!(
             inventory.len(),

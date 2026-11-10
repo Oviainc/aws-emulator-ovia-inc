@@ -37,6 +37,9 @@ mod groups_for_member;
 #[path = "all/membership_removal.rs"]
 mod membership_removal;
 
+#[path = "all/object_naming.rs"]
+mod object_naming;
+
 #[path = "all/request_layer_envelopes.rs"]
 mod request_layer_envelopes;
 
@@ -48,6 +51,9 @@ mod user_lifecycle;
 
 #[path = "all/user_search.rs"]
 mod user_search;
+
+#[path = "all/user_update.rs"]
+mod user_update;
 
 #[path = "all/validation_envelope.rs"]
 mod validation_envelope;

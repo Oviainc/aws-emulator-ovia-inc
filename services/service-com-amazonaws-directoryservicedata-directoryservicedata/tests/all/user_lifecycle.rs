@@ -176,19 +176,24 @@ async fn list_group_members(router: &MultiServiceRouter, directory: &str, body: 
     .await
 }
 
-/// The `DC=` form of a realm: `corp.example.com` → `DC=corp,DC=example,DC=com`.
+/// The distinguished name a created object of this suite's directories carries:
+/// `CN=<name>,OU=Users,OU=<NetBIOS name>,<DC= components of the realm>`.
 ///
 /// Built from the realm the SAME answer reports, so what is pinned is the derivation
-/// rule — a distinguished name names the object's container inside its own domain —
-/// and not whichever domain name the emulator's directories carry.
+/// rule — a managed directory names an object the account created inside the
+/// organizational unit it delegates to the account — and not whichever domain name the
+/// emulator's directories carry. These directories were registered without a NetBIOS
+/// short name, so the unit goes by the default a create that names none gets: the first
+/// label of the domain name, in upper case.
 fn expected_distinguished_name(realm: &str, common_name: &str) -> String {
-    let components = realm
-        .trim_end_matches('.')
-        .split('.')
+    let labels: Vec<&str> = realm.trim_end_matches('.').split('.').collect();
+    let components = labels
+        .iter()
         .map(|label| format!("DC={label}"))
         .collect::<Vec<_>>()
         .join(",");
-    format!("CN={common_name},CN=Users,{components}")
+    let delegated_ou = labels.first().unwrap_or(&"").to_uppercase();
+    format!("CN={common_name},OU=Users,OU={delegated_ou},{components}")
 }
 
 /// A realm is a domain name: `Realm`'s
@@ -300,14 +305,16 @@ fn user_cases() -> Vec<(&'static str, Value)> {
             // The `S` member is the one this API takes a value as, so a row covering
             // several attributes varies their NAMES and values, not the union member;
             // the other three members are refused, which `directory_authorization`
-            // covers.
+            // covers. The names are written as the directory's schema holds them, which
+            // is the spelling a read reports (`object_naming` is the suite that pins how
+            // another spelling of one is resolved).
             "several attributes, each sent as the AttributeValue S member",
             json!({
                 "SAMAccountName": "attrs",
                 "OtherAttributes": {
-                    "description": {"S": "the whole attribute catalogue"},
-                    "codePage": {"S": "437"},
-                    "servicePrincipalName": {"S": "host/a.corp.example.com"},
+                    "Description": {"S": "the whole attribute catalogue"},
+                    "CodePage": {"S": "437"},
+                    "ServicePrincipalName": {"S": "host/a.corp.example.com"},
                 },
             }),
         ),
@@ -315,7 +322,7 @@ fn user_cases() -> Vec<(&'static str, Value)> {
             "a single attribute, the fewest Attributes admits",
             json!({
                 "SAMAccountName": "oneattr",
-                "OtherAttributes": {"telephoneNumber": {"S": "+1-555-0100"}},
+                "OtherAttributes": {"TelephoneNumber": {"S": "+1-555-0100"}},
             }),
         ),
     ]
@@ -411,7 +418,7 @@ async fn a_created_user_is_described_from_its_stored_record() {
         );
         assert_eq!(
             described.text("UserPrincipalName"),
-            format!("{name}@{realm}"),
+            format!("{name}@{}", realm.to_uppercase()),
             "case {case:?}: the user principal name must be the account name in that realm, \
              got {:?}",
             described.body
@@ -556,9 +563,9 @@ async fn describe_user_projects_only_the_requested_attributes() {
         &json!({
             "SAMAccountName": "projected",
             "OtherAttributes": {
-                "description": {"S": "a described object"},
-                "codePage": {"S": "437"},
-                "co": {"S": "Antarctica"},
+                "Description": {"S": "a described object"},
+                "CodePage": {"S": "437"},
+                "Co": {"S": "Antarctica"},
             },
         }),
     )
@@ -568,23 +575,23 @@ async fn describe_user_projects_only_the_requested_attributes() {
         ("no attributes asked for", json!(null), json!(null)),
         (
             "one of the three",
-            json!(["description"]),
-            json!({"description": {"S": "a described object"}}),
+            json!(["Description"]),
+            json!({"Description": {"S": "a described object"}}),
         ),
         (
             "another one, asked for in a different case",
             json!(["CODEPAGE"]),
-            json!({"codePage": {"S": "437"}}),
+            json!({"CodePage": {"S": "437"}}),
         ),
         (
             "two of the three",
             json!(["co", "description"]),
-            json!({"co": {"S": "Antarctica"}, "description": {"S": "a described object"}}),
+            json!({"Co": {"S": "Antarctica"}, "Description": {"S": "a described object"}}),
         ),
         (
             "one held and one not",
             json!(["co", "wWWHomePage"]),
-            json!({"co": {"S": "Antarctica"}}),
+            json!({"Co": {"S": "Antarctica"}}),
         ),
         (
             "only attributes the user does not hold",

@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
+mod attribute_schema;
 mod builtin_groups;
 
 use sha2::Digest;
@@ -53,6 +54,15 @@ use crate::ops::types::{
 /// created in this process — and it satisfies `Realm`'s
 /// `^([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+[.]?$`.
 pub const DEFAULT_REALM: &str = "corp.example.com";
+
+/// The container inside a managed directory's DELEGATED organizational unit that the
+/// objects this API creates sit in.
+///
+/// A Managed Microsoft AD gives the account no write access to the domain's own containers:
+/// it delegates an organizational unit named after the directory's NetBIOS short name, and
+/// creates the account's own containers inside it. The objects this data plane creates are
+/// users and groups, which are the principals that container holds.
+const DELEGATED_OBJECT_CONTAINER: &str = "Users";
 
 /// The `GroupType` a group gets when `CreateGroup` names none.
 ///
@@ -84,6 +94,22 @@ pub const FIRST_RID: u64 = 1000;
 /// The largest page the list operations serve, and the page they serve when the
 /// request names no `MaxResults`: `MaxResults` is modelled `@range(min: 1, max: 250)`.
 pub const MAX_PAGE_SIZE: i32 = 250;
+
+/// How many attributes ONE object's record holds at once.
+///
+/// An EMULATOR ceiling, not an AWS quota: these records live in memory for the lifetime of
+/// the process, and `UpdateUser` adds attributes to one object call after call, so without
+/// a bound a caller looping on fresh attribute names would grow a single record without
+/// end. It sits far above the 25 attributes one request may carry (`Attributes` is
+/// modelled `@length(min: 1, max: 25)`), so nothing a workflow does reaches it; a write
+/// that would pass it is refused ([`attribute_limit_exceeded`]) and the record is left
+/// exactly as it stands. A create cannot reach it at all — one request's 25 attributes are
+/// all a created object holds — so it is the UPDATE path the clamp sits on.
+pub const MAX_OBJECT_ATTRIBUTES: usize = 250;
+
+/// The `ValidationException` `Reason` for a write the directory refuses for its SIZE.
+/// One of `ValidationExceptionReason`'s modelled values.
+pub const LDAP_SIZE_LIMIT_EXCEEDED: &str = "LDAP_SIZE_LIMIT_EXCEEDED";
 
 /// How long a `ClientToken` keeps naming the result of the call that first used it.
 ///
@@ -185,9 +211,9 @@ pub struct User {
     pub email_address: Option<String>,
     pub given_name: Option<String>,
     pub surname: Option<String>,
-    /// The `OtherAttributes` the create stored, keyed by the attribute's
-    /// `LdapDisplayName` as given — AD attribute names are case insensitive, so a
-    /// projection matches them case insensitively.
+    /// The `OtherAttributes` the create stored, keyed by the attribute's name as the
+    /// directory's own schema spells it ([`attribute_schema`]) — AD attribute names are case
+    /// insensitive, so the case a request wrote is not part of the attribute.
     pub other_attributes: BTreeMap<String, AttributeValue>,
     pub created_at: SystemTime,
 }
@@ -278,7 +304,111 @@ impl User {
     ) -> Option<HashMap<String, AttributeValue>> {
         project_attributes(&self.other_attributes, names)
     }
+
+    /// Write `values` onto this record the way `update` says to, and leave every member
+    /// `values` does NOT name exactly as it stands.
+    ///
+    /// What an update names is what it changes: `UpdateUser` carries the members a caller
+    /// wants changed and nothing about the rest of the object, so a member the request left
+    /// out is not a member it asked to clear. The naming members are not updatable — the
+    /// account name is the object's key, and its SID, distinguished name and principal name
+    /// are the directory's own derivations — so nothing here touches them.
+    ///
+    /// Answers the refusal for a write that would take this record past
+    /// [`MAX_OBJECT_ATTRIBUTES`] attributes, in which case NOTHING is written: the clamp
+    /// precedes every write this method performs, so one object's record stays bounded
+    /// however many updates a caller sends it.
+    pub fn apply_update(
+        &mut self,
+        update: UpdateMode,
+        values: UserValues,
+    ) -> Result<(), ValidationException> {
+        let attributes = stored_attributes(values.other_attributes);
+        // The CLAMP, ahead of the first write: how many attributes this record would hold
+        // afterwards — a name it already holds takes the new value rather than a second
+        // entry, and a clearing update only ever removes.
+        if update == UpdateMode::Set {
+            let held: BTreeSet<&String> = self
+                .other_attributes
+                .keys()
+                .chain(attributes.keys())
+                .collect();
+            if held.len() > MAX_OBJECT_ATTRIBUTES {
+                return Err(attribute_limit_exceeded());
+            }
+        }
+        let named = |value: Option<String>| match update {
+            UpdateMode::Set => value,
+            // The value a clearing update carries says WHICH member to clear, not what to
+            // leave in it.
+            UpdateMode::Clear => None,
+        };
+        if values.email_address.is_some() {
+            self.email_address = named(values.email_address);
+        }
+        if values.given_name.is_some() {
+            self.given_name = named(values.given_name);
+        }
+        if values.surname.is_some() {
+            self.surname = named(values.surname);
+        }
+        // The attribute names were resolved against the directory's schema above, so an
+        // update written in another case changes the attribute the create stored rather
+        // than adding a second one beside it.
+        for (name, value) in attributes {
+            match update {
+                UpdateMode::Set => {
+                    self.other_attributes.insert(name, value);
+                }
+                UpdateMode::Clear => {
+                    self.other_attributes.remove(&name);
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+/// The values of a user an update carries: the members `UpdateUser` can change, each
+/// `Some` only when the request named it.
+#[derive(Debug, Default)]
+pub struct UserValues {
+    pub email_address: Option<String>,
+    pub given_name: Option<String>,
+    pub surname: Option<String>,
+    pub other_attributes: Option<HashMap<String, AttributeValue>>,
+}
+
+/// What an update does with the values it carries, as `UpdateType` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateMode {
+    /// Hold the values the request carries: `ADD` for a member that holds none and
+    /// `REPLACE` for one that does, which write the same value either way.
+    Set,
+    /// Hold no value for the members the request names: `REMOVE`, which
+    /// `UpdateUserRequest$UpdateType` documents as the type to "clear the attribute
+    /// value".
+    Clear,
+}
+
+impl UpdateMode {
+    /// The mode `UpdateType` names.
+    ///
+    /// `UpdateType` is optional and the modelled values are `ADD`, `REPLACE` and `REMOVE`
+    /// (`smithy_query(query="shape", shape="UpdateType")`); its documentation tells a
+    /// caller to "use REPLACE to change an attribute value or REMOVE to clear the attribute
+    /// value", so a request that names no type is one carrying the values it wants held,
+    /// which is what the two writing types both do.
+    pub fn of(update_type: Option<&str>) -> Self {
+        match update_type {
+            Some(REMOVE_UPDATE_TYPE) => Self::Clear,
+            _ => Self::Set,
+        }
+    }
+}
+
+/// The `UpdateType` that clears the members an update names; the other two write them.
+const REMOVE_UPDATE_TYPE: &str = "REMOVE";
 
 /// One group object of a directory.
 #[derive(Debug, Clone)]
@@ -407,7 +537,8 @@ fn names_include(names: &[String], attributes: &[&str]) -> bool {
 
 /// The attributes of a stored object that `names` asks for, matched case
 /// insensitively (AD attribute names are case insensitive) and reported under the
-/// names they are stored as.
+/// names the directory's schema holds them under, which is the name they are stored as
+/// ([`attribute_schema`]).
 ///
 /// `None` when nothing was asked for or nothing asked for is held: `Attributes` is
 /// modelled `@length(min: 1, max: 25)`, so an empty map is not a value that member
@@ -447,6 +578,11 @@ pub struct Directory {
     /// answers from it, and a request naming another realm is asking about a domain this
     /// directory holds no objects for.
     pub realm: String,
+    /// The NetBIOS short name of this directory, as the control plane that created the
+    /// directory named it ([`DirectoryDataAccess::short_name`]). It names the
+    /// organizational unit the directory delegates to the account, which is where the
+    /// objects this API creates sit ([`Directory::distinguished_name`]).
+    pub short_name: String,
     /// `S-1-5-21-<three sub-authorities>`: the SID of this directory's domain, which
     /// every object's SID extends with its own RID.
     pub domain_sid: String,
@@ -462,12 +598,13 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// A directory with no objects yet, in the domain `realm`, whose SID authority is
-    /// derived from `directory_id` so it is stable for that directory and distinct across
-    /// directories.
-    fn new(directory_id: &str, realm: &str) -> Self {
+    /// A directory with no objects yet, in the domain `realm` and delegating the
+    /// organizational unit `short_name` names, whose SID authority is derived from
+    /// `directory_id` so it is stable for that directory and distinct across directories.
+    fn new(directory_id: &str, realm: &str, short_name: &str) -> Self {
         let mut directory = Self {
             realm: realm.to_string(),
+            short_name: short_name.to_string(),
             domain_sid: domain_sid(directory_id),
             next_rid: FIRST_RID,
             users: BTreeMap::new(),
@@ -518,10 +655,20 @@ impl Directory {
             .join(",")
     }
 
-    /// The distinguished name of an object created in this directory's default
-    /// container: `CN=<name>,CN=Users,DC=…`.
+    /// The distinguished name of an object this API creates in the directory:
+    /// `CN=<name>,OU=Users,OU=<ShortName>,DC=…`.
+    ///
+    /// A managed directory does not give the account write access to the domain's own
+    /// containers; it delegates an organizational unit named after the directory's NetBIOS
+    /// short name, holding the containers the account's own objects go in — so a user or a
+    /// group this API creates is named inside that OU's `Users` container, and the name is
+    /// the directory's to compose: no create carries one.
     pub fn distinguished_name(&self, sam_account_name: &str) -> String {
-        self.distinguished_name_in("Users", sam_account_name)
+        format!(
+            "CN={sam_account_name},OU={DELEGATED_OBJECT_CONTAINER},OU={},{}",
+            self.short_name,
+            self.domain_components()
+        )
     }
 
     /// The distinguished name of an object of this directory sitting in `container`:
@@ -535,9 +682,14 @@ impl Directory {
         )
     }
 
-    /// A user's `UserPrincipalName`: the account name in this directory's realm.
+    /// A user's `UserPrincipalName`: the account name in this directory's realm, the
+    /// domain name in upper case.
+    ///
+    /// `CreateUser` carries no UPN — the member is output-only — so Active Directory
+    /// derives it from the account name and the domain the account was created in, and
+    /// states the domain half of a principal name the way it states a realm: in capitals.
     pub fn user_principal_name(&self, sam_account_name: &str) -> String {
-        format!("{sam_account_name}@{}", self.realm)
+        format!("{sam_account_name}@{}", self.realm.to_uppercase())
     }
 
     /// Whether any object of this directory already answers to `key`.
@@ -678,17 +830,22 @@ pub struct ComAmazonawsDirectoryservicedataDirectoryservicedataState {
 }
 
 impl ComAmazonawsDirectoryservicedataDirectoryservicedataState {
-    /// The directory `directory_id` names, creating the record — in the domain `realm` —
-    /// if this is the first write to it. Only a MUTATING operation may call this: a read
-    /// uses [`Self::directories`] directly, so reporting never materialises a directory.
+    /// The directory `directory_id` names, creating the record — in the domain and under the
+    /// delegated organizational unit `access` resolved for it — if this is the first write
+    /// to it. Only a MUTATING operation may call this: a read uses [`Self::directories`]
+    /// directly, so reporting never materialises a directory.
     ///
     /// One call materialises at most one directory, and a new record holds a fixed
     /// set of objects — the domain's built-in groups, a catalogue fixed at compile
     /// time — so nothing in a request decides how much a materialisation allocates.
-    pub fn directory_for_write(&mut self, directory_id: &str, realm: &str) -> &mut Directory {
+    pub fn directory_for_write(
+        &mut self,
+        directory_id: &str,
+        access: &DirectoryDataAccess,
+    ) -> &mut Directory {
         self.directories
             .entry(directory_id.to_string())
-            .or_insert_with(|| Directory::new(directory_id, realm))
+            .or_insert_with(|| Directory::new(directory_id, access.realm(), access.short_name()))
     }
 
     /// What `token` says about a call whose inputs fingerprint to `fingerprint`.
@@ -805,11 +962,20 @@ pub fn attribute_value_strings(value: &AttributeValue) -> Vec<String> {
     }
 }
 
-/// The attributes of a request, stored in the order a directory reports them.
+/// The attributes of a request, stored under the name the directory's own schema holds each
+/// attribute under ([`attribute_schema::resolved_name`]) and in the order a directory reports
+/// them.
+///
+/// The name is resolved once, HERE, so one attribute written in two cases is one stored
+/// attribute and every projection of it reports the schema's name without re-deciding it.
 pub fn stored_attributes(
     attributes: Option<HashMap<String, AttributeValue>>,
 ) -> BTreeMap<String, AttributeValue> {
-    attributes.into_iter().flatten().collect()
+    attributes
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| (attribute_schema::resolved_name(&name), value))
+        .collect()
 }
 
 /// The scope a pagination cursor is stamped with: everything about the request that
@@ -946,44 +1112,50 @@ pub fn resolved_realm(requested: Option<&str>, directory_realm: &str) -> String 
 }
 
 /// The `ResourceNotFoundException` payload for a user no directory holds.
-pub fn user_not_found(directory_id: &str, sam_account_name: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "user {sam_account_name} was not found in directory {directory_id}"
-        )),
-    }
+pub fn user_not_found(directory_id: &str) -> ResourceNotFoundException {
+    object_not_found(OBJECT_CLASS_USER, directory_id)
 }
 
 /// The `ResourceNotFoundException` payload for a group no directory holds.
-pub fn group_not_found(directory_id: &str, sam_account_name: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "group {sam_account_name} was not found in directory {directory_id}"
-        )),
-    }
+pub fn group_not_found(directory_id: &str) -> ResourceNotFoundException {
+    object_not_found(OBJECT_CLASS_GROUP, directory_id)
 }
 
 /// The `ResourceNotFoundException` payload for a member no directory holds.
-pub fn member_not_found(directory_id: &str, member_name: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "member {member_name} was not found in directory {directory_id}"
-        )),
-    }
+pub fn member_not_found(directory_id: &str) -> ResourceNotFoundException {
+    object_not_found(OBJECT_CLASS_MEMBER, directory_id)
 }
 
 /// The `ResourceNotFoundException` payload for a membership a group does not hold.
 ///
-/// The membership is the resource a removal names, so a group that does not hold the
-/// member has nothing of that name to remove.
-pub fn membership_not_found(
-    directory_id: &str,
-    group_name: &str,
-    member_name: &str,
-) -> ResourceNotFoundException {
+/// The membership is the resource a removal names, and the object of that resource is the
+/// MEMBER a group does not hold — so the refusal states the same class the member's own
+/// absence states, through the one sentence below.
+pub fn membership_not_found(directory_id: &str) -> ResourceNotFoundException {
+    object_not_found(OBJECT_CLASS_MEMBER, directory_id)
+}
+
+/// The object class a not-found refusal names for a user object.
+const OBJECT_CLASS_USER: &str = "User";
+
+/// The object class it names for a group object.
+const OBJECT_CLASS_GROUP: &str = "Group";
+
+/// The object class it names for a member of a group — which is a user or a group object,
+/// reached as a MEMBER, so the refusal states the role the request named it in.
+const OBJECT_CLASS_MEMBER: &str = "Member";
+
+/// The sentence every not-found refusal of this API states: the CLASS of object the request
+/// asked about and the directory it was asked about in, and no object name.
+///
+/// Directory Service Data states this refusal as a class and a directory: the name the
+/// request named is the caller's own and the answer discloses nothing of what the directory
+/// holds — so one reader of the message cannot tell a name the directory never had from one
+/// it no longer has. The creates' refusal is worded the same way ([`object_already_exists`]).
+fn object_not_found(object_class: &str, directory_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
-            "member {member_name} is not a member of group {group_name} in directory {directory_id}"
+            "{object_class} not found in directory {directory_id}."
         )),
     }
 }
@@ -1006,12 +1178,6 @@ pub fn group_already_exists(directory_id: &str) -> ConflictException {
     object_already_exists(OBJECT_CLASS_GROUP, directory_id)
 }
 
-/// The object class `CreateUser` reports in that refusal.
-const OBJECT_CLASS_USER: &str = "User";
-
-/// The object class `CreateGroup` reports in it.
-const OBJECT_CLASS_GROUP: &str = "Group";
-
 /// The sentence both creates state: the class of object that already exists, then the
 /// directory it already exists in.
 fn object_already_exists(object_class: &str, directory_id: &str) -> ConflictException {
@@ -1032,6 +1198,22 @@ pub fn invalid_next_token() -> ValidationException {
     ValidationException {
         message: Some("Invalid parameter: NextToken.".to_string()),
         reason: Some(INVALID_NEXT_TOKEN.to_string()),
+    }
+}
+
+/// The `ValidationException` payload for a write that would take ONE object's record past
+/// [`MAX_OBJECT_ATTRIBUTES`] attributes.
+///
+/// The `Reason` is the modelled [`LDAP_SIZE_LIMIT_EXCEEDED`] value — the one that names a
+/// write the directory will not take for its SIZE — and the message names the member the
+/// write carried and the number of attributes an object holds, read off that ceiling rather
+/// than written into the sentence.
+pub fn attribute_limit_exceeded() -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "OtherAttributes: an object holds at most {MAX_OBJECT_ATTRIBUTES} attributes."
+        )),
+        reason: Some(LDAP_SIZE_LIMIT_EXCEEDED.to_string()),
     }
 }
 
@@ -1114,7 +1296,8 @@ pub fn link_deleted_account<Eng: Send + Sync + 'static>(
 }
 
 /// What the control plane says about the directory a call names: the realm its objects are
-/// reported in, and which of its accounts have a password.
+/// reported in, the organizational unit it delegates to the account, and which of its
+/// accounts have a password.
 ///
 /// WHETHER this plane may answer for the directory at all is not here: that is the
 /// authorization gate's question (`crate::service::authorization`), which reads the same
@@ -1129,6 +1312,10 @@ pub struct DirectoryDataAccess {
     /// The domain name the directory was created with, or [`DEFAULT_REALM`] for a
     /// directory the control plane recorded none for.
     realm: String,
+    /// The NetBIOS short name the directory was created with, which names the
+    /// organizational unit it delegates to the account; derived from the realm
+    /// ([`default_short_name`]) for a directory the control plane recorded none for.
+    short_name: String,
     /// The directory's accounts whose password the control plane has set, by folded name.
     accounts_with_password: BTreeSet<String>,
 }
@@ -1140,28 +1327,51 @@ impl Default for DirectoryDataAccess {
     fn default() -> Self {
         Self {
             realm: DEFAULT_REALM.to_string(),
+            short_name: default_short_name(DEFAULT_REALM),
             accounts_with_password: BTreeSet::new(),
         }
     }
 }
 
+/// The NetBIOS short name of a directory whose create recorded none: the first label of its
+/// domain name, in upper case.
+///
+/// That is the default the control plane's own create documents for the member
+/// (`CreateMicrosoftADRequest$ShortName`: "If you don't specify a NetBIOS name, it will
+/// default to the first part of your directory DNS. For example, `CORP` for the directory DNS
+/// `corp.example.com`"), so a directory always has the one name its delegated organizational
+/// unit goes by.
+fn default_short_name(domain_name: &str) -> String {
+    domain_name
+        .trim_end_matches('.')
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_uppercase()
+}
+
 impl DirectoryDataAccess {
     /// What the control plane recorded about `directory_id`: the domain it created the
-    /// directory in and the accounts of it whose password it has set.
+    /// directory in, the NetBIOS short name of that create, and the accounts of it whose
+    /// password it has set.
     ///
     /// The defaults stand for a directory that plane recorded nothing of the kind for —
-    /// this plane's own fallback realm, and no account holding a password — so a handler
-    /// always has an answer to report from.
+    /// this plane's own fallback realm, the short name that realm's first label gives, and
+    /// no account holding a password — so a handler always has an answer to report from.
     pub fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, directory_id: &str) -> Self {
         let Some(inventory) = ad_directory_inventory(engine) else {
             return Self::default();
         };
         let inventory = inventory.lock();
+        let realm = inventory
+            .domain_name(directory_id)
+            .unwrap_or(DEFAULT_REALM)
+            .to_string();
         Self {
-            realm: inventory
-                .domain_name(directory_id)
-                .unwrap_or(DEFAULT_REALM)
-                .to_string(),
+            short_name: inventory
+                .short_name(directory_id)
+                .map_or_else(|| default_short_name(&realm), str::to_string),
+            realm,
             accounts_with_password: inventory.accounts_with_password(directory_id),
         }
     }
@@ -1170,6 +1380,12 @@ impl DirectoryDataAccess {
     /// plane created it with.
     pub fn realm(&self) -> &str {
         &self.realm
+    }
+
+    /// The NetBIOS short name of this directory, which names the organizational unit it
+    /// delegates to the account — the unit the objects this API creates are named inside.
+    pub fn short_name(&self) -> &str {
+        &self.short_name
     }
 
     /// Whether the account `sam_account_name` names is ACTIVE.

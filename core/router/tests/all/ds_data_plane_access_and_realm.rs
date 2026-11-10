@@ -15,7 +15,9 @@
 //! * the realm every object of a directory is reported in, and the realm inside its
 //!   `UserPrincipalName` and `DistinguishedName`, is the DIRECTORY's own fully qualified
 //!   domain name — the `Name` the control plane created it with — so two directories
-//!   report two realms;
+//!   report two realms; and the organizational unit the object is named in is the one the
+//!   directory delegates to the account, named after the NetBIOS `ShortName` of that same
+//!   create;
 //! * `CreateUser` carries no password, so the account it creates has no credential and is
 //!   reported INACTIVE until the control plane's `ResetUserPassword` gives it one, which is
 //!   what flips `Enabled` to true; an account neither plane holds, and a password the
@@ -51,11 +53,18 @@ const DATA_ACCESS_NOT_ENABLED: &str =
      by calling the EnableDirectoryDataAccess API.";
 
 /// A Managed Microsoft AD directory of domain `name`, in service, with its DS Data feature
-/// turned on — the two control-plane calls every row below depends on.
-async fn directory_serving_its_data_plane(emulator: &Emulator, name: &str) -> String {
-    let created = emulator
-        .control_plane("CreateMicrosoftAD", create_microsoft_ad(name))
-        .await;
+/// turned on — the two control-plane calls every row below depends on. `short_name` is the
+/// NetBIOS name the create names, or `None` for a create that names none.
+async fn directory_serving_its_data_plane(
+    emulator: &Emulator,
+    name: &str,
+    short_name: Option<&str>,
+) -> String {
+    let mut body = create_microsoft_ad(name);
+    if let Some(short_name) = short_name {
+        body["ShortName"] = json!(short_name);
+    }
+    let created = emulator.control_plane("CreateMicrosoftAD", body).await;
     assert_eq!(
         created.status, 200,
         "CreateMicrosoftAD {name:?} must be accepted, got {} with {:?}",
@@ -128,14 +137,25 @@ async fn the_data_plane_answers_from_the_control_planes_directory_record() {
     // Two directories, so every realm-valued answer is pinned to the directory it was
     // asked about rather than to one domain the emulator happens to hold: the rows differ
     // along the domain name the directory was created with (its label count and its
-    // top-level domain) and the account name created in it.
-    let rows: [(&str, &str, &str); 2] = [
-        ("a three-label domain", "sim2real-one.example.com", "ada"),
-        ("a two-label domain", "sim2real-two.test", "grace.hopper"),
+    // top-level domain), whether the create named a NetBIOS short name of its own, and the
+    // account name created in it.
+    let rows: [(&str, &str, Option<&str>, &str); 2] = [
+        (
+            "a three-label domain and a NetBIOS name of its own",
+            "sim2real-one.example.com",
+            Some("SIM2REAL"),
+            "ada",
+        ),
+        (
+            "a two-label domain whose create named no NetBIOS name",
+            "sim2real-two.test",
+            None,
+            "grace.hopper",
+        ),
     ];
 
-    for (case, realm, user_name) in rows {
-        let directory_id = directory_serving_its_data_plane(&emulator, realm).await;
+    for (case, realm, short_name, user_name) in rows {
+        let directory_id = directory_serving_its_data_plane(&emulator, realm, short_name).await;
 
         let created = emulator
             .data_plane(
@@ -156,8 +176,9 @@ async fn the_data_plane_answers_from_the_control_planes_directory_record() {
             created.body
         );
 
-        // Every realm-valued member answers from the DIRECTORY's own domain, and the
-        // account has no password yet, so Active Directory leaves it inactive.
+        // Every realm-valued member answers from the DIRECTORY's own domain, the object is
+        // named inside the organizational unit that directory delegates to the account, and
+        // the account has no password yet, so Active Directory leaves it inactive.
         let described = emulator
             .data_plane(
                 "/Users/DescribeUser",
@@ -170,13 +191,29 @@ async fn the_data_plane_answers_from_the_control_planes_directory_record() {
             "case {case:?}: expected the describe to be served, got {} with {:?}",
             described.status, described.body
         );
+        // The unit is named after the directory's NetBIOS name: the one the create named,
+        // or the default a create that names none gets — the first label of the domain
+        // name, in upper case (`CreateMicrosoftADRequest$ShortName`).
+        let delegated_ou = short_name.map_or_else(
+            || {
+                realm
+                    .split('.')
+                    .next()
+                    .unwrap_or_default()
+                    .to_uppercase()
+            },
+            str::to_string,
+        );
         for (member, expected) in [
             ("Realm", json!(realm)),
-            ("UserPrincipalName", json!(format!("{user_name}@{realm}"))),
+            (
+                "UserPrincipalName",
+                json!(format!("{user_name}@{}", realm.to_uppercase())),
+            ),
             (
                 "DistinguishedName",
                 json!(format!(
-                    "CN={user_name},CN=Users,{}",
+                    "CN={user_name},OU=Users,OU={delegated_ou},{}",
                     domain_components(realm)
                 )),
             ),

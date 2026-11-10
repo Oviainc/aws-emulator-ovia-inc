@@ -145,19 +145,31 @@ pub(super) fn hold_directories(engine: &engine::InMemoryEngine, directories: &[&
     }
 }
 
-/// [`hold_directories`] for ONE directory, with the DOMAIN the control plane created it in:
-/// the `Name` its create was called with, which this plane reports as the realm of every
-/// object inside it.
+/// [`hold_directories`] for ONE directory, with the two names the control plane created it
+/// with: the `Name` its create was called with, which this plane reports as the realm of
+/// every object inside it, and the NetBIOS `ShortName` of the same create, which names the
+/// organizational unit the objects inside it are placed in. `None` for a create that
+/// recorded no short name.
 pub(super) fn hold_directory_in_domain(
     engine: &engine::InMemoryEngine,
     directory: &str,
     domain_name: &str,
 ) {
+    hold_directory_named(engine, directory, domain_name, None);
+}
+
+/// [`hold_directory_in_domain`], naming the directory's NetBIOS short name too.
+pub(super) fn hold_directory_named(
+    engine: &engine::InMemoryEngine,
+    directory: &str,
+    domain_name: &str,
+    short_name: Option<&str>,
+) {
     let inventory = service_com_amazonaws_directoryservicedata_directoryservicedata::state::
         ad_directory_inventory(engine)
         .expect("the shared engine holds the AD directory inventory");
     let mut held = inventory.lock();
-    held.register_in_domain(directory, domain_name);
+    held.register_in_domain(directory, domain_name, short_name);
     let now = SystemTime::now();
     held.enable_data_access(directory, now, now);
 }

@@ -221,14 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a member from.
         let Some(directory) = store.directories.get_mut(&input.directory_id) else {
             return Err(RemoveGroupMemberErrorModeled::ResourceNotFoundException(
-                crate::state::group_not_found(&input.directory_id, &input.group_name),
+                crate::state::group_not_found(&input.directory_id),
             )
             .into());
         };
 
         if !directory.groups.contains_key(&group_key) {
             return Err(RemoveGroupMemberErrorModeled::ResourceNotFoundException(
-                crate::state::group_not_found(&input.directory_id, &input.group_name),
+                crate::state::group_not_found(&input.directory_id),
             )
             .into());
         }
@@ -240,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::realm_matches(input.member_realm.as_deref(), &directory.realm);
         if !member_in_realm || !directory.holds_object(&member_key) {
             return Err(RemoveGroupMemberErrorModeled::ResourceNotFoundException(
-                crate::state::member_not_found(&input.directory_id, &input.member_name),
+                crate::state::member_not_found(&input.directory_id),
             )
             .into());
         }
@@ -250,11 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // out of it.
         if directory.remove_member(&group_key, &member_key).is_none() {
             return Err(RemoveGroupMemberErrorModeled::ResourceNotFoundException(
-                crate::state::membership_not_found(
-                    &input.directory_id,
-                    &input.group_name,
-                    &input.member_name,
-                ),
+                crate::state::membership_not_found(&input.directory_id),
             )
             .into());
         }

@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|directory| directory.delete_user(&key));
         if removed.is_none() {
             return Err(DeleteUserErrorModeled::ResourceNotFoundException(
-                crate::state::user_not_found(&input.directory_id, &input.sam_account_name),
+                crate::state::user_not_found(&input.directory_id),
             )
             .into());
         }

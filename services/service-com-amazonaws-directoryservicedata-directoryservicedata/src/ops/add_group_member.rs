@@ -221,14 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own: a `DirectoryId` nothing has written to holds no group to add to.
         let Some(directory) = store.directories.get_mut(&input.directory_id) else {
             return Err(AddGroupMemberErrorModeled::ResourceNotFoundException(
-                crate::state::group_not_found(&input.directory_id, &input.group_name),
+                crate::state::group_not_found(&input.directory_id),
             )
             .into());
         };
 
         if !directory.groups.contains_key(&group_key) {
             return Err(AddGroupMemberErrorModeled::ResourceNotFoundException(
-                crate::state::group_not_found(&input.directory_id, &input.group_name),
+                crate::state::group_not_found(&input.directory_id),
             )
             .into());
         }
@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let Some(member_type) = member_type else {
             return Err(AddGroupMemberErrorModeled::ResourceNotFoundException(
-                crate::state::member_not_found(&input.directory_id, &input.member_name),
+                crate::state::member_not_found(&input.directory_id),
             )
             .into());
         };

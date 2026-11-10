@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates a user object of a directory: the members and attributes the request names are
+//! written onto the stored record in [`crate::state`], the way `UpdateType` says to write
+//! them, and every later read answers from that record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An update never creates anything: a `DirectoryId` nothing was written to, and a name
+//! the directory holds no user object under, are `ResourceNotFoundException`. A repeated
+//! call carrying the same `ClientToken` answers as the call it repeats.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +175,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUser"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateUserErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the directory object store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let key = crate::state::fold(&input.sam_account_name);
+        // What the request says to do with the values it carries: write them, or clear the
+        // members it names.
+        let update = crate::state::UpdateMode::of(input.update_type.as_deref());
+        // What this call IS, for the `@idempotencyToken` ledger: the same token with
+        // these inputs replays, the same token with different ones conflicts.
+        let fingerprint = crate::state::fingerprint(&[
+            Self::NAME,
+            &input.directory_id,
+            &key,
+            input.update_type.as_deref().unwrap_or_default(),
+            input.email_address.as_deref().unwrap_or_default(),
+            input.given_name.as_deref().unwrap_or_default(),
+            input.surname.as_deref().unwrap_or_default(),
+            &crate::state::attributes_fingerprint(input.other_attributes.as_ref()),
+        ]);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        match store.claim_token(input.client_token.as_deref(), &fingerprint, now) {
+            // The first call already wrote these values, so the replay answers as it did
+            // rather than writing them a second time.
+            crate::state::TokenClaim::Replayed(_) => return Ok(UpdateUserOutput {}),
+            crate::state::TokenClaim::Conflict => {
+                return Err(UpdateUserErrorModeled::ConflictException(ConflictException {
+                    message: Some(
+                        "ClientToken was already used for a request with different parameters"
+                            .to_string(),
+                    ),
+                })
+                .into());
+            }
+            crate::state::TokenClaim::Fresh => {}
+        }
+
+        // An update writes onto a record that already exists, so it materialises no
+        // directory: a `DirectoryId` nothing has written to holds no user to update, and
+        // neither does a directory holding no object of that name.
+        let user = store
+            .directories
+            .get_mut(&input.directory_id)
+            .and_then(|directory| directory.users.get_mut(&key));
+        let Some(user) = user else {
+            return Err(UpdateUserErrorModeled::ResourceNotFoundException(
+                crate::state::user_not_found(&input.directory_id),
+            )
+            .into());
+        };
+
+        // Bounded ahead of the write: a record holds at most
+        // `crate::state::MAX_OBJECT_ATTRIBUTES` attributes, and a write that would pass
+        // that ceiling is refused with the modelled reason for a write the directory will
+        // not take for its size, leaving the record as it stands.
+        user.apply_update(
+            update,
+            crate::state::UserValues {
+                email_address: input.email_address,
+                given_name: input.given_name,
+                surname: input.surname,
+                other_attributes: input.other_attributes,
+            },
+        )
+        .map_err(UpdateUserErrorModeled::ValidationException)?;
+
+        store.record_token(input.client_token, fingerprint, None, now);
+        drop(store);
+
+        // Changing an account CHANGES the directory, and its domain controllers audit
+        // every such change in their security log — so a directory whose log subscription
+        // forwards that log forwards this record too. The store's guard was released
+        // above: the emitter takes the control plane's store and then CloudWatch Logs'.
+        crate::state::security_log::record(
+            &*self.engine,
+            &input.directory_id,
+            crate::state::security_log::USER_ACCOUNT_CHANGED,
+            &input.sam_account_name,
+            now,
+        );
+
+        Ok(UpdateUserOutput {})
     }
 }

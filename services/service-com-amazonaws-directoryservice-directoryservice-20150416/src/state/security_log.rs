@@ -107,6 +107,12 @@ pub const USER_ACCOUNT_DELETED: AuditedAct = AuditedAct {
     description: "A user account was deleted.",
 };
 
+/// A user account was changed (`ds-data:UpdateUser`).
+pub const USER_ACCOUNT_CHANGED: AuditedAct = AuditedAct {
+    event_id: 4738,
+    description: "A user account was changed.",
+};
+
 /// A security-enabled global group was created (`ds-data:CreateGroup`).
 pub const GROUP_CREATED: AuditedAct = AuditedAct {
     event_id: 4727,

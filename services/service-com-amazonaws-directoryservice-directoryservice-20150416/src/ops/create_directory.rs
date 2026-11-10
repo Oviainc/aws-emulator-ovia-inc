@@ -379,13 +379,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account now holds this directory, which is a fact the DATA plane needs and
         // cannot read from its own records: it creates no directory, so a `DirectoryId` it
         // is called with is one of this account's only because this create recorded it —
-        // and the domain the directory was created with, which that plane reports as the
-        // realm of every object inside it, is recorded with it for the same reason, read
-        // back off the record this create persisted.
+        // and the two names the directory was created with — the domain, which that plane
+        // reports as the realm of every object inside it, and the NetBIOS short name, which
+        // names the organizational unit the objects it creates sit in — are recorded with it
+        // for the same reason, read back off the record this create persisted.
         if let Some(inventory) = crate::state::ad_directory_inventory(&*self.engine) {
-            inventory
-                .lock()
-                .register_in_domain(&directory_id, &stored.name);
+            inventory.lock().register_in_domain(
+                &directory_id,
+                &stored.name,
+                stored.short_name.as_deref(),
+            );
         }
 
         Ok(CreateDirectoryOutput {

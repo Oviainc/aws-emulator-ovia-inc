@@ -195,7 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let not_found = || {
             DescribeUserErrorModeled::ResourceNotFoundException(crate::state::user_not_found(
                 &input.directory_id,
-                &input.sam_account_name,
             ))
         };
         let Some(directory) = store.directories.get(&input.directory_id) else {

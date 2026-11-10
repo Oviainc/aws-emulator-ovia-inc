@@ -9,7 +9,7 @@
 //! directories of one account report two domains and no answer carries a domain this
 //! emulator chose. Every name formed inside that domain follows it: an object's
 //! `DistinguishedName` carries the domain's `DC=` components and a user's
-//! `UserPrincipalName` the domain after the `@`.
+//! `UserPrincipalName` the domain, in capitals, after the `@`.
 //!
 //! The rows below span the forms a domain name takes (`Realm`:
 //! `^([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+[.]?$`, len 1..255 —
@@ -264,7 +264,7 @@ async fn every_projection_reports_the_directory_s_own_domain() {
         );
         assert_eq!(
             text(&described_user, "UserPrincipalName"),
-            format!("{USER}@{domain}"),
+            format!("{USER}@{}", domain.to_uppercase()),
             "case {case:?}: the user principal name must name the account in {domain:?}, \
              got {:?}",
             described_user.body

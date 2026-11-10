@@ -189,7 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = crate::state::fold(&input.sam_account_name);
         // What the control plane recorded about this directory: the domain its objects
-        // live in, which is the realm this account is created under.
+        // live in, which is the realm this account is created under, and the organizational
+        // unit the directory delegates, which is where the object is named.
         let access =
             crate::state::DirectoryDataAccess::resolve(&*self.engine, &input.directory_id);
         // What this call IS, for the `@idempotencyToken` ledger: the same token with
@@ -230,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A create is a write, so it is what materialises the directory record: the
         // `ds` control plane that creates a directory is not part of this API, and the
         // domain that plane created it in is what the record's realm is.
-        let directory = store.directory_for_write(&input.directory_id, access.realm());
+        let directory = store.directory_for_write(&input.directory_id, &access);
         if directory.holds_object(&key) {
             return Err(CreateUserErrorModeled::ConflictException(
                 crate::state::user_already_exists(&input.directory_id),

@@ -71,19 +71,24 @@ fn text(answer: &Answer, member: &str) -> String {
     answer.body[member].as_str().unwrap_or_default().to_string()
 }
 
-/// The `DC=` form of a realm: `corp.example.com` → `DC=corp,DC=example,DC=com`.
+/// The distinguished name a created object of this suite's directory carries:
+/// `CN=<name>,OU=Users,OU=<NetBIOS name>,<DC= components of the realm>`.
 ///
 /// Built from the realm the SAME answer reports, so what is pinned is the derivation
-/// rule — a distinguished name names the object's container inside its own domain —
-/// and not whichever domain name the emulator's directories carry.
+/// rule — a managed directory names an object the account created inside the
+/// organizational unit it delegates to the account — and not whichever domain name the
+/// emulator's directories carry. This directory was registered without a NetBIOS short
+/// name, so the unit goes by the default a create that names none gets: the first label
+/// of the domain name, in upper case.
 fn expected_distinguished_name(realm: &str, common_name: &str) -> String {
-    let components = realm
-        .trim_end_matches('.')
-        .split('.')
+    let labels: Vec<&str> = realm.trim_end_matches('.').split('.').collect();
+    let components = labels
+        .iter()
         .map(|label| format!("DC={label}"))
         .collect::<Vec<_>>()
         .join(",");
-    format!("CN={common_name},CN=Users,{components}")
+    let delegated_ou = labels.first().unwrap_or(&"").to_uppercase();
+    format!("CN={common_name},OU=Users,OU={delegated_ou},{components}")
 }
 
 /// A realm is a domain name: `Realm`'s `^([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+[.]?$` in
@@ -150,17 +155,21 @@ fn group_cases() -> Vec<(String, Value)> {
         (
             // Every attribute value goes as the `S` member, the one this API takes;
             // the other three members of the union are refused, which the
-            // `directory_authorization` suite covers.
+            // `directory_authorization` suite covers. The names are written as the
+            // directory's schema holds them, which is the spelling a read reports
+            // (`object_naming` is the suite that pins how another spelling is resolved);
+            // `groupType` and `isCriticalSystemObject` are attributes this plane's schema
+            // holds no entry for, so they are reported as written.
             "several attributes, each sent as the AttributeValue S member".to_string(),
             json!({
                 "SAMAccountName": "attrgroup",
                 "GroupType": "Distribution",
                 "GroupScope": "Universal",
                 "OtherAttributes": {
-                    "description": {"S": "the whole attribute catalogue"},
+                    "Description": {"S": "the whole attribute catalogue"},
                     "groupType": {"S": "4"},
                     "isCriticalSystemObject": {"S": "FALSE"},
-                    "servicePrincipalName": {"S": "host/a.corp.example.com"},
+                    "ServicePrincipalName": {"S": "host/a.corp.example.com"},
                 },
             }),
         ),
@@ -168,7 +177,7 @@ fn group_cases() -> Vec<(String, Value)> {
             "a single attribute, the fewest Attributes admits".to_string(),
             json!({
                 "SAMAccountName": "oneattrgroup",
-                "OtherAttributes": {"info": {"S": "one attribute"}},
+                "OtherAttributes": {"Info": {"S": "one attribute"}},
             }),
         ),
     ];
@@ -416,16 +425,20 @@ async fn a_group_name_resolves_case_insensitively() {
 }
 
 /// Only the attributes the request names come back, matched case insensitively and
-/// reported under the names the create stored them as.
+/// reported under the name the directory's schema holds each attribute under (the exact
+/// spelling is the `object_naming` suite's).
 #[tokio::test]
 async fn describe_group_projects_only_the_requested_attributes() {
     let router = emulator();
+    // The names the directory's schema holds these attributes under, which is the spelling
+    // a read reports them in; `groupType` and `isCriticalSystemObject` are attributes this
+    // plane's schema holds no entry for, so they are reported as written.
     let stored = json!({
-        "description": {"S": "the finance department"},
-        "info": {"S": "owned by finance"},
+        "Description": {"S": "the finance department"},
+        "Info": {"S": "owned by finance"},
         "groupType": {"S": "2"},
         "isCriticalSystemObject": {"S": "TRUE"},
-        "servicePrincipalName": {"S": "host/finance.corp.example.com"},
+        "ServicePrincipalName": {"S": "host/finance.corp.example.com"},
     });
     create_group(
         &router,
@@ -445,15 +458,15 @@ async fn describe_group_projects_only_the_requested_attributes() {
         (
             "one of the stored attributes",
             json!(["description"]),
-            json!({"description": stored["description"]}),
+            json!({"Description": stored["Description"]}),
         ),
         (
             "a subset of three",
             json!(["description", "groupType", "servicePrincipalName"]),
             json!({
-                "description": stored["description"],
+                "Description": stored["Description"],
                 "groupType": stored["groupType"],
-                "servicePrincipalName": stored["servicePrincipalName"],
+                "ServicePrincipalName": stored["ServicePrincipalName"],
             }),
         ),
         (
@@ -470,7 +483,7 @@ async fn describe_group_projects_only_the_requested_attributes() {
         (
             "an attribute name in another case",
             json!(["DESCRIPTION", "Info"]),
-            json!({"description": stored["description"], "info": stored["info"]}),
+            json!({"Description": stored["Description"], "Info": stored["Info"]}),
         ),
         (
             "a name the group holds no attribute under",
@@ -480,7 +493,7 @@ async fn describe_group_projects_only_the_requested_attributes() {
         (
             "one held name beside one that is not",
             json!(["notStored", "info"]),
-            json!({"info": stored["info"]}),
+            json!({"Info": stored["Info"]}),
         ),
     ];
 
