@@ -39,32 +39,32 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
 
 /// The region every call below is signed for, so the ARNs the decisions are made about are
 /// the ones this region's resources carry.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The access-key id standing for the account's own published credential: neither STS nor
 /// IAM holds a record for it, so it resolves to the account's ambient identity, which holds
 /// no IAM policies and is allowed — the position AWS account root credentials are in.
-const ACCOUNT_KEY: &str = "AKIDTESTAPIGWV2ROOT";
+pub(crate) const ACCOUNT_KEY: &str = "AKIDTESTAPIGWV2ROOT";
 
 /// The error code every refusal of this gate carries, from the model's own 403 error.
-const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// One response, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_code: String,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// Whether the gate let this call through — whatever the operation then answered.
-    fn authorized(&self) -> bool {
+    pub(crate) fn authorized(&self) -> bool {
         self.error_code != ACCESS_DENIED
     }
 
     /// The `message` of a refusal.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body
             .get("message")
             .and_then(Value::as_str)
@@ -75,19 +75,19 @@ impl Reply {
 
 /// A principal a call is signed as: the access key id it presents, and the ARN a refusal
 /// must blame it by — what `sts:GetCallerIdentity` reports for that key.
-struct Principal {
-    access_key_id: String,
-    arn: String,
+pub(crate) struct Principal {
+    pub(crate) access_key_id: String,
+    pub(crate) arn: String,
 }
 
 /// The emulator these tests drive: one shared engine carrying this service beside the IAM
 /// and STS services the principals and their policies are made with.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -110,7 +110,7 @@ impl Emulator {
     }
 
     /// One call to this service, with `access_key_id` in the SigV4 credential scope.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         access_key_id: &str,
         method: &str,
@@ -201,7 +201,11 @@ impl Emulator {
 
     /// Create an IAM role carrying `policy` as its inline policy (when one is given),
     /// assume it through STS, and answer the session's access key id with the session ARN.
-    async fn assumed_role(&self, role_name: &str, policy: Option<&str>) -> Principal {
+    pub(crate) async fn assumed_role(
+        &self,
+        role_name: &str,
+        policy: Option<&str>,
+    ) -> Principal {
         let account = ::engine::emulator_account_id();
         let trust = format!(
             "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
@@ -320,7 +324,7 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 }
 
 /// A policy document allowing `action` on `resource`.
-fn allow(action: &str, resource: &str) -> String {
+pub(crate) fn allow(action: &str, resource: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}]}}"
@@ -329,7 +333,7 @@ fn allow(action: &str, resource: &str) -> String {
 
 /// A policy document allowing every action of this service on everything, and explicitly
 /// denying `denied`.
-fn allow_all_but(denied: &str) -> String {
+pub(crate) fn allow_all_but(denied: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[\
          {{\"Effect\":\"Allow\",\"Action\":\"apigateway:*\",\"Resource\":\"*\"}},\
