@@ -227,6 +227,8 @@ mod single_package_association;
 mod single_package_dissociation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/successive_domain_transitions.rs"]
+mod successive_domain_transitions;
 #[path = "all/tag_accumulation.rs"]
 mod tag_accumulation;
 #[path = "all/unresolvable_package_id.rs"]
