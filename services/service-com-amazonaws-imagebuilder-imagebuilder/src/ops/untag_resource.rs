@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes tags from the resource an ARN names: each key the request carries stops being
+//! one of that resource's tags, and every key it does not name is left exactly as it was.
+//! A key the resource does not carry is nothing to remove, so naming one is served rather
+//! than refused.
+//!
+//! The handler below is this operation's implementation. `crate::scaffolded` remains its
+//! error channel, which is also how it refuses a request its own model has no error for.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +140,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The lookup and the write happen under ONE guard, so the tags this call removes
+        // keys from are the tags the resource held when it was found.
+        let mut store = state.lock();
+
+        let Some(stored) = store.tags_of_resource_mut(&input.resource_arn, &region) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::required_resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Removing a tag takes away only the keys the request names; a key the resource
+        // does not carry is already absent, so naming it removes nothing and fails
+        // nothing.
+        let mut remaining = stored.clone().unwrap_or_default();
+        for key in &input.tag_keys {
+            remaining.remove(key);
+        }
+
+        // A resource left carrying no tags carries none — the same record a resource
+        // created without tags holds, so both read back as an empty tag map.
+        *stored = if remaining.is_empty() {
+            None
+        } else {
+            Some(remaining)
+        };
+        drop(store);
+
+        Ok(UntagResourceOutput {})
     }
 }

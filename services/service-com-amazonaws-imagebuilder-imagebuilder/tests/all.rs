@@ -43,5 +43,7 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/tag_resource_resource_kinds.rs"]
 mod tag_resource_resource_kinds;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/versioned_resource_responses.rs"]
 mod versioned_resource_responses;
