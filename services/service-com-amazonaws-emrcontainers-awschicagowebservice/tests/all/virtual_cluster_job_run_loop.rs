@@ -85,17 +85,80 @@ pub(crate) struct Emr {
     /// that has to stage a condition no request reaches can reach this service's store
     /// ([`Self::store`]).
     engine: Arc<engine::InMemoryEngine>,
+    /// The in-process seam an AWS SDK client reaches this emulator through, so a suite can
+    /// drive a service mounted BESIDE this one through that service's own API — the very
+    /// seam this service's own handlers reach a peer through.
+    callback: smithy_server_runtime::EmbeddedEmulator,
 }
 
 impl Emr {
     pub(crate) fn new() -> Self {
+        Self::mounted(None, false)
+    }
+
+    /// The same emulator, reachable at `base` instead of the unserved default
+    /// ([`smithy_server_runtime::UNSERVED_URL_BASE`]): what `ctx.endpoint()` answers, and
+    /// so what an address a handler hands out is built from.
+    ///
+    /// `crate::managed_endpoint_connection` drives two bases through this one request path,
+    /// because a `serverUrl` that named a fixed host rather than the emulator's own would
+    /// pass against only one of them.
+    pub(crate) fn with_url_base(base: &str) -> Self {
+        Self::mounted(
+            Some(
+                smithy_server_runtime::EndpointUrl::parse(base)
+                    .unwrap_or_else(|| panic!("{base:?} is a usable emulator base URL")),
+            ),
+            false,
+        )
+    }
+
+    /// The same emulator with Amazon EKS and Amazon EC2 mounted BESIDE this service on the
+    /// one shared engine, the way the assembled emulator mounts them.
+    ///
+    /// A managed endpoint's placement is the CONTAINER cluster's, and the only answer to
+    /// what network a cluster is in is the service that owns it, so the suite that asserts
+    /// the placement (`crate::managed_endpoint_connection`) creates every container cluster
+    /// through Amazon EKS's own API and reads the account's subnets from Amazon EC2's.
+    pub(crate) fn with_container_clusters() -> Self {
+        Self::mounted(None, true)
+    }
+
+    /// The in-process seam of [`Self::with_container_clusters`]: an AWS SDK client built on
+    /// it routes to the services mounted here and opens no socket.
+    pub(crate) fn callback(&self) -> &smithy_server_runtime::EmbeddedEmulator {
+        &self.callback
+    }
+
+    fn mounted(
+        url_base: Option<smithy_server_runtime::EndpointUrl>,
+        container_clusters: bool,
+    ) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // This suite signs nothing, so pin authentication off rather than inheriting the
         // process-wide switch.
         router.set_request_authentication(false);
+        if let Some(base) = url_base {
+            router.set_url_base(base);
+        }
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
+        if container_clusters {
+            router.register_service(
+                service_com_amazonaws_eks_awswesleyfrontend::EmulatedService::new(Arc::clone(
+                    &engine,
+                )),
+            );
+            router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+                Arc::clone(&engine),
+            ));
+        }
+        let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
+        Self {
+            router,
+            engine,
+            callback,
+        }
     }
 
     /// This service's store in that engine — the very one every handler above reads and

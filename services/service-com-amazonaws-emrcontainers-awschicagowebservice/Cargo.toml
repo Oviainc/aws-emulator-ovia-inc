@@ -21,14 +21,53 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The ONE reading of a caller-supplied Region as a Region LABEL, for the in-process hop
+# below: a Region reaches that call in an endpoint URL's authority, so it is held to the
+# grammar every model's ARN pattern states rather than interpolated as given.
+service-common = { path = "../common" }
+# A managed endpoint's `securityGroup` and `subnetIds` are the CONTAINER CLUSTER's
+# networking, and that cluster is Amazon EKS's resource: the placement is read off
+# `eks:DescribeCluster` over the in-process callback
+# (`state::container_cluster_network`), so this service keeps no second answer to which
+# network a cluster is in. Only the generated client is needed, as the sibling guardduty
+# service declares it for the same hop.
+aws-sdk-eks = { version = "1", default-features = false }
 # SHA-256 behind `state::request_fingerprint`: the fixed-size digest that decides
 # whether a replayed `@idempotencyToken` carries the same request.
 sha2 = { workspace = true }
 # Renders that digest as the hex string the record stores.
 hex = { workspace = true }
+# `CreateManagedEndpoint` provisions a gateway, and the certificate that secures its
+# address is a REAL self-signed X.509 certificate generated here
+# (`state::managed_endpoint_connection`) rather than text in the shape of one. The
+# maintained generator the sibling services in this tree use for certificate material, at
+# the same version.
+rcgen = "0.13"
+# The CIVIL DAY a certificate's validity window is stated in: the UTC day the endpoint was
+# created and the day its certificate expires. The maintained date library the sibling
+# services in this tree use, with the same `default-features = false` + `std` spelling, so
+# no time-zone database is pulled in.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# Reads the certificate `CreateManagedEndpoint` generated for a managed endpoint back as
+# X.509 — its subject, its subject alternative names and its validity window — so the
+# suite asserts the member carries a real certificate rather than text that looks like
+# one. The maintained reader the sibling acm service uses, at the same version.
+x509-cert = "0.2"
+# The placement an endpoint reports is the container cluster's, so Amazon EKS is mounted
+# BESIDE this service on the suite's own engine and every cluster a case names is created
+# through EKS's OWN API; EC2 comes with it because that is where EKS resolves a cluster's
+# subnets and mints its security group, so the ids asserted here are the ones the account
+# really has (`tests/all/managed_endpoint_connection.rs`).
+service-com-amazonaws-eks-awswesleyfrontend = { workspace = true }
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# The subnets the account has are asked of EC2 through its own API over the in-process
+# callback, the same seam this service resolves a placement through.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [lints]
 workspace = true

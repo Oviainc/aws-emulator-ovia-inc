@@ -103,6 +103,105 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The container cluster the virtual cluster this create names is backed by, or the
+/// modelled refusal for a cluster that cannot host a managed endpoint.
+///
+/// A managed endpoint is a gateway INTO a virtual cluster, so the cluster is resolved out
+/// of state first, in the region the request is signed for: one that was never created
+/// here, or one that is no longer RUNNING because it was deleted, cannot host an endpoint.
+/// The two are distinguished in the MESSAGE: a cluster that is not there is reported with
+/// the one not-found wording of this service ([`crate::state::ResourceKind`]), while one
+/// that exists but cannot host an endpoint is reported as what it is.
+///
+/// What it answers with is `ContainerProvider$id` — "The ID of the container cluster" —
+/// whose owner is asked for the network the gateway runs in.
+///
+/// Taken by reference and called on EVERY lock this operation holds, so the cluster is
+/// still hostable on the lock the record is written under.
+fn hosting_container_cluster(
+    state: &crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState,
+    region: &str,
+    virtual_cluster_id: &str,
+) -> Result<String, CreateManagedEndpointError> {
+    let hosting = state
+        .virtual_cluster(region, virtual_cluster_id)
+        .map(|cluster| {
+            (
+                cluster.state.clone(),
+                cluster.container_provider.id.clone(),
+            )
+        });
+    match hosting {
+        Some((cluster_state, container_cluster_id))
+            if cluster_state == crate::state::CLUSTER_RUNNING =>
+        {
+            Ok(container_cluster_id)
+        }
+        resolved => {
+            let message = match resolved {
+                None => {
+                    crate::state::ResourceKind::VirtualCluster.not_found_message(virtual_cluster_id)
+                }
+                Some(_) => format!(
+                    "Virtual cluster {virtual_cluster_id} is not available to host a managed \
+                     endpoint"
+                ),
+            };
+            Err(
+                CreateManagedEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            )
+        }
+    }
+}
+
+/// The endpoint a replayed `clientToken` already minted, when this request is that replay.
+///
+/// `clientToken` is `@idempotencyToken`: the same token replayed names the endpoint the
+/// first call minted rather than provisioning a second gateway. The same token carrying a
+/// DIFFERENT request is not a replay — answering it with the first endpoint would silently
+/// drop the parameters this call asked for — so it is refused.
+///
+/// Called on every lock this operation holds, for the same reason as
+/// [`hosting_container_cluster`]: a racing create may have spent the token while nothing
+/// was locked.
+fn replayed_endpoint(
+    state: &crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState,
+    region: &str,
+    scope: &str,
+    virtual_cluster_id: &str,
+    client_token: &str,
+    fingerprint: &str,
+) -> Result<Option<CreateManagedEndpointOutput>, CreateManagedEndpointError> {
+    let minted = state.replayed_idempotency(region, scope, client_token).cloned();
+    let Some(existing) =
+        minted.and_then(|id| state.managed_endpoint(region, virtual_cluster_id, &id))
+    else {
+        return Ok(None);
+    };
+    if existing.request_fingerprint != fingerprint {
+        return Err(CreateManagedEndpointErrorModeled::ValidationException(
+            ValidationException {
+                // The one wording an idempotency conflict carries in this service
+                // ([`crate::state::IDEMPOTENCY_CONFLICT_MESSAGE`]): fixed text, naming
+                // neither the token nor the endpoint it already minted.
+                message: Some(crate::state::IDEMPOTENCY_CONFLICT_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+    Ok(Some(CreateManagedEndpointOutput {
+        id: Some(existing.id.clone()),
+        name: Some(existing.name.clone()),
+        arn: Some(existing.arn.clone()),
+        virtual_cluster_id: Some(existing.virtual_cluster_id.clone()),
+    }))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -188,66 +287,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it depends on nothing in state, and the lock is what serialises racing creates
         // that share one token.
         let fingerprint = crate::state::request_fingerprint(&input);
-        let mut state = store.lock();
-        state.settle();
+        // The gateway this endpoint is reached at is THIS emulator: `ctx.endpoint()` is the
+        // base a later request addresses.
+        let gateway = ctx.endpoint();
 
-        // A managed endpoint is a gateway INTO a virtual cluster, so the cluster is
-        // resolved out of state first, in the region this request is signed for: one that
-        // was never created here, or one that is no longer RUNNING because it was deleted,
-        // cannot host an endpoint. The two are distinguished in the MESSAGE: a cluster that
-        // is not there is reported with the one not-found wording of this service
-        // ([`crate::state::ResourceKind`]), while one that exists but cannot host an
-        // endpoint is reported as what it is.
-        let cluster_state = state
-            .virtual_cluster(&region, &input.virtual_cluster_id)
-            .map(|cluster| cluster.state.clone());
-        if cluster_state.as_deref() != Some(crate::state::CLUSTER_RUNNING) {
-            let message = match cluster_state {
-                None => crate::state::ResourceKind::VirtualCluster
-                    .not_found_message(&input.virtual_cluster_id),
-                Some(_) => format!(
-                    "Virtual cluster {} is not available to host a managed endpoint",
-                    input.virtual_cluster_id
-                ),
-            };
-            return Err(CreateManagedEndpointErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(message),
+        // The cluster this endpoint would gateway into, and the replay of a spent token,
+        // are both facts of THIS store, so they are answered first, under one lock — and
+        // that lock is released before anything is asked of another service.
+        let container_cluster_id = {
+            let mut state = store.lock();
+            state.settle();
+            let container_cluster_id =
+                hosting_container_cluster(&state, &region, &input.virtual_cluster_id)?;
+            if let Some(replayed) = replayed_endpoint(
+                &state,
+                &region,
+                &scope,
+                &input.virtual_cluster_id,
+                &input.client_token,
+                &fingerprint,
+            )? {
+                return Ok(replayed);
+            }
+            container_cluster_id
+        };
+
+        // With no lock held and nothing of this store touched: the network the gateway runs
+        // in belongs to the container cluster, so it is asked of the service that OWNS it
+        // ([`crate::state::container_cluster_network`]) rather than derived here, and the
+        // certificate that secures the endpoint's address is generated. Neither depends on
+        // this store, and both are past the two refusals above, so a create that is going
+        // to be refused pays for neither.
+        let network =
+            crate::state::container_cluster_network(ctx, &region, &container_cluster_id).await;
+        let created_at_millis = crate::state::now_millis();
+        let Some(certificate_data) = crate::state::mint_endpoint_certificate(
+            gateway.as_str(),
+            &input.name,
+            created_at_millis,
+        ) else {
+            // An endpoint whose address nothing secures is not stored: the caller is told
+            // the gateway could not be provisioned.
+            return Err(CreateManagedEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "this emulator could not generate the managed endpoint's certificate"
+                            .to_string(),
+                    ),
                 },
             )
             .into());
-        }
+        };
 
-        // `clientToken` is `@idempotencyToken`: the same token replayed names the endpoint
-        // the first call minted rather than provisioning a second gateway. The same token
-        // carrying a DIFFERENT request is not a replay — answering it with the first
-        // endpoint would silently drop the parameters this call asked for — so it is
-        // refused.
-        let replayed = state
-            .replayed_idempotency(&region, &scope, &input.client_token)
-            .cloned();
-        if let Some(existing) =
-            replayed.and_then(|id| state.managed_endpoint(&region, &input.virtual_cluster_id, &id))
-        {
-            if existing.request_fingerprint != fingerprint {
-                return Err(CreateManagedEndpointErrorModeled::ValidationException(
-                    ValidationException {
-                        // The one wording an idempotency conflict carries in this service
-                        // ([`crate::state::IDEMPOTENCY_CONFLICT_MESSAGE`]): fixed text,
-                        // naming neither the token nor the endpoint it already minted.
-                        message: Some(
-                            crate::state::IDEMPOTENCY_CONFLICT_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into());
-            }
-            return Ok(CreateManagedEndpointOutput {
-                id: Some(existing.id.clone()),
-                name: Some(existing.name.clone()),
-                arn: Some(existing.arn.clone()),
-                virtual_cluster_id: Some(existing.virtual_cluster_id.clone()),
-            });
+        // The lock the record is WRITTEN under. The hop above ran with nothing locked, so
+        // the hosting cluster could have been deleted and the token could have been spent
+        // in the meantime: both are resolved again here, on this lock, so what is stored is
+        // what the store's state supports at the moment it is stored.
+        let mut state = store.lock();
+        state.settle();
+        hosting_container_cluster(&state, &region, &input.virtual_cluster_id)?;
+        if let Some(replayed) = replayed_endpoint(
+            &state,
+            &region,
+            &scope,
+            &input.virtual_cluster_id,
+            &input.client_token,
+            &fingerprint,
+        )? {
+            return Ok(replayed);
         }
 
         // The store is capped, and an endpoint that has been torn down is reclaimed to
@@ -291,11 +398,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             certificate_arn: input.certificate_arn,
             configuration_overrides: input.configuration_overrides,
             session_idle_timeout_in_minutes: input.session_idle_timeout_in_minutes,
-            created_at_millis: crate::state::now_millis(),
+            created_at_millis,
             tags: input.tags.unwrap_or_default(),
             client_token: input.client_token,
             request_fingerprint: fingerprint,
             sequence,
+            // What the endpoint is reached through, settled here and never again: the
+            // address is this emulator's own followed by the endpoint's path, the
+            // certificate is the one generated above for that address, and the placement is
+            // the one the container cluster's owner reported.
+            connection: crate::state::endpoint_connection(
+                gateway.as_str(),
+                &input.virtual_cluster_id,
+                &id,
+                certificate_data,
+                network,
+            ),
             pending: Some(crate::state::PendingTransition::due(
                 crate::state::ENDPOINT_ACTIVE,
             )),

@@ -31,6 +31,8 @@ mod job_template_lifecycle;
 mod list_cursor_canonical_spelling;
 #[path = "all/list_cursor_region_scope.rs"]
 mod list_cursor_region_scope;
+#[path = "all/managed_endpoint_connection.rs"]
+mod managed_endpoint_connection;
 #[path = "all/managed_endpoint_create_admission.rs"]
 mod managed_endpoint_create_admission;
 #[path = "all/managed_endpoint_delete.rs"]
