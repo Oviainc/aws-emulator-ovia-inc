@@ -307,6 +307,14 @@ pub fn thing_version_conflict_message(thing_name: &str, expected: i64, registere
     format!("expectedVersion {expected} does not match the version {registered} of thing {thing_name}")
 }
 
+/// How AWS IoT states that an `expectedVersion` does not match a THING GROUP's version:
+/// one fixed sentence whose only variable part is the group the request addressed. The
+/// versions themselves are NOT part of it — unlike a thing's refusal, this family's
+/// sentence reports neither the version asked for nor the one the registry holds.
+pub fn thing_group_version_conflict_message(thing_group_name: &str) -> String {
+    format!("The version for thing group {thing_group_name} does not match the expected version.")
+}
+
 /// The configuration of a thing group: the members of a `CreateThingGroup` request
 /// that describe the group rather than name it.
 ///
@@ -2742,6 +2750,13 @@ pub use thing_registration::ThingRegistrationTask;
 // `crate::state::<name>`.
 pub mod thing_update;
 pub use thing_update::{AttributeUpdate, ThingUpdate, ThingUpdateRefusal};
+
+// What an UPDATE of a thing GROUP record changes — the properties the request carries,
+// under the same optimistic concurrency `expectedVersion` states — lives in
+// `state/thing_group_update.rs`, beside the thing update for the same reason. Its names
+// are re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod thing_group_update;
+pub use thing_group_update::{ThingGroupUpdate, ThingGroupUpdateRefusal};
 
 // What an X.509 DEVICE CERTIFICATE is — the record one holds, and the real RSA key pair
 // and certificate `CreateKeysAndCertificate` issues — lives in `state/certificates.rs`,

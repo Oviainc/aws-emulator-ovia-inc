@@ -71,6 +71,8 @@ mod role_alias_registry;
 mod state_roundtrip;
 #[path = "all/thing_group_hierarchy.rs"]
 mod thing_group_hierarchy;
+#[path = "all/thing_group_update.rs"]
+mod thing_group_update;
 #[path = "all/thing_listing.rs"]
 mod thing_listing;
 #[path = "all/thing_registry_lifecycle.rs"]

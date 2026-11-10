@@ -41,8 +41,10 @@ pub struct AttributeUpdate {
 }
 
 impl AttributeUpdate {
-    /// Apply the provided list to `attributes`, the attributes a thing record holds.
-    fn apply_to(&self, attributes: &mut BTreeMap<String, String>) {
+    /// Apply the provided list to `attributes`, the attributes a record holds — a thing's
+    /// or a thing group's, since `merge` is modelled for `UpdateThing` and
+    /// `UpdateThingGroup` alike.
+    pub fn apply_to(&self, attributes: &mut BTreeMap<String, String>) {
         if !self.merge {
             // Not a merge: the provided list is what the thing has afterwards, so
             // whatever the record held and the list does not name is gone.
