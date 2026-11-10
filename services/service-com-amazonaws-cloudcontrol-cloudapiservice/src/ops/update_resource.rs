@@ -235,6 +235,7 @@ enum StoreVerdict {
 /// a request can make expensive — happens between them with no lock held.
 fn judge_against_store(
     store: &crate::state::ComAmazonawsCloudcontrolCloudapiserviceState,
+    native: &crate::state::native::NativeResources,
     input: &UpdateResourceInput,
     fingerprint: &str,
 ) -> Result<StoreVerdict, UpdateResourceError> {
@@ -270,13 +271,14 @@ fn judge_against_store(
     if let Some(holding) = store.in_flight_request(&input.type_name, &input.identifier) {
         return Err(concurrent_operation(&input.identifier, Some(holding)));
     }
-    let Some(stored) = store.resource(&input.type_name, &input.identifier) else {
+    let Some(resolved) = store.resolve(native, &input.type_name, &input.identifier) else {
         // A not-found is the OWNING handler's verdict, so the refusal carries that
         // handler's whole answer: its diagnostic, the handler error code it failed with
         // and the token of the invocation that failed.
         return Err(UpdateResourceErrorModeled::ResourceNotFoundException(
             ResourceNotFoundException {
                 message: Some(crate::state::resource_not_found_refusal(
+                    native,
                     &input.type_name,
                     &input.identifier,
                 )),
@@ -285,8 +287,8 @@ fn judge_against_store(
         .into());
     };
     Ok(StoreVerdict::Update(
-        stored.properties.clone(),
-        stored.identifier_property.clone(),
+        resolved.properties,
+        resolved.identifier_property,
     ))
 }
 
@@ -301,6 +303,7 @@ fn judge_against_store(
 /// since replaced or removed.
 fn overlapping_operation(
     store: &crate::state::ComAmazonawsCloudcontrolCloudapiserviceState,
+    native: &crate::state::native::NativeResources,
     input: &UpdateResourceInput,
     base: &::serde_json::Value,
 ) -> Option<UpdateResourceError> {
@@ -308,8 +311,8 @@ fn overlapping_operation(
         .in_flight_request(&input.type_name, &input.identifier)
         .map(str::to_string);
     let moved = store
-        .resource(&input.type_name, &input.identifier)
-        .is_none_or(|stored| &stored.properties != base);
+        .resolve(native, &input.type_name, &input.identifier)
+        .is_none_or(|resolved| &resolved.properties != base);
     (holding.is_some() || moved)
         .then(|| concurrent_operation(&input.identifier, holding.as_deref()))
 }
@@ -398,14 +401,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(&input.patch_document),
         ]);
         let resource = crate::state::resource_label(&input.type_name, &input.identifier);
+        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
 
         // Everything this service's own store answers is judged first, under a lock that
         // is DROPPED before the patch below — so no caller waits on the store while
         // another caller's patch is computed.
         let (base, identifier_property) = {
             let mut store = state.lock();
-            store.materialise_due(::std::time::SystemTime::now());
-            match judge_against_store(&store, &input, &fingerprint)? {
+            store.materialise_due(::std::time::SystemTime::now(), &native);
+            match judge_against_store(&store, &native, &input, &fingerprint)? {
                 StoreVerdict::Replay(progress_event, request_token) => {
                     drop(store);
                     crate::state::audit(
@@ -456,8 +460,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // operation that overlapped this one may have replaced or removed that
             // model, which is contention rather than a bad request.
             let mut store = state.lock();
-            store.materialise_due(::std::time::SystemTime::now());
-            if let Some(overlap) = overlapping_operation(&store, &input, &base) {
+            store.materialise_due(::std::time::SystemTime::now(), &native);
+            if let Some(overlap) = overlapping_operation(&store, &native, &input, &base) {
                 return Err(overlap);
             }
             drop(store);
@@ -486,8 +490,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // more under THAT lock, so what lands is judged against the store as it is THEN.
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        store.materialise_due(now);
-        match judge_against_store(&store, &input, &fingerprint)? {
+        store.materialise_due(now, &native);
+        match judge_against_store(&store, &native, &input, &fingerprint)? {
             StoreVerdict::Replay(progress_event, request_token) => {
                 drop(store);
                 crate::state::audit(

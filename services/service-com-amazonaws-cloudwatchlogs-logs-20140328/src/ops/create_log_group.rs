@@ -203,12 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         // "Log group names can't start with the string aws/" — a naming guideline this
-        // operation's own documentation states, so a name that breaks it is refused.
-        if input.log_group_name.starts_with("aws/") {
+        // operation's own documentation states, so a name that breaks it is refused. The
+        // rule and its sentence are the shared ones
+        // ([`::service_common::cloudwatch_logs`]), so every caller that creates a log group
+        // refuses such a name alike.
+        if ::service_common::cloudwatch_logs::is_reserved_log_group_name(&input.log_group_name) {
             return Err(CreateLogGroupErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(
-                        "logGroupName must not start with the string 'aws/'".to_string(),
+                        ::service_common::cloudwatch_logs::reserved_log_group_name_message(),
                     ),
                 },
             )

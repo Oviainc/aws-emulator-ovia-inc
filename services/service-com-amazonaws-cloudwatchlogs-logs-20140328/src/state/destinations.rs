@@ -97,6 +97,53 @@ pub fn destination_arn(region: &str, name: &str) -> String {
 /// without naming which one failed.
 pub const DESTINATION_ARN_PARSE_FAILED: &str = "Error parsing ARN from given role or target";
 
+/// What this service states for a put that would create a destination past
+/// [`MAX_DESTINATIONS`]: the quota that refused it.
+///
+/// Stated once here because more than one caller creates a destination — this service's own
+/// `PutDestination`, and the resource operations another service runs on one — and the quota
+/// is the account's, so both refuse past it with the same sentence.
+pub fn destinations_quota_message() -> String {
+    format!("an account can have up to {MAX_DESTINATIONS} destinations")
+}
+
+/// The shortest name a logical destination is held under — the minimum the model gives
+/// `DestinationName` (`@length(min: 1, max: 512)`), so the empty string names none.
+pub const MIN_DESTINATION_NAME_CHARS: usize = 1;
+
+/// The longest such name; see [`MIN_DESTINATION_NAME_CHARS`].
+pub const MAX_DESTINATION_NAME_CHARS: usize = 512;
+
+/// The characters `DestinationName`'s own `@pattern("^[^:*]*$")` keeps out of one, as a
+/// refusal names them.
+const DESTINATION_NAME_EXCLUDED_CHARACTERS: [char; 2] = [':', '*'];
+/// Whether `value` is a name this service holds a destination under: inside the length its
+/// model gives `DestinationName`, and carrying none of the characters its pattern excludes.
+///
+/// The rule lives here, once, so this service's own wire edge — where the modelled
+/// constraints are checked — and any other service that creates a destination on a
+/// caller's behalf cannot disagree about which names it holds.
+pub fn is_destination_name(value: &str) -> bool {
+    let length = value.chars().count();
+    (MIN_DESTINATION_NAME_CHARS..=MAX_DESTINATION_NAME_CHARS).contains(&length)
+        && !value.contains(DESTINATION_NAME_EXCLUDED_CHARACTERS)
+}
+
+/// The requirement a refused destination name failed: the member's WHOLE accepted domain in
+/// one sentence, so a name refused for its length and one refused for a character it
+/// carries are answered with the same rule.
+pub fn destination_name_requirement() -> String {
+    let excluded: Vec<String> = DESTINATION_NAME_EXCLUDED_CHARACTERS
+        .iter()
+        .map(|character| format!("'{character}'"))
+        .collect();
+    format!(
+        "must be {MIN_DESTINATION_NAME_CHARS} to {MAX_DESTINATION_NAME_CHARS} characters and \
+         carry none of {}",
+        excluded.join(", ")
+    )
+}
+
 /// The size of the access policy one destination can carry:
 /// `PutDestinationPolicy$accessPolicy` is documented "This can be up to 5120 bytes", a ceiling
 /// the model's `AccessPolicy` shape does not express (`@length` min 1 only), so the handler

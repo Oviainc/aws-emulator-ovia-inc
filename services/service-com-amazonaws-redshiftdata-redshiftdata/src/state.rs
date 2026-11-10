@@ -2120,8 +2120,7 @@ fn read_catalog(
             .map(|column| {
                 let declared = column
                     .decl_type()
-                    .map(str::to_ascii_lowercase)
-                    .map(|declared| ColumnType::from_declared(&declared));
+                    .map(|decl| ColumnType::from_declared(&decl.to_ascii_lowercase()));
                 table_column_metadata(column.name(), declared.as_ref(), &name)
             })
             .collect();

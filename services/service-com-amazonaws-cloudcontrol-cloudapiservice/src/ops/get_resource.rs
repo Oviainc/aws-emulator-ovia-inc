@@ -244,14 +244,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the clock already owes the store: a create whose work has fallen due has
         // provisioned its resource and a delete whose work has fallen due has removed
         // one, whether or not anybody called in between.
-        store.materialise_due(::std::time::SystemTime::now());
-        let Some(stored) = store.resource(&input.type_name, &input.identifier) else {
+        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
+        store.materialise_due(::std::time::SystemTime::now(), &native);
+        // "You can use this action to return information about an existing resource in
+        // your account and Amazon Web Services Region, whether those resources were
+        // provisioned using Cloud Control API": the resource is resolved wherever it
+        // LIVES — the owning service's own state for a type that service holds the
+        // resources of — so a resource this service never created still reads, and one
+        // the owning service has since removed no longer does.
+        let Some(resolved) = store.resolve(&native, &input.type_name, &input.identifier) else {
             // A not-found is the OWNING handler's verdict, so the refusal carries that
             // handler's whole answer: its diagnostic, the handler error code it failed
             // with and the token of the invocation that failed.
             return Err(GetResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_refusal(
+                        &native,
                         &input.type_name,
                         &input.identifier,
                     )),
@@ -260,8 +268,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         Ok(GetResourceOutput {
-            type_name: Some(stored.type_name.clone()),
-            resource_description: Some(crate::state::resource_description(stored)),
+            type_name: Some(resolved.type_name.clone()),
+            resource_description: Some(crate::state::resource_description(&resolved)),
         })
     }
 }

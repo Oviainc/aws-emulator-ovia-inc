@@ -257,7 +257,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // What the clock already owes the store, so one listing cannot report a resource
         // another read says no longer exists.
-        store.materialise_due(::std::time::SystemTime::now());
+        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
+        store.materialise_due(::std::time::SystemTime::now(), &native);
 
         // A continuation token carries the position it names, so only the authenticator
         // inside it tells one this store minted from one a caller wrote — and a token
@@ -281,39 +282,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(crate::state::MAX_PAGE_SIZE)
             .clamp(1, crate::state::MAX_PAGE_SIZE);
 
-        // One more than the page is read, so the presence of a further resource — and
-        // the position to resume at — is known without scanning the rest of the type.
-        let mut page: Vec<&crate::state::StoredResource> = store
-            .resources_of_type(&input.type_name)
-            .filter(|stored| {
-                resume_after
-                    .as_deref()
-                    .is_none_or(|from| stored.identifier.as_str() > from)
-            })
-            .filter(|stored| {
+        // ONE window of the inventory is read: the page this call is about to report, and
+        // one resource past it so the presence of a further resource — and the position to
+        // resume at — is known without reading the rest of the type. The window is applied
+        // AT the inventory (`resolve_type`), so the work and the memory one listing drives
+        // are the page it answers rather than the size of the store behind it, whichever
+        // store that is.
+        //
+        // The inventory is the one that EXISTS: for a type another service owns the
+        // resources of, that service's own state is what is listed, so a resource it
+        // holds is reported whichever API created it.
+        let mut examined =
+            store.resolve_type(&native, &input.type_name, resume_after.as_deref(), page_size + 1);
+        // A window that came back full may have more behind it; one that came back short
+        // reached the end of the type, which is what tells a client to stop.
+        let further = examined.len() > page_size;
+        if further {
+            examined.truncate(page_size);
+        }
+        // Where the next call resumes: after the last resource this one EXAMINED, which
+        // is the last of the window whether or not the selector below reports it — so a
+        // narrowed listing walks the inventory once rather than re-reading it.
+        let resume_at = examined.last().map(|resolved| resolved.identifier.clone());
+        // "The resource model to use to select the resources to return": the page reports
+        // the resources of the window whose own model carries every property the selector
+        // names, so a narrowed page may be shorter than `MaxResults` ("the maximum number
+        // of results to be returned with a single call") while a token still names where
+        // to go on.
+        let page: Vec<crate::state::ResolvedResource> = examined
+            .into_iter()
+            .filter(|resolved| {
                 selector.as_ref().is_none_or(|selector| {
-                    crate::state::properties_match_selector(&stored.properties, selector)
+                    crate::state::properties_match_selector(&resolved.properties, selector)
                 })
             })
-            .take(page_size + 1)
             .collect();
-        let next_token = if page.len() > page_size {
-            page.truncate(page_size);
-            page.last().map(|stored| {
-                crate::state::encode_page_token(
-                    &key,
-                    &crate::state::page_cursor(&input.type_name, &stored.identifier),
-                )
-            })
-        } else {
-            // The last page carries no token, which is what tells a client to stop.
-            None
-        };
+        let next_token = further.then_some(resume_at).flatten().map(|identifier| {
+            crate::state::encode_page_token(
+                &key,
+                &crate::state::page_cursor(&input.type_name, &identifier),
+            )
+        });
 
         Ok(ListResourcesOutput {
             type_name: Some(input.type_name.clone()),
             resource_descriptions: Some(
-                page.into_iter()
+                page.iter()
                     .map(crate::state::resource_description)
                     .collect(),
             ),

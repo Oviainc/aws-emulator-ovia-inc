@@ -13,13 +13,27 @@ use super::emulator::{
     code, descriptions, message, progress, text, Emulator, STATUS_FAILED, STATUS_IN_PROGRESS,
     STATUS_SUCCESS,
 };
-use super::refusal_wording::assert_handler_not_found;
+use super::refusal_wording::{assert_handler_not_found, generic_already_exists};
 
 /// A resource type whose primary identifier the caller supplies.
 const BUCKET: &str = "AWS::S3::Bucket";
 
-/// A second resource type, so a case can tell one type's resources from another's.
+/// A second resource type, so a case can tell one type's resources from another's. Its
+/// resources live in the OWNING service's store (`AWS::Logs::LogGroup` is a CloudWatch
+/// Logs log group), so what a read reports for one is the model that service holds.
 const LOG_GROUP: &str = "AWS::Logs::LogGroup";
+
+/// The model a read reports for the log group `name`: its identity, the class every group
+/// carries and the read-only ARN the type's schema declares — rendered by the owning
+/// service's own ARN builder, so the case pins the group Cloud Control API resolved to the
+/// one CloudWatch Logs holds.
+fn log_group_model(name: &str) -> Value {
+    json!({
+        "LogGroupName": name,
+        "LogGroupClass": "STANDARD",
+        "Arn": engine::emulator_arn("logs", super::emulator::SIGNING_REGION, &format!("log-group:{name}:*")),
+    })
+}
 
 /// A type whose model a case grows with a patch, kept apart from the lifecycle rows.
 const STREAM: &str = "AWS::Kinesis::Stream";
@@ -129,7 +143,7 @@ async fn the_six_operations_run_end_to_end() {
     );
     assert_eq!(
         text(&duplicate, "StatusMessage"),
-        "Resource of type 'AWS::S3::Bucket' with identifier 'demo-bucket' already exists.",
+        generic_already_exists(BUCKET, "demo-bucket"),
         "a second create of the same resource: unexpected wording"
     );
     let stored = emulator.properties(BUCKET, "demo-bucket").await;
@@ -205,7 +219,7 @@ async fn the_six_operations_run_end_to_end() {
     assert_handler_not_found(
         &message(&body),
         BUCKET,
-        &format!("Resource of type '{BUCKET}' with identifier 'demo-bucket' was not found."),
+        &super::refusal_wording::generic_not_found(BUCKET, "demo-bucket"),
         "GetResource after the delete",
     );
     let walked = emulator.walk(BUCKET, None).await;
@@ -297,10 +311,13 @@ async fn a_resource_operation_is_in_progress_before_it_completes() {
         settled["RetryAfter"].is_null(),
         "a completed request has nothing left to ask again for, got {settled:?}"
     );
+    // The resource lives in the owning service's store, so the model reported is the one
+    // CloudWatch Logs holds for the group this create provisioned.
     let stored = emulator.properties(LOG_GROUP, "app-logs").await;
+    let expected = log_group_model("app-logs");
     assert_eq!(
-        stored, desired,
-        "GetResource after the create: expected {desired:?}, got {stored:?}"
+        stored, expected,
+        "GetResource after the create: expected {expected:?}, got {stored:?}"
     );
 }
 
@@ -471,9 +488,7 @@ async fn unknown_identifiers_and_tokens_are_the_modelled_refusals() {
         assert_handler_not_found(
             &message(&body),
             BUCKET,
-            &format!(
-                "Resource of type '{BUCKET}' with identifier 'absent-bucket' was not found."
-            ),
+            &super::refusal_wording::generic_not_found(BUCKET, "absent-bucket"),
             case,
         );
     }

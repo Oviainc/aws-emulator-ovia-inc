@@ -20,6 +20,15 @@
 //! Every read goes through [`ComAmazonawsCloudcontrolCloudapiserviceState::materialise_due`]
 //! first, so no two operations can disagree about which requests have completed or which
 //! resources exist.
+//!
+//! A [`StoredResource`] is NOT where every resource of every type lives. Cloud Control API
+//! is a front end over the resource type's own provider, so a type whose resources live in
+//! another service's store of this emulator is resolved and acted on THERE: that is
+//! [`native`], and every resolution in this module goes through it. This store holds the
+//! resources of the types no provider stands behind, which is the only place such a
+//! resource can live.
+
+pub mod native;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -27,6 +36,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use native::{NativeRefusal, NativeResources};
 
 /// The secret this service's `NextToken`s are authenticated under — the shared one every
 /// paginated read of this emulator uses, so no two services disagree about what makes a
@@ -157,6 +168,35 @@ pub struct StoredResource {
     pub updated_at: SystemTime,
 }
 
+/// One resource as it exists NOW, whichever store holds it: what a read reports and what a
+/// patch is applied to.
+///
+/// A resource of a type [`native`] stands behind is rendered from the OWNING service's
+/// record, and one of any other type from this store's [`StoredResource`] — so no caller
+/// of this module has to know which of the two a resource lives in.
+#[derive(Debug, Clone)]
+pub struct ResolvedResource {
+    /// The `TypeName` the resource belongs to.
+    pub type_name: String,
+    /// Its primary identifier.
+    pub identifier: String,
+    /// The property of the resource model that carries that identifier.
+    pub identifier_property: String,
+    /// The current resource model: a JSON object of each property and its value.
+    pub properties: Value,
+}
+
+impl From<&StoredResource> for ResolvedResource {
+    fn from(stored: &StoredResource) -> Self {
+        Self {
+            type_name: stored.type_name.clone(),
+            identifier: stored.identifier.clone(),
+            identifier_property: stored.identifier_property.clone(),
+            properties: stored.properties.clone(),
+        }
+    }
+}
+
 /// The work a resource operation request still owes the store.
 #[derive(Debug, Clone)]
 pub enum ResourceEffect {
@@ -168,6 +208,9 @@ pub enum ResourceEffect {
         identifier_property: String,
         /// The `TypeVersionId` the create named, when it named one.
         type_version_id: Option<String>,
+        /// The Region the call that accepted the create was signed for, which is the
+        /// Region a resource the OWNING service provisions is created in.
+        region: String,
     },
     /// Replace the resource's properties with the patched model.
     Update {
@@ -292,6 +335,30 @@ enum EffectFailure {
     ResourceGone,
     /// The resource a create was to provision is already in the store.
     ResourceExists,
+    /// The service that OWNS the resource type refused the work, in its own terms: the
+    /// `HandlerErrorCode` it failed with and its own diagnostic.
+    Owning {
+        /// The handler error code the owning service's refusal is reported under.
+        code: &'static str,
+        /// That service's own diagnostic.
+        detail: String,
+    },
+}
+
+impl From<NativeRefusal> for EffectFailure {
+    /// The owning service's refusal, as this store reports it: the two verdicts every type
+    /// shares are reported in Cloud Control API's own generic terms, and anything the
+    /// owning service states in its own terms carries that statement.
+    fn from(refusal: NativeRefusal) -> Self {
+        match &refusal {
+            NativeRefusal::NotFound => Self::ResourceGone,
+            NativeRefusal::AlreadyExists => Self::ResourceExists,
+            NativeRefusal::AtCapacity(detail) | NativeRefusal::Invalid(detail) => Self::Owning {
+                code: refusal.handler_error_code(),
+                detail: detail.clone(),
+            },
+        }
+    }
 }
 
 impl EffectFailure {
@@ -302,17 +369,21 @@ impl EffectFailure {
         match self {
             Self::ResourceGone => HANDLER_ERROR_NOT_FOUND,
             Self::ResourceExists => HANDLER_ERROR_ALREADY_EXISTS,
+            Self::Owning { code, .. } => code,
         }
     }
 
     /// The `StatusMessage` the record reports: the owning handler's own diagnostic for
     /// the resource the work was owed on. The handler error code is reported beside it in
     /// `ProgressEvent$ErrorCode`, so the message carries the detail alone.
-    fn status_message(&self, record: &RequestRecord) -> String {
+    fn status_message(&self, record: &RequestRecord, native: &NativeResources) -> String {
         let identifier = record.identifier.as_deref().unwrap_or_default();
         match self {
-            Self::ResourceGone => handler_not_found_detail(&record.type_name, identifier),
-            Self::ResourceExists => handler_already_exists_detail(&record.type_name, identifier),
+            Self::ResourceGone => handler_not_found_detail(native, &record.type_name, identifier),
+            Self::ResourceExists => {
+                handler_already_exists_detail(native, &record.type_name, identifier)
+            }
+            Self::Owning { detail, .. } => detail.clone(),
         }
     }
 }
@@ -368,7 +439,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
     ///
     /// Every operation of this service calls this before it reads anything, so no two of
     /// them can disagree about which requests have completed or which resources exist.
-    pub fn materialise_due(&mut self, now: SystemTime) {
+    pub fn materialise_due(&mut self, now: SystemTime, native: &NativeResources) {
         let due: Vec<String> = self
             .requests
             .iter()
@@ -387,7 +458,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                 continue;
             };
             if let Some(pending) = record.pending.take() {
-                match self.apply(&record, pending.effect, now) {
+                match self.apply(&record, pending.effect, now, native) {
                     Ok(resource_model) => {
                         record.resource_model = resource_model;
                         record.operation_status = STATUS_SUCCESS.to_string();
@@ -397,7 +468,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                         // actually happened rather than a success nothing performed.
                         record.operation_status = STATUS_FAILED.to_string();
                         record.error_code = Some(failure.error_code().to_string());
-                        record.status_message = Some(failure.status_message(&record));
+                        record.status_message = Some(failure.status_message(&record, native));
                     }
                 }
             } else {
@@ -418,14 +489,37 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
         record: &RequestRecord,
         effect: ResourceEffect,
         now: SystemTime,
+        native: &NativeResources,
     ) -> Result<Option<String>, EffectFailure> {
         let identifier = record.identifier.clone().unwrap_or_default();
+        // A type another service owns the resources of is acted on THERE, so the work this
+        // record owes is applied to that service's store and the model it leaves behind is
+        // the one that service then holds.
+        if let Some(provider) = native.provider(&record.type_name) {
+            return match effect {
+                ResourceEffect::Create {
+                    properties, region, ..
+                } => provider
+                    .create(&identifier, &properties, &region, now)
+                    .map(|model| Some(rendered_properties(&model)))
+                    .map_err(EffectFailure::from),
+                ResourceEffect::Update { properties } => provider
+                    .update(&identifier, &properties)
+                    .map(|model| Some(rendered_properties(&model)))
+                    .map_err(EffectFailure::from),
+                ResourceEffect::Delete => provider
+                    .delete(&identifier)
+                    .map(|()| None)
+                    .map_err(EffectFailure::from),
+            };
+        }
         let key = ResourceKey::new(&record.type_name, &identifier);
         match effect {
             ResourceEffect::Create {
                 properties,
                 identifier_property,
                 type_version_id,
+                region: _,
             } => {
                 // The create was accepted against a store that held no such resource;
                 // if one is there now, the owning handler is the one that finds it, so
@@ -477,28 +571,69 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
             .retain(|token| self.client_tokens.contains_key(token));
     }
 
-    /// The resource `identifier` of `type_name`, or `None` when this store holds none —
-    /// a resource of ANOTHER type never answers here, which is what makes the same
-    /// identifier under two types two resources.
-    pub fn resource(&self, type_name: &str, identifier: &str) -> Option<&StoredResource> {
-        self.resources.get(&ResourceKey::new(type_name, identifier))
+    /// The resource `identifier` of `type_name` as it exists NOW, or `None` when no store
+    /// holds it — a resource of ANOTHER type never answers here, which is what makes the
+    /// same identifier under two types two resources.
+    ///
+    /// Where a provider stands behind the type, the OWNING service's state is what
+    /// answers: a resource that service holds is resolved whichever API created it, and
+    /// one it no longer holds resolves to nothing even if this service created it.
+    pub fn resolve(
+        &self,
+        native: &NativeResources,
+        type_name: &str,
+        identifier: &str,
+    ) -> Option<ResolvedResource> {
+        if let Some(provider) = native.provider(type_name) {
+            return provider.read(identifier).map(|properties| ResolvedResource {
+                type_name: type_name.to_string(),
+                identifier: identifier.to_string(),
+                identifier_property: provider.identifier_property().to_string(),
+                properties,
+            });
+        }
+        self.resources
+            .get(&ResourceKey::new(type_name, identifier))
+            .map(ResolvedResource::from)
     }
 
-    /// Every resource of `type_name`, in identifier order.
+    /// The resources of `type_name` that exist NOW, in identifier order: at most `limit`
+    /// of them, and only those whose identifier sorts AFTER `after`.
     ///
-    /// A range scan bounded by the type: one type's keys are contiguous, so this reads
-    /// exactly that type's entries and stops at the first key belonging to another.
-    pub fn resources_of_type<'a>(
-        &'a self,
-        type_name: &'a str,
-    ) -> impl Iterator<Item = &'a StoredResource> + 'a {
+    /// Bounded at the inventory rather than after it, so the work one listing drives is
+    /// the window it is about to report and not the size of the inventory behind it: the
+    /// owning service's own ordered read where a provider stands behind the type, and
+    /// otherwise a range scan of this store bounded by the type, whose keys are
+    /// contiguous, so it reads exactly that type's entries and stops at the first key
+    /// belonging to another.
+    pub fn resolve_type(
+        &self,
+        native: &NativeResources,
+        type_name: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Vec<ResolvedResource> {
+        if let Some(provider) = native.provider(type_name) {
+            return provider
+                .list(after, limit)
+                .into_iter()
+                .map(|(identifier, properties)| ResolvedResource {
+                    type_name: type_name.to_string(),
+                    identifier,
+                    identifier_property: provider.identifier_property().to_string(),
+                    properties,
+                })
+                .collect();
+        }
         // `Identifier` is at least one character long, so the empty identifier sorts
         // before every real one and excluding it excludes nothing.
-        let start = ResourceKey::new(type_name, "");
+        let start = ResourceKey::new(type_name, after.unwrap_or_default());
         self.resources
             .range((Bound::Excluded(start), Bound::Unbounded))
             .take_while(move |(key, _)| key.type_name == type_name)
-            .map(|(_, stored)| stored)
+            .take(limit)
+            .map(|(_, stored)| ResolvedResource::from(stored))
+            .collect()
     }
 
     /// How many resources this store holds — what [`MAX_RESOURCES`] bounds.
@@ -903,6 +1038,17 @@ pub fn rendered_properties(properties: &Value) -> String {
 /// rather than with a code or wording the service has for it.
 pub const MAX_PATCH_OPERATIONS: usize = 100;
 
+/// The deepest a resource model may nest.
+///
+/// This is the depth the JSON reader itself admits in a document, so a model deeper than
+/// this is one no `DesiredState` or `ResourceModel` could have been read from the wire in
+/// the first place ([`parse_properties`]) and one no reader could report back. A PATCH can
+/// reach past it even though a document cannot: `copy` and `move` duplicate a whole
+/// subtree, so an operation that copies the model into one of its own children DOUBLES its
+/// depth while adding only a few bytes — which is why depth is bounded beside size
+/// ([`MAX_PROPERTIES_CHARACTERS`]) rather than left to it.
+pub const MAX_PROPERTIES_DEPTH: usize = 128;
+
 /// Why a patch document was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PatchRefusal {
@@ -920,6 +1066,8 @@ pub enum PatchRefusal {
     NotAnObject,
     /// The model it produced is longer than one this service can report.
     TooLarge,
+    /// The model it produced nests deeper than one this service can read or report.
+    TooDeep,
 }
 
 impl PatchRefusal {
@@ -943,6 +1091,10 @@ impl PatchRefusal {
             Self::TooLarge => format!(
                 "the patch document would leave a resource model longer than \
                  {MAX_PROPERTIES_CHARACTERS} characters"
+            ),
+            Self::TooDeep => format!(
+                "the patch document would leave a resource model nested deeper than \
+                 {MAX_PROPERTIES_DEPTH} levels"
             ),
         }
     }
@@ -1013,14 +1165,19 @@ pub fn patched_properties(patch: &::json_patch::Patch) -> BTreeSet<String> {
 }
 
 /// Apply `patch` to `properties`, ONE operation at a time, holding the document to the
-/// `Properties` bound after every one of them.
+/// `Properties` bounds after every one of them.
 ///
-/// The bound is checked BETWEEN operations rather than only at the end, because that is
-/// the only place it bounds the work: `copy` and `move` duplicate a whole subtree, so a
+/// The bounds are checked BETWEEN operations rather than only at the end, because that is
+/// the only place they bound the work: `copy` and `move` duplicate a whole subtree, so a
 /// document measured only once could have grown by a factor per operation on the way
-/// there. With the check between each pair, the largest document that can exist is one
+/// there — in SIZE, and in nesting DEPTH, which a few bytes of document can double. With
+/// the checks between each pair, the largest and deepest document that can exist is one
 /// operation's growth past the bound, and the operation count caps how many such steps a
 /// request can ask for ([`MAX_PATCH_OPERATIONS`]).
+///
+/// Depth is checked FIRST, and iteratively ([`properties_within_depth`]): every other walk
+/// of a `Value` — rendering it to measure its size, and dropping it — recurses once per
+/// level, so the depth bound is what keeps those walks inside the thread's stack.
 ///
 /// On a refusal `properties` may hold the operations applied before it, so a caller
 /// applies this to a COPY of the stored model and discards it unless the whole patch
@@ -1038,6 +1195,9 @@ pub fn apply_patch(properties: &mut Value, patch: &::json_patch::Patch) -> Resul
                 path,
             }
         })?;
+        if !properties_within_depth(properties) {
+            return Err(PatchRefusal::TooDeep);
+        }
         if !properties_within_bound(properties) {
             return Err(PatchRefusal::TooLarge);
         }
@@ -1048,6 +1208,28 @@ pub fn apply_patch(properties: &mut Value, patch: &::json_patch::Patch) -> Resul
         return Err(PatchRefusal::NotAnObject);
     }
     Ok(())
+}
+
+/// Whether `properties` nests no deeper than [`MAX_PROPERTIES_DEPTH`].
+///
+/// Walked ITERATIVELY, with an explicit stack of the values still to look at, so measuring
+/// a document deeper than this service will take cannot itself exhaust the thread's stack
+/// — which a recursive walk of exactly such a document is how it would.
+fn properties_within_depth(properties: &Value) -> bool {
+    let mut pending = vec![(properties, 1_usize)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_PROPERTIES_DEPTH {
+            return false;
+        }
+        match value {
+            Value::Array(items) => pending.extend(items.iter().map(|item| (item, depth + 1))),
+            Value::Object(members) => {
+                pending.extend(members.values().map(|member| (member, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Whether `properties` renders inside [`MAX_PROPERTIES_CHARACTERS`].
@@ -1418,22 +1600,71 @@ const HANDLER_ALREADY_EXISTS_DIAGNOSTICS: &[(&str, &str)] = &[(
 /// The status code an owning service reports for a resource that is not there.
 const HANDLER_NOT_FOUND_STATUS: u16 = 404;
 
+/// How a resource-provider exception names the resource it is about: the type's PRIMARY
+/// IDENTIFIER, rendered the way the CloudFormation registry renders one — a JSON object
+/// mapping the type's `primaryIdentifier` pointer into its schema to the value the
+/// resource holds there.
+///
+/// A request may address a resource by its primary identifier as a bare string, but what
+/// the handler holds is the identifier the type DECLARES, so that is what its diagnostics
+/// name: the one rule both the not-found and the already-exists diagnostic word the
+/// resource by.
+///
+/// Only for a type whose primary identifier this emulator's registry KNOWS — the property
+/// the owning service's provider declares. For any other type the identifier is named as
+/// the request spelled it: this registry holds no `primaryIdentifier` for it, and naming a
+/// pointer the type's schema may not declare would name a property its resources do not
+/// carry.
+pub fn rendered_primary_identifier(
+    native: &NativeResources,
+    type_name: &str,
+    identifier: &str,
+) -> String {
+    let Some(provider) = native.provider(type_name) else {
+        return identifier.to_string();
+    };
+    let pointer = format!("{PROPERTY_POINTER_PREFIX}{}", provider.identifier_property());
+    Value::Object(::serde_json::Map::from_iter([(
+        pointer,
+        Value::String(identifier.to_string()),
+    )]))
+    .to_string()
+}
+
 /// How every operation of this service words "a resource with the specified identifier
-/// can't be found", with the type and identifier the request named.
-pub fn resource_not_found_message(type_name: &str, identifier: &str) -> String {
-    format!("Resource of type '{type_name}' with identifier '{identifier}' was not found.")
+/// can't be found", with the type the request named and the resource's primary identifier
+/// as the registry renders one ([`rendered_primary_identifier`]).
+pub fn resource_not_found_message(type_name: &str, rendered_identifier: &str) -> String {
+    format!(
+        "Resource of type '{type_name}' with identifier '{rendered_identifier}' was not found."
+    )
 }
 
 /// The diagnostic the handler that owns `type_name` states for a resource it cannot
 /// find.
-pub fn handler_not_found_detail(type_name: &str, identifier: &str) -> String {
-    let Some((_, diagnostic)) = HANDLER_NOT_FOUND_DIAGNOSTICS
+pub fn handler_not_found_detail(
+    native: &NativeResources,
+    type_name: &str,
+    identifier: &str,
+) -> String {
+    owning_not_found_detail(type_name).unwrap_or_else(|| {
+        resource_not_found_message(
+            type_name,
+            &rendered_primary_identifier(native, type_name, identifier),
+        )
+    })
+}
+
+/// The OWNING SERVICE's own diagnostic for a resource it cannot find, or `None` for a type
+/// whose handler reports a not-found in Cloud Control API's own terms
+/// ([`resource_not_found_message`]) — which is what a handler built on the generic
+/// resource-provider base class states, because the not-found exception that base class
+/// throws names nothing but the type and the identifier.
+fn owning_not_found_detail(type_name: &str) -> Option<String> {
+    let (_, diagnostic) = HANDLER_NOT_FOUND_DIAGNOSTICS
         .iter()
-        .find(|(name, _)| *name == type_name)
-    else {
-        return resource_not_found_message(type_name, identifier);
-    };
-    match diagnostic.sdk_service {
+        .find(|(name, _)| *name == type_name)?;
+    Some(match diagnostic.sdk_service {
         // The handler carries its client's rendering of the owning service's own
         // exception, which names the service, the status it answered and the request the
         // handler made of it.
@@ -1443,27 +1674,40 @@ pub fn handler_not_found_detail(type_name: &str, identifier: &str) -> String {
             mint_token()
         ),
         None => diagnostic.sentence.to_string(),
-    }
+    })
 }
 
-/// How a create words "the resource with the name requested already exists".
-pub fn already_exists_message(type_name: &str, identifier: &str) -> String {
-    format!("Resource of type '{type_name}' with identifier '{identifier}' already exists.")
+/// How a create words "the resource with the name requested already exists", with the
+/// resource's primary identifier as the registry renders one
+/// ([`rendered_primary_identifier`]).
+pub fn already_exists_message(type_name: &str, rendered_identifier: &str) -> String {
+    format!(
+        "Resource of type '{type_name}' with identifier '{rendered_identifier}' already exists."
+    )
 }
 
 /// The diagnostic the handler that owns `type_name` states for a create whose resource is
 /// already there.
-pub fn handler_already_exists_detail(type_name: &str, identifier: &str) -> String {
+pub fn handler_already_exists_detail(
+    native: &NativeResources,
+    type_name: &str,
+    identifier: &str,
+) -> String {
     HANDLER_ALREADY_EXISTS_DIAGNOSTICS
         .iter()
         .find(|(name, _)| *name == type_name)
         .map(|(_, sentence)| (*sentence).to_string())
-        .unwrap_or_else(|| already_exists_message(type_name, identifier))
+        .unwrap_or_else(|| {
+            already_exists_message(
+                type_name,
+                &rendered_primary_identifier(native, type_name, identifier),
+            )
+        })
 }
 
-/// How a SYNCHRONOUS refusal carries a handler verdict: the owning handler's status, its
-/// own diagnostic, the `HandlerErrorCode` it failed with and the `RequestToken` of the
-/// handler invocation that failed.
+/// How a SYNCHRONOUS refusal carries a handler verdict: the owning handler's own
+/// diagnostic, the `HandlerErrorCode` it failed with and the token of the handler
+/// invocation that failed.
 ///
 /// A `ProgressEvent` reports the handler error code in `ErrorCode` and the diagnostic in
 /// `StatusMessage`, each in its own member. An exception has only its `Message`, so a
@@ -1481,16 +1725,38 @@ pub fn handler_failure_message(
     )
 }
 
+/// The `Message` a resource-level operation refuses an absent resource with.
+///
+/// Which of the two forms a refusal takes follows from WHOSE diagnostic it carries:
+///
+/// * a handler that states the not-found in Cloud Control API's own terms — the not-found
+///   exception the generic resource-provider base class throws, whose sentence names
+///   nothing but the type and the identifier — is reported as THAT sentence, which is the
+///   modelled "a resource with the specified identifier can't be found" itself;
+/// * a handler that failed with the OWNING SERVICE's own exception reports that exception,
+///   and the handler envelope around it is what carries the rest of the verdict
+///   ([`handler_failure_message`]): the `HandlerErrorCode` it failed with and the
+///   `RequestToken` of the invocation that failed, neither of which an exception's single
+///   `Message` member would otherwise leave a client able to recover.
+///
+/// The token is minted where the envelope is used because the handler invocation the
+/// refusal reports IS this call: nothing was accepted, so there is no resource operation
+/// request to poll and no record for the token to name.
 /// The `Message` a resource-level operation refuses an absent resource with: the
-/// handler-wrapped not-found verdict ([`handler_failure_message`]).
+/// handler-wrapped not-found verdict ([`handler_failure_message`]) around the diagnostic
+/// the type's own handler states ([`handler_not_found_detail`]).
 ///
 /// The token is minted here because the handler invocation this refusal reports IS this
 /// call: nothing was accepted, so there is no resource operation request to poll and no
 /// record for the token to name.
-pub fn resource_not_found_refusal(type_name: &str, identifier: &str) -> String {
+pub fn resource_not_found_refusal(
+    native: &NativeResources,
+    type_name: &str,
+    identifier: &str,
+) -> String {
     handler_failure_message(
         type_name,
-        &handler_not_found_detail(type_name, identifier),
+        &handler_not_found_detail(native, type_name, identifier),
         HANDLER_ERROR_NOT_FOUND,
         &mint_token(),
     )
@@ -1693,10 +1959,12 @@ pub fn progress_event(record: &RequestRecord) -> crate::ops::types::ProgressEven
 ///
 /// Shared by `GetResource` and `ListResources`, so the two cannot report different
 /// properties for one resource.
-pub fn resource_description(stored: &StoredResource) -> crate::ops::types::ResourceDescription {
+pub fn resource_description(
+    resolved: &ResolvedResource,
+) -> crate::ops::types::ResourceDescription {
     crate::ops::types::ResourceDescription {
-        identifier: Some(stored.identifier.clone()),
-        properties: Some(rendered_properties(&stored.properties)),
+        identifier: Some(resolved.identifier.clone()),
+        properties: Some(rendered_properties(&resolved.properties)),
     }
 }
 

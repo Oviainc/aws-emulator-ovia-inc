@@ -256,8 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
         let mut store = state.lock();
-        store.materialise_due(now);
+        store.materialise_due(now, &native);
 
         // @idempotencyToken: the same rule the other two mutating operations apply — a
         // token that already carried THIS request replays it, and a token reused for a
@@ -313,13 +314,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if store.resource(&input.type_name, &input.identifier).is_none() {
+        if store
+            .resolve(&native, &input.type_name, &input.identifier)
+            .is_none()
+        {
             // A not-found is the OWNING handler's verdict, so the refusal carries that
             // handler's whole answer: its diagnostic, the handler error code it failed
             // with and the token of the invocation that failed.
             return Err(DeleteResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_refusal(
+                        &native,
                         &input.type_name,
                         &input.identifier,
                     )),

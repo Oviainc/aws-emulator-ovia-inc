@@ -256,10 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .is_some_and(|tags| tags.len() > crate::state::MAX_TAGS_PER_RESOURCE)
         {
-            return Err(invalid(format!(
-                "a resource can have no more than {} tags",
-                crate::state::MAX_TAGS_PER_RESOURCE
-            )));
+            return Err(invalid(crate::state::too_many_tags_message()));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

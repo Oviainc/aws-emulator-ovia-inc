@@ -25,6 +25,14 @@ pub(crate) const TARGET_PREFIX: &str = "CloudApiService";
 /// The region the harness signs for.
 pub(crate) const SIGNING_REGION: &str = "us-east-1";
 
+/// The sigv4 signing name of the CloudWatch Logs service, whose own store holds the log
+/// groups `AWS::Logs::LogGroup` names.
+pub(crate) const LOGS_SIGNING_NAME: &str = "logs";
+
+/// The `X-Amz-Target` prefix a client writes for that service: the local name of its
+/// Smithy service shape.
+pub(crate) const LOGS_TARGET_PREFIX: &str = "Logs_20140328";
+
 /// How long a wait for a resource operation request to complete runs before the case
 /// fails.
 ///
@@ -65,18 +73,75 @@ impl Emulator {
         Self { router }
     }
 
+    /// One emulator with the service that OWNS `AWS::Logs::LogGroup` mounted beside this
+    /// one over the SAME shared engine — which is what the assembled router is, and what
+    /// a case about a resource created over the OWNING service's own API needs.
+    pub(crate) fn with_cloudwatch_logs() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_cloudcontrol_cloudapiservice::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
+        router.register_service(
+            service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
+        );
+        Self { router }
+    }
+
     /// One operation of this service, as a `(status, body)` pair.
     pub(crate) async fn cc(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.post(
+            SIGNING_NAME,
+            "application/x-amz-json-1.0",
+            &format!("{TARGET_PREFIX}.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// One operation of the CloudWatch Logs service — the OWNING service's own API, the
+    /// one a client uses when it is not going through Cloud Control API.
+    pub(crate) async fn logs(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.post(
+            LOGS_SIGNING_NAME,
+            "application/x-amz-json-1.1",
+            &format!("{LOGS_TARGET_PREFIX}.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// One operation of the CloudWatch Logs service, required to succeed.
+    pub(crate) async fn logs_ok(&self, operation: &str, body: Value) -> Value {
+        let (status, decoded) = self.logs(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
+        );
+        decoded
+    }
+
+    /// One signed `POST /` through the router, as a `(status, body)` pair.
+    async fn post(
+        &self,
+        signing_name: &str,
+        content_type: &str,
+        target: &str,
+        body: Value,
+    ) -> (u16, Value) {
         let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{SIGNING_REGION}/{SIGNING_NAME}/\
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{SIGNING_REGION}/{signing_name}/\
              aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=00"
         );
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
-            .header("host", format!("{SIGNING_NAME}.localhost"))
-            .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
+            .header("host", format!("{signing_name}.localhost"))
+            .header("content-type", content_type)
+            .header("x-amz-target", target)
             .header("authorization", authorization)
             .body(Bytes::from(
                 serde_json::to_vec(&body).expect("the request body serializes"),

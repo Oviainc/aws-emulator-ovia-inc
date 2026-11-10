@@ -77,6 +77,26 @@ pub fn log_group_name_requirement() -> String {
     )
 }
 
+/// The log group name prefix CloudWatch Logs keeps for groups of its own: "Log group names
+/// can't start with the string aws/" (`CreateLogGroup`'s own documentation), so a name in it
+/// is not a caller's to create.
+pub const RESERVED_LOG_GROUP_NAME_PREFIX: &str = "aws/";
+
+/// Whether `value` is a name in [`RESERVED_LOG_GROUP_NAME_PREFIX`], which CloudWatch Logs
+/// creates no group under however well-formed the rest of it is.
+pub fn is_reserved_log_group_name(value: &str) -> bool {
+    value.starts_with(RESERVED_LOG_GROUP_NAME_PREFIX)
+}
+
+/// What CloudWatch Logs states for a create whose name is in that prefix: the member and the
+/// string it may not start with.
+///
+/// The sentence lives here, once, so the service that owns log groups and any other service
+/// that creates one on a caller's behalf cannot word the same refusal differently.
+pub fn reserved_log_group_name_message() -> String {
+    format!("logGroupName must not start with the string '{RESERVED_LOG_GROUP_NAME_PREFIX}'")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -188,10 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if group.deletion_protection_enabled {
             return Err(DeleteLogGroupErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(
-                        "LogGroup has delete protection enabled. Disable delete protection before attempting to delete the resource."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::log_group_delete_protected_message()),
                 },
             )
             .into());

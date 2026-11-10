@@ -29,6 +29,65 @@ async fn provision_all(emulator: &Emulator, type_name: &str, property: &str, nam
 }
 
 #[tokio::test]
+async fn a_narrowed_listing_walks_the_inventory_one_window_at_a_time() {
+    let emulator = Emulator::new();
+    // Every third resource matches the selector, and the pages are narrower than the gap
+    // between two matches, so the walk has to cross several windows of the inventory to
+    // report them all: a listing reads one window per call rather than the whole type.
+    let names: Vec<String> = (0..12).map(|index| format!("stream-{index:02}")).collect();
+    let mut accepted = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let stage = if index % 3 == 0 { "prod" } else { "test" };
+        let event = emulator
+            .create_ok(STREAM, &json!({ "StreamName": name, "Stage": stage }), None)
+            .await;
+        accepted.push(text(&event, "RequestToken"));
+    }
+    for request_token in &accepted {
+        emulator.settled(request_token).await;
+    }
+
+    let selector = json!({ "Stage": "prod" });
+    let mut reported: Vec<String> = Vec::new();
+    let mut next: Option<String> = None;
+    let mut calls = 0;
+    loop {
+        let listed = emulator
+            .cc_ok(
+                "ListResources",
+                Emulator::list_request(STREAM, Some(2), next.as_deref(), Some(&selector)),
+            )
+            .await;
+        calls += 1;
+        reported.extend(
+            descriptions(&listed)
+                .iter()
+                .map(|description| text(description, "Identifier")),
+        );
+        match listed["NextToken"].as_str() {
+            Some(token) => next = Some(token.to_string()),
+            None => break,
+        }
+        assert!(
+            calls <= names.len(),
+            "the pages never ran out after {calls} calls, got {reported:?}"
+        );
+    }
+
+    let expected: Vec<String> = names
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| index % 3 == 0)
+        .map(|(_, name)| name.clone())
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "a narrowed walk must report every matching resource in identifier order, expected \
+         {expected:?}, got {reported:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_listing_pages_in_identifier_order_and_resumes_where_it_stopped() {
     let emulator = Emulator::new();
     // Created in an order that is not identifier order, so an ordered listing cannot be

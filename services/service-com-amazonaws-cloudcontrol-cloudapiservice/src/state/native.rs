@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The resources Cloud Control API acts on that live in ANOTHER service's store.
+//!
+//! Cloud Control API is a front end over the resource type's own provider, not an
+//! inventory of its own: `GetResource` "can be used to return information about an
+//! existing resource in your account and Amazon Web Services Region, whether those
+//! resources were provisioned using Cloud Control API"
+//! (`smithy_query(query="doc",shape="GetResource")`). So for a resource type whose
+//! resources live in a store of THIS emulator, every resource operation of this service
+//! has to resolve and act on the resource THERE: a client using Cloud Control API as the
+//! uniform read path has to see the resources the owning service's own API created, and
+//! stop seeing them once that API deleted them.
+//!
+//! One [`NativeResourceProvider`] per such `TypeName` is what this module holds. A
+//! provider owns the handle to the OWNING service's state in the same shared engine
+//! ([`NativeResources::for_engine`]) and answers the five things a resource operation
+//! needs of a type: read one resource's model, list the type's resources, provision one,
+//! apply a model to one, and remove one. A `TypeName` no provider stands behind is served
+//! out of this service's own store exactly as before — that store is the only place such a
+//! resource can live.
+//!
+//! LOCK ORDER: a caller holds this service's own store guard while taking a provider's
+//! ([`crate::state::ComAmazonawsCloudcontrolCloudapiserviceState::materialise_due`]), so
+//! the request record and the resource it owes are settled together. Never the other way
+//! round: nothing in an owning service reaches back into this one.
+
+mod destinations;
+mod log_groups;
+
+use ::serde_json::Value;
+use ::std::collections::BTreeMap;
+use ::std::ops::Bound;
+use ::std::time::{SystemTime, UNIX_EPOCH};
+
+/// Why an owning service would not do what a resource operation asked of it.
+///
+/// Each variant is the OWNING handler's verdict, which is what a Cloud Control API
+/// refusal reports: the `HandlerErrorCode` it failed with
+/// ([`Self::handler_error_code`]) and, where the owning service states one in its own
+/// terms, its diagnostic ([`Self::detail`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeRefusal {
+    /// The owning service holds no such resource.
+    NotFound,
+    /// The owning service already holds a resource under this identifier.
+    AlreadyExists,
+    /// The owning service holds as many resources of this type as it may, and states
+    /// the quota in its own terms.
+    AtCapacity(String),
+    /// The model names something this type's resource cannot carry, or the resource
+    /// cannot be acted on in the state it is in. Carries the owning service's own
+    /// diagnostic.
+    Invalid(String),
+}
+
+impl NativeRefusal {
+    /// The `HandlerErrorCode` this refusal is reported under — a value of the model's own
+    /// `HandlerErrorCode` enum, which `crate::state`'s wire-vocabulary check pins.
+    pub fn handler_error_code(&self) -> &'static str {
+        match self {
+            Self::NotFound => crate::state::HANDLER_ERROR_NOT_FOUND,
+            Self::AlreadyExists => crate::state::HANDLER_ERROR_ALREADY_EXISTS,
+            Self::AtCapacity(_) => HANDLER_ERROR_SERVICE_LIMIT_EXCEEDED,
+            Self::Invalid(_) => HANDLER_ERROR_INVALID_REQUEST,
+        }
+    }
+}
+
+/// The `HandlerErrorCode` for work an owning service has no room for.
+pub const HANDLER_ERROR_SERVICE_LIMIT_EXCEEDED: &str = "ServiceLimitExceeded";
+
+/// The `HandlerErrorCode` for a model the owning service will not take.
+pub const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
+
+/// What one resource type's owning service answers about its resources.
+///
+/// A provider holds the handle to that service's state, so every answer here is read from
+/// — and every change written to — the store the owning service's OWN operations read.
+pub trait NativeResourceProvider: Send + Sync {
+    /// The `TypeName` this provider stands behind.
+    fn type_name(&self) -> &'static str;
+
+    /// The property of the resource model that carries the type's primary identifier.
+    fn identifier_property(&self) -> &'static str;
+
+    /// The resource model of `identifier`, or `None` when the owning service holds no
+    /// such resource.
+    fn read(&self, identifier: &str) -> Option<Value>;
+
+    /// The resources of this type the owning service holds, as
+    /// `(primary identifier, resource model)` in identifier order: at most `limit` of
+    /// them, and only those whose identifier sorts AFTER `after`.
+    ///
+    /// Bounded at the owning store, so a listing builds the window it is about to report
+    /// rather than the whole inventory behind it.
+    fn list(&self, after: Option<&str>, limit: usize) -> Vec<(String, Value)>;
+
+    /// Provision `identifier` from `properties`, in `region`, as of `at` — answering the
+    /// model the owning service holds for it once it is there.
+    fn create(
+        &self,
+        identifier: &str,
+        properties: &Value,
+        region: &str,
+        at: SystemTime,
+    ) -> Result<Value, NativeRefusal>;
+
+    /// Apply `properties` to `identifier` — answering the model the owning service holds
+    /// for it afterwards.
+    fn update(&self, identifier: &str, properties: &Value) -> Result<Value, NativeRefusal>;
+
+    /// Remove `identifier` from the owning service's store.
+    fn delete(&self, identifier: &str) -> Result<(), NativeRefusal>;
+}
+
+/// The providers reachable from one engine: the owning stores this service resolves
+/// resources in.
+///
+/// Built per request from the handler's engine ([`Self::for_engine`]), because a provider
+/// is a handle to a store rather than state of its own.
+pub struct NativeResources {
+    /// One provider per `TypeName` this emulator holds the resources of elsewhere.
+    providers: Vec<Box<dyn NativeResourceProvider>>,
+}
+
+impl ::std::fmt::Debug for NativeResources {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("NativeResources")
+            .field(
+                "types",
+                &self
+                    .providers
+                    .iter()
+                    .map(|provider| provider.type_name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl NativeResources {
+    /// The providers whose owning store THIS engine carries: call it with a handler's
+    /// `&*self.engine`.
+    ///
+    /// A store the engine does not carry contributes no provider, so its type falls back
+    /// to this service's own store rather than resolving to nothing.
+    pub fn for_engine<Eng: Send + Sync + 'static>(engine: &Eng) -> Self {
+        let mut providers: Vec<Box<dyn NativeResourceProvider>> = Vec::new();
+        if let Some(provider) = log_groups::LogGroupProvider::for_engine(engine) {
+            providers.push(Box::new(provider));
+        }
+        if let Some(provider) = destinations::DestinationProvider::for_engine(engine) {
+            providers.push(Box::new(provider));
+        }
+        Self { providers }
+    }
+
+    /// The provider that stands behind `type_name`, or `None` when the resources of that
+    /// type live in this service's own store.
+    pub fn provider(&self, type_name: &str) -> Option<&dyn NativeResourceProvider> {
+        self.providers
+            .iter()
+            .find(|provider| provider.type_name() == type_name)
+            .map(::std::convert::AsRef::as_ref)
+    }
+}
+
+/// `at` in milliseconds since the Unix epoch, which is what the timestamp members of the
+/// services whose resources these providers hold are expressed in. An instant before the
+/// epoch, which no clock reports, reads as the epoch itself.
+fn epoch_millis(at: SystemTime) -> i64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+/// The CloudWatch Logs store the resources of the `AWS::Logs::*` types live in — that
+/// service's OWN state struct, reached through the shared engine, so what is written there
+/// is what its own readers report.
+pub type LogsState =
+    ::service_com_amazonaws_cloudwatchlogs_logs_20140328::ComAmazonawsCloudwatchlogsLogs20140328State;
+
+/// The window `(after, limit)` names of an owning store keyed by its resources' own
+/// identifiers: the entries whose key sorts AFTER `after`, in key order, at most `limit`
+/// of them.
+///
+/// A `BTreeMap`'s own ordered range, so a provider's listing reads the window it is about
+/// to report and never walks the inventory behind it.
+fn window<'a, T>(
+    held: &'a BTreeMap<String, T>,
+    after: Option<&str>,
+    limit: usize,
+) -> impl Iterator<Item = (&'a String, &'a T)> + 'a {
+    let start = after.map_or(Bound::Unbounded, |after| Bound::Excluded(after.to_string()));
+    held.range((start, Bound::Unbounded)).take(limit)
+}
+
+/// The text `value` carries, or why it is not the text `property` takes.
+fn text(property: &str, value: &Value) -> Result<String, NativeRefusal> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| NativeRefusal::Invalid(format!("{property} must be a string")))
+}
+
+/// Check that `property` carries exactly `expected` — the rule a model's identity and its
+/// read-only properties are held to: a read reports them, so a model a client round-trips
+/// carries them, but only ever with the value the resource already answers to.
+fn require_value(property: &str, value: &Value, expected: &str) -> Result<(), NativeRefusal> {
+    (value.as_str() == Some(expected))
+        .then_some(())
+        .ok_or_else(|| {
+            NativeRefusal::Invalid(format!("{property} of this resource is {expected}"))
+        })
+}
+
+/// Check that `property` carries exactly what the resource already HOLDS for it — the rule
+/// a property of the type's schema that this emulator's provider does not APPLY is held
+/// to.
+///
+/// A read reports such a property, so a model a client round-trips carries it, and carrying
+/// it unchanged asks for nothing; any other value — and any value at all where the resource
+/// holds none — asks for work no handler here performs, which is refused rather than
+/// accepted and dropped.
+fn require_held(
+    type_name: &str,
+    property: &str,
+    value: &Value,
+    held: Option<&str>,
+) -> Result<(), NativeRefusal> {
+    match held {
+        Some(held) => require_value(property, value, held),
+        None => Err(NativeRefusal::Invalid(format!(
+            "{property} is a property of {type_name} this emulator's handler does not apply"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every handler error code a provider's refusal is reported under is a value the
+    /// model's own `HandlerErrorCode` enum declares, so no refusal can carry a code a
+    /// client cannot read.
+    #[test]
+    fn a_refusals_handler_error_code_is_the_models_own() {
+        for refusal in [
+            NativeRefusal::NotFound,
+            NativeRefusal::AlreadyExists,
+            NativeRefusal::AtCapacity("at the quota".to_string()),
+            NativeRefusal::Invalid("not a property of the type".to_string()),
+        ] {
+            let code = refusal.handler_error_code();
+            assert!(
+                crate::ops::types::HANDLER_ERROR_CODE_VALUES.contains(&code),
+                "refusal {refusal:?}: {code:?} is not a value the model's HandlerErrorCode \
+                 enum declares"
+            );
+        }
+    }
+
+    /// A type no provider stands behind resolves to none, which is what keeps this
+    /// service's own store the place such a resource lives.
+    #[test]
+    fn only_a_backed_type_resolves_to_a_provider() {
+        let engine = ::engine::InMemoryEngine::new();
+        let native = NativeResources::for_engine(&engine);
+        assert!(
+            native.provider("AWS::Logs::LogGroup").is_some(),
+            "expected the log group provider, got {native:?}"
+        );
+        assert!(
+            native.provider("AWS::Logs::Destination").is_some(),
+            "expected the destination provider, got {native:?}"
+        );
+        for unbacked in ["AWS::S3::Bucket", "AWS::Kinesis::Stream", "AWS::Logs"] {
+            assert!(
+                native.provider(unbacked).is_none(),
+                "type {unbacked:?}: expected no provider, got one"
+            );
+        }
+        assert!(
+            NativeResources::for_engine(&())
+                .provider("AWS::Logs::LogGroup")
+                .is_none(),
+            "a deployment whose engine carries no owning store must stand behind no type"
+        );
+    }
+}

@@ -141,8 +141,27 @@ pub(crate) fn assert_handler_not_found(
 }
 
 /// Cloud Control's own generic not-found diagnostic, for a type whose handler states one.
-fn generic_not_found(type_name: &str, identifier: &str) -> String {
+///
+/// The resource is named as the request addressed it, which is what this emulator's
+/// registry can say about a type whose `primaryIdentifier` it does not hold; a type whose
+/// primary identifier it DOES know is named by it
+/// ([`rendered_identifier`]).
+pub(crate) fn generic_not_found(type_name: &str, identifier: &str) -> String {
     format!("Resource of type '{type_name}' with identifier '{identifier}' was not found.")
+}
+
+/// Cloud Control's own generic already-exists diagnostic, which names the resource the
+/// same way ([`generic_not_found`]).
+pub(crate) fn generic_already_exists(type_name: &str, identifier: &str) -> String {
+    format!("Resource of type '{type_name}' with identifier '{identifier}' already exists.")
+}
+
+/// How the CloudFormation registry renders a resource's PRIMARY IDENTIFIER: a JSON object
+/// mapping the type's `primaryIdentifier` pointer into its schema to the value the resource
+/// holds there — which is how a diagnostic names a resource of a type whose primary
+/// identifier this emulator knows.
+pub(crate) fn rendered_identifier(identifier_property: &str, identifier: &str) -> String {
+    format!("{{\"/properties/{identifier_property}\":\"{identifier}\"}}")
 }
 
 #[tokio::test]
@@ -732,32 +751,107 @@ async fn a_patch_document_the_front_door_refuses_is_a_validation_failure() {
 }
 
 #[tokio::test]
+async fn a_patch_that_grows_the_model_past_what_it_can_hold_is_refused_and_changes_nothing() {
+    let emulator = Emulator::new();
+    let model = json!({ "QueueName": "grown-queue", "Tags": [] });
+    let identifier = emulator.provision(QUEUE, &model).await;
+
+    // What one patch document can make of a resource model is bounded in BOTH dimensions
+    // RFC 6902's `copy` and `move` multiply — a copy of the model into a point inside
+    // itself doubles its nesting depth as well as its size — so the rows differ along
+    // which dimension the document grows: a short document that doubles the depth until it
+    // is past what this service can read, and one that duplicates a large value until the
+    // model is longer than one it can report.
+    let deepening: Vec<Value> = {
+        // Each copy puts the whole model at the deepest point the model already has, so
+        // the chain of nested members, and the depth with it, about doubles per operation.
+        let mut operations = Vec::new();
+        let mut chain = 1_usize;
+        for _ in 0..8 {
+            operations.push(json!({
+                "op": "copy",
+                "from": "",
+                "path": "/Nest".repeat(chain),
+            }));
+            chain *= 2;
+        }
+        operations
+    };
+    let bulky = {
+        // Three copies of a value that is itself over a third of the bound.
+        let value = "g".repeat(100_000);
+        let mut operations = vec![json!({ "op": "add", "path": "/Big", "value": value })];
+        for key in ["/BigA", "/BigB"] {
+            operations.push(json!({ "op": "copy", "from": "/Big", "path": key }));
+        }
+        operations
+    };
+    let rows = [
+        (
+            "a document that doubles the model's depth",
+            Value::Array(deepening),
+            "Invalid request provided: the patch document would leave a resource model \
+             nested deeper than 128 levels",
+        ),
+        (
+            "a document that duplicates a large value",
+            Value::Array(bulky),
+            "Invalid request provided: the patch document would leave a resource model \
+             longer than 262144 characters",
+        ),
+    ];
+
+    for (case, patch_document, expected_message) in rows {
+        let (status, body) = emulator
+            .update(QUEUE, &identifier, &patch_document, None)
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
+        );
+        assert!(
+            code(&body).contains("InvalidRequestException"),
+            "case {case:?}: expected InvalidRequestException, got {:?}",
+            code(&body)
+        );
+        assert_eq!(
+            message(&body),
+            expected_message,
+            "case {case:?}: unexpected wording"
+        );
+        let stored = emulator.properties(QUEUE, &identifier).await;
+        assert_eq!(
+            stored, model,
+            "case {case:?}: a refused update must change nothing, got {stored:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_create_whose_resource_exists_fails_with_the_handlers_already_exists_verdict() {
     let emulator = Emulator::new();
     // A resource that is already there is the OWNING handler's verdict, so the request is
     // accepted and terminates FAILED carrying that handler's error code and its own
     // wording. The rows differ along the owning service's wording: one that has a
     // sentence of its own, and the types reported in Cloud Control's generic sentence.
-    let rows: [(&str, &str, Value, &str); 3] = [
+    let rows: [(&str, &str, Value, String); 3] = [
         (
             "a type whose own service has a sentence for it",
             QUEUE,
             json!({ "QueueName": "duplicate-queue" }),
-            "Queue creation failed because the queue already exists",
+            "Queue creation failed because the queue already exists".to_string(),
         ),
         (
             "a type reported in the generic sentence",
             PARAMETER,
             json!({ "Name": "duplicate-parameter", "Type": "String", "Value": "v" }),
-            "Resource of type 'AWS::SSM::Parameter' with identifier 'duplicate-parameter' \
-             already exists.",
+            generic_already_exists(PARAMETER, "duplicate-parameter"),
         ),
         (
             "a second such type, so the sentence is built from the request",
             BUCKET,
             json!({ "BucketName": "duplicate-bucket" }),
-            "Resource of type 'AWS::S3::Bucket' with identifier 'duplicate-bucket' already \
-             exists.",
+            generic_already_exists(BUCKET, "duplicate-bucket"),
         ),
     ];
 

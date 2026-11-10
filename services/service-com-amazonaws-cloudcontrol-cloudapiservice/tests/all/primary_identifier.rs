@@ -201,10 +201,19 @@ async fn the_same_identifier_under_two_types_is_two_resources() {
         bucket,
         "each type must report its own resource model"
     );
+    // A log group lives in the CloudWatch Logs store, so its model is the one that
+    // service holds for the group: what the create asked for, and the properties the
+    // type's schema declares read-only beside it.
+    let group = emulator.properties(LOG_GROUP, "shared").await;
+    let expected = json!({
+        "LogGroupName": "shared",
+        "RetentionInDays": 7,
+        "LogGroupClass": "STANDARD",
+        "Arn": engine::emulator_arn("logs", super::emulator::SIGNING_REGION, "log-group:shared:*"),
+    });
     assert_eq!(
-        emulator.properties(LOG_GROUP, "shared").await,
-        log_group,
-        "each type must report its own resource model"
+        group, expected,
+        "each type must report its own resource model, expected {expected:?}, got {group:?}"
     );
 
     // Deleting one leaves the other, which is what makes them two resources.

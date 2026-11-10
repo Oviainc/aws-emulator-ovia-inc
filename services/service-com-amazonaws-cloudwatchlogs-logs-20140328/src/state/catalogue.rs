@@ -125,6 +125,30 @@ pub fn log_groups_quota_message() -> String {
     format!("the maximum of {MAX_LOG_GROUPS} log groups per Region per account has been reached")
 }
 
+/// What this service states for a delete of a log group under deletion protection: "When
+/// enabled on a log group, deletion protection blocks all deletion operations until it is
+/// explicitly disabled" (`PutLogGroupDeletionProtection`).
+///
+/// Stated once here because more than one caller deletes a log group — this service's own
+/// `DeleteLogGroup`, and the resource operations another service runs on a group it holds —
+/// and it is the same group under the same rule, so both report the same sentence.
+pub fn log_group_delete_protected_message() -> String {
+    "LogGroup has delete protection enabled. Disable delete protection before attempting to \
+     delete the resource."
+        .to_string()
+}
+
+/// What this service states for a tag set past [`MAX_TAGS_PER_RESOURCE`], which is the quota
+/// `TooManyTagsException` states ("A resource can have no more than 50 tags").
+///
+/// Stated once here for the same reason as [`log_group_delete_protected_message`]: every
+/// caller that assigns a resource's tags is held to the one quota and reports it alike.
+pub fn too_many_tags_message() -> String {
+    format!(
+        "a resource can have no more than {MAX_TAGS_PER_RESOURCE} tags"
+    )
+}
+
 /// AWS's documented resource-policy quota, from `PutResourcePolicy`: "An account can
 /// have a maximum of 10 policies without resourceARN and one per LogGroup resourceARN".
 /// The per-resource half of that quota is structural here: a resource-scoped policy is

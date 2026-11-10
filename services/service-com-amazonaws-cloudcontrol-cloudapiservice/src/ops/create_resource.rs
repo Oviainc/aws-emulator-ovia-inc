@@ -294,8 +294,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
         let now = ::std::time::SystemTime::now();
+        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
         let mut store = state.lock();
-        store.materialise_due(now);
+        store.materialise_due(now, &native);
 
         // @idempotencyToken: a retry carrying a client token that already started a
         // resource request replays THAT request rather than starting a second one, and a
@@ -392,6 +393,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 properties,
                 identifier_property,
                 type_version_id: input.type_version_id.clone(),
+                // Where the resource is provisioned by the service that OWNS the type,
+                // this is the Region it is created in — the one this call was signed for.
+                region: crate::state::request_region(ctx.parts()),
             },
         );
         let progress_event = crate::state::progress_event(&record);

@@ -10,6 +10,10 @@ build = "build.rs"
 # The shared, authenticated continuation-token primitive every paginated read of
 # this emulator mints its `NextToken` with.
 service-common = { path = "../common" }
+# Cloud Control API is a front end over the resource type's own provider, not an
+# inventory of its own: an `AWS::Logs::LogGroup` lives in the CloudWatch Logs
+# service's store, so this crate reads and writes it THERE.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

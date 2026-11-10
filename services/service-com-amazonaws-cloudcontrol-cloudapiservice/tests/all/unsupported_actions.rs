@@ -131,26 +131,40 @@ async fn a_type_a_provider_stands_behind_is_served() {
     let emulator = Emulator::new();
     // The rows differ along the owning service — including CloudFormation's own
     // `AWS::CloudFormation::Stack`, whose namespace is the one every refused row above
-    // lives in — and along the property that carries the primary identifier.
+    // lives in — and along the property that carries the primary identifier. Each row
+    // names the model a read must report: for a type whose resources live in the OWNING
+    // service's store (`AWS::Logs::LogGroup` is a CloudWatch Logs log group) that is the
+    // model that service holds, read-only properties included.
     let rows = [
         (
             "AWS::SQS::Queue",
             json!({ "QueueName": "provisionable-queue" }),
             "QueueName",
+            json!({ "QueueName": "provisionable-queue" }),
         ),
         (
             "AWS::CloudFormation::Stack",
             json!({ "StackName": "provisionable-stack" }),
             "StackName",
+            json!({ "StackName": "provisionable-stack" }),
         ),
         (
             "AWS::Logs::LogGroup",
             json!({ "LogGroupName": "/provisionable/group" }),
             "LogGroupName",
+            json!({
+                "LogGroupName": "/provisionable/group",
+                "LogGroupClass": "STANDARD",
+                "Arn": engine::emulator_arn(
+                    "logs",
+                    super::emulator::SIGNING_REGION,
+                    "log-group:/provisionable/group:*",
+                ),
+            }),
         ),
     ];
 
-    for (type_name, desired, property) in rows {
+    for (type_name, desired, property, expected) in rows {
         let identifier = emulator.provision(type_name, &desired).await;
         assert_eq!(
             identifier,
@@ -160,9 +174,9 @@ async fn a_type_a_provider_stands_behind_is_served() {
         );
         let stored = emulator.properties(type_name, &identifier).await;
         assert_eq!(
-            stored, desired,
-            "case {type_name:?}: expected the created resource to read back as it was \
-             created, got {stored:?}"
+            stored, expected,
+            "case {type_name:?}: expected the created resource to read back as \
+             {expected:?}, got {stored:?}"
         );
         let listed = emulator.list(type_name, None, None).await;
         let identifiers: Vec<String> = descriptions(&listed)

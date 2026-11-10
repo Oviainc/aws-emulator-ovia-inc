@@ -203,10 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(PutDestinationErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "an account can have up to {} destinations",
-                        crate::state::MAX_DESTINATIONS
-                    )),
+                    message: Some(crate::state::destinations_quota_message()),
                 },
             )
             .into());
