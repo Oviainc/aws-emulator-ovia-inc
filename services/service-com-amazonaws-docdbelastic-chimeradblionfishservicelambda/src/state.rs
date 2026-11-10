@@ -381,6 +381,7 @@ pub const STATUS_UPDATING: &str = "UPDATING";
 pub const STATUS_DELETING: &str = "DELETING";
 pub const STATUS_STOPPING: &str = "STOPPING";
 pub const STATUS_STOPPED: &str = "STOPPED";
+pub const STATUS_STARTING: &str = "STARTING";
 
 /// The status a snapshot being copied from another snapshot carries until the clock
 /// owes it `ACTIVE`; `CopyClusterSnapshot` is the only operation that starts it.
@@ -985,6 +986,65 @@ pub fn ensure_available(record: &ClusterRecord, action: &str) -> Result<(), Vali
             record.cluster_name, record.status
         ),
     ))
+}
+
+/// Refuse a start of a cluster whose status does not admit one.
+///
+/// `StartCluster` "restarts the stopped elastic cluster that is specified by clusterARN",
+/// so [`STATUS_STOPPED`] is the only status it acts from: a cluster that is already
+/// running, one the service is still building or changing, and one that is still stopping
+/// are refused instead of taking the action, and the refused cluster keeps the status it
+/// had. The refusal is `ValidationException` (HTTP 400), the client refusal the operation
+/// models for a request it will not act on (`smithy_query(query="operation",
+/// operation="StartCluster")`).
+///
+/// The model does not state the state machine, so the sentence is recorded behaviour: the
+/// service states this one as fixed text that interpolates nothing — not the cluster, not
+/// the status it is in.
+///
+/// Call [`ClusterRecord::settle_due`] first, so a cluster whose stop the clock has
+/// already made due is judged by the status it is owed rather than the one it was left in.
+pub fn ensure_startable(record: &ClusterRecord) -> Result<(), ValidationException> {
+    if record.status == STATUS_STOPPED {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: "Can't start the cluster as it's currently in state unavailable for starting."
+            .to_string(),
+    })
+}
+
+/// The cluster statuses a delete is refused from: a cluster that has been stopped, and
+/// one that is on its way to stopped.
+///
+/// A stopped elastic cluster is not running, so the service cannot tear it down: it has
+/// to be started again before it can be deleted. Every other modelled `Status` value
+/// (`ops::types::STATUS_VALUES`) either names a running cluster or names one the
+/// service could not bring up — [`STATUS_CREATING`], [`STATUS_UPDATING`] and the
+/// configuration-failure statuses — and a delete is how a caller gets rid of those, so
+/// none of them blocks one.
+pub const UNDELETABLE_STATUSES: &[&str] = &[STATUS_STOPPING, STATUS_STOPPED];
+
+/// Refuse a delete of a cluster whose stored status does not admit one
+/// ([`UNDELETABLE_STATUSES`]).
+///
+/// The refusal is `ValidationException` (HTTP 400) — the client refusal `DeleteCluster`
+/// models for a request it will not act on (`smithy_query(query="operation",
+/// operation="DeleteCluster")`) — and the service states it as one sentence whose only
+/// variable part is the status the cluster is stored in. Ask it after
+/// [`ClusterRecord::settle_due`] and BEFORE anything is removed, so the judgement is on
+/// the status the clock owes the cluster and a refused delete leaves the record
+/// readable in that status.
+pub fn ensure_deletable(record: &ClusterRecord) -> Result<(), ValidationException> {
+    if !UNDELETABLE_STATUSES.contains(&record.status.as_str()) {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: format!(
+            "Can't delete the cluster because it is in {} state.",
+            record.status
+        ),
+    })
 }
 
 /// Refuse a create that would take the cluster count past [`MAX_CLUSTERS`].

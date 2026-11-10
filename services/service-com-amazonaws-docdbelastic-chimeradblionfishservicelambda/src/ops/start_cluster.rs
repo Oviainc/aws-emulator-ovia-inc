@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Restarts a stopped elastic cluster: the stored cluster moves to `STARTING` and the
+//! clock owes it `ACTIVE` a short span later. A cluster that is not stopped is refused
+//! with `ValidationException` (HTTP 400) and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +138,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCluster"))
+        use crate::state;
+
+        let _ = ctx;
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(StartClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: state::STORE_UNREACHABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = store.lock();
+        let Some(record) = guard.clusters.get_mut(&input.cluster_arn) else {
+            return Err(StartClusterErrorModeled::ResourceNotFoundException(
+                state::not_found(state::ResourceKind::Cluster, &input.cluster_arn),
+            )
+            .into());
+        };
+        // The transition the clock has already made due is completed first, so a cluster
+        // whose stop became due is judged — and started — by the status it is owed rather
+        // than the one it was left in.
+        record.settle_due();
+        // This operation restarts a STOPPED cluster, so that is the only status it acts
+        // from: a running cluster, one still being built or changed, and one still
+        // stopping are refused and nothing is written.
+        state::ensure_startable(record).map_err(StartClusterErrorModeled::ValidationException)?;
+
+        // The start is in flight when this call answers: the cluster reports STARTING, and
+        // the clock owes it ACTIVE a short span later. Nothing sleeps for that — the due
+        // instant is stored on the record and materialised by whoever next reads it.
+        record.begin_transition(state::STATUS_STARTING);
+        let cluster = record.as_cluster();
+        drop(guard);
+
+        Ok(StartClusterOutput { cluster })
     }
 }

@@ -5,6 +5,10 @@
 //! After this the ARN is genuinely unreachable: `GetCluster` answers
 //! `ResourceNotFoundException` and `ListClusters` no longer lists it.
 //!
+//! The delete is state-gated: a cluster whose stored status does not admit one
+//! (`crate::state::ensure_deletable`) is refused with `ValidationException` (HTTP 400)
+//! before anything is removed, so the record stays readable in that status.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -157,25 +161,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = store.lock();
         // A second delete of the same ARN finds nothing, so it is a 404 — the record is
         // gone, not merely flagged.
-        let Some(mut record) = guard.clusters.remove(&input.cluster_arn) else {
+        let Some(record) = guard.clusters.get_mut(&input.cluster_arn) else {
             return Err(DeleteClusterErrorModeled::ResourceNotFoundException(
                 state::not_found(state::ResourceKind::Cluster, &input.cluster_arn),
             )
             .into());
         };
-        guard.cluster_names.remove(&record.cluster_name);
-        drop(guard);
+        // The transition the clock has already made due is completed first, so the gate
+        // below judges the cluster by the status it is owed rather than the one it was
+        // left in.
+        record.settle_due();
+        // The status gate comes before any write: a cluster whose stored status does not
+        // admit a delete is refused and nothing is removed, so a following read still
+        // reports it in that status.
+        state::ensure_deletable(record).map_err(DeleteClusterErrorModeled::ValidationException)?;
 
         // The caller is told the cluster is going away; nothing settles it to ACTIVE
-        // again, because the record no longer exists.
+        // again, because the record is removed in the same breath.
         record.status = state::STATUS_DELETING.to_string();
         record.settles_at = None;
         for shard in &mut record.shards {
             shard.status = state::STATUS_DELETING.to_string();
         }
+        let cluster = record.as_cluster();
+        let cluster_name = record.cluster_name.clone();
+        guard.clusters.remove(&input.cluster_arn);
+        guard.cluster_names.remove(&cluster_name);
+        drop(guard);
 
-        Ok(DeleteClusterOutput {
-            cluster: record.as_cluster(),
-        })
+        Ok(DeleteClusterOutput { cluster })
     }
 }
