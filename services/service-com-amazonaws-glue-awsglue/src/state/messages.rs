@@ -714,6 +714,18 @@ pub fn database_not_found(name: &str) -> String {
 /// deliberately withheld.
 pub const DATABASE_ALREADY_EXISTS: &str = "Database already exists.";
 
+/// A Data Catalog metadata read of a database the caller holds no Lake Formation
+/// permission on ([`super::lake_formation`]), refused as unauthorized rather than
+/// answered.
+///
+/// RECORDED template: the fixed text is "Insufficient Lake Formation permission(s):
+/// Required Describe on " and the one variable part is the database the request
+/// addressed, taken from the request. `Describe` is the Lake Formation permission a
+/// metadata read needs, so it is the permission the sentence names.
+pub fn insufficient_lake_formation_describe(database_name: &str) -> String {
+    format!("Insufficient Lake Formation permission(s): Required Describe on {database_name}")
+}
+
 /// A read that addresses ONE catalog resource by its `CatalogId` (`GetCatalog`) for a
 /// name the addressed account's Data Catalog holds no catalog under. Recorded
 /// constant: the whole sentence is fixed text, and the id the request addressed is

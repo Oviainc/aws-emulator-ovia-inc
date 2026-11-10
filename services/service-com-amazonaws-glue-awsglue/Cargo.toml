@@ -30,8 +30,13 @@ regex = "1.13"
 # The shared IAM policy evaluator and IAM-ARN reading, for the crawler-role checks.
 service-common = { path = "../common" }
 # The account's own IAM records, read through the same shared engine, so a crawler's
-# `Role` is resolved against the roles `CreateRole`/`PutRolePolicy` wrote.
+# `Role` is resolved against the roles `CreateRole`/`PutRolePolicy` wrote, and the role
+# behind an assumed-role session is the one the account holds.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# WHO a signed request speaks for: STS's own resolution of the access key id, the same
+# record `sts:GetCallerIdentity` answers from, so the principal a Lake Formation decision
+# is made about is the one the caller reads back for the credentials it signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # The account's own IAM Identity Center instances, read through the same shared engine, so
 # the `InstanceArn` of a Glue Identity Center configuration is resolved against the
 # instances `CreateInstance`/`ListInstances` answer for.
@@ -46,6 +51,11 @@ aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio",
 # emulator (no network client feature is enabled: the transport is the emulator's own, so
 # no socket is opened and no host is resolved).
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The Lake Formation client the Data Catalog's read paths consult the permissions held on
+# a database through, over the in-process callback into this same emulator: Lake Formation
+# owns those grants, so they are read from it rather than kept a second time here (no
+# network client feature is enabled: the transport is the emulator's own).
+aws-sdk-lakeformation = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Reads the delimited text behind a Data Catalog table when a column statistics task run
 # aggregates its columns; a library computing over data in this process, with no native or
 # build-time code.
@@ -87,6 +97,10 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # Amazon S3, mounted beside Glue on one engine, so a column statistics task run aggregates
 # the objects a test staged with `PutObject` at the covered table's location.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# Lake Formation, mounted beside Glue on one engine, because the catalog's read paths ask
+# it which permissions the caller holds. It depends on this crate (a grant names a Data
+# Catalog resource), so it is a dev-dependency here and never a dependency.
+service-com-amazonaws-lakeformation-awslakeformation = { workspace = true }
 
 [lints]
 workspace = true

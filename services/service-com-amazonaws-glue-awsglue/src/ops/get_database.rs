@@ -10,6 +10,11 @@
 //! named no grants (see `crate::state::default_create_table_default_permissions`). An
 //! absent catalog or database is `EntityNotFoundException`.
 //!
+//! What it answers is governed by Lake Formation: a database that exists is reported only
+//! to a principal holding a Lake Formation permission on it, on a resource inside it, or
+//! over the whole data lake as an administrator ([`crate::state::lake_formation`]);
+//! anything else is refused with `AccessDeniedException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -195,6 +200,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             (entry.to_database(), entry.encryption.clone())
         };
+
+        // A Data Catalog database is governed by Lake Formation: its metadata is answered
+        // only to a principal that holds a Lake Formation permission on the database, on a
+        // resource inside it, or over the whole data lake as an administrator — so once the
+        // grant the database was created carrying is revoked, a principal holding nothing
+        // is refused rather than served (see `crate::state::lake_formation`). Asked with no
+        // store guard held: Lake Formation reads this same Data Catalog to resolve the
+        // resources its grants name.
+        let permissions = crate::state::lake_formation::catalog_permissions(
+            &*self.engine,
+            ctx,
+            &region,
+            &catalog_id,
+        )
+        .await;
+        if permissions.is_some_and(|held| !held.may_describe_database(&input.name)) {
+            return Err(GetDatabaseErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::messages::insufficient_lake_formation_describe(
+                        &input.name,
+                    )),
+                },
+            )
+            .into());
+        }
 
         // A database written while its catalog encrypted catalog writes under a KMS key is
         // readable only while that key is, exactly as a table of it is

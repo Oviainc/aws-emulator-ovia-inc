@@ -1421,6 +1421,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-lakeformation"
+version = "1.126.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "272abe9c6b6118c160572354173600610855de69739437f5ec1e77627b77f2b8"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-lambda"
 version = "1.156.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13019,6 +13044,7 @@ dependencies = [
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-kms",
+ "aws-sdk-lakeformation",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
@@ -13032,9 +13058,11 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-lakeformation-awslakeformation",
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-ssoadmin-swbexternalservice",
+ "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",
  "tokio",

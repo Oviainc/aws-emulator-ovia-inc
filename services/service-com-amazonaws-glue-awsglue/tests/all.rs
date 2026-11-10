@@ -231,6 +231,8 @@ mod job_updates;
 mod jobs;
 #[path = "all/lake_formation_authorization.rs"]
 mod lake_formation_authorization;
+#[path = "all/lake_formation_database_reads.rs"]
+mod lake_formation_database_reads;
 #[path = "all/metadata_catalog_reads.rs"]
 mod metadata_catalog_reads;
 #[path = "all/ml_task_run_reads.rs"]

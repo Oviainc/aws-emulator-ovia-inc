@@ -25,6 +25,11 @@
 //! `FederatedDatabase`, and none being foreign, because this store holds one account's
 //! catalog.
 //!
+//! The listing is governed by Lake Formation exactly as the single-database read is
+//! ([`crate::state::lake_formation`]), and it OMITS a database the caller holds no Lake
+//! Formation permission on rather than refusing the call: a listing reports the resources
+//! its caller may see, and this operation models no refusal for one it does not report.
+//!
 //! `ResourceShareType` and the entries of `AttributesToGet` are judged by this handler
 //! rather than by the framework boundary
 //! ([`crate::service::resource_share_type_not_valid`],
@@ -371,6 +376,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(MAX_PAGE_SIZE as usize)
             .clamp(1, MAX_PAGE_SIZE as usize);
 
+        // What the caller holds in this Data Catalog, asked BEFORE the store is locked:
+        // Lake Formation reads this same Data Catalog to resolve the resources its grants
+        // name. A database the caller holds no permission on is left OUT of the listing;
+        // `None` is Lake Formation saying nothing, under which the whole catalog is listed.
+        let permissions = crate::state::lake_formation::catalog_permissions(
+            &*self.engine,
+            ctx,
+            &region,
+            &catalog_id,
+        )
+        .await;
+
         // The page is built under the store's guard and the guard released before KMS is
         // asked anything: the key material of the databases on the page travels out with
         // it. Read-only: the stored definitions are projected out and nothing is written.
@@ -385,6 +402,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|database| share.admits(database))
+                .filter(|database| {
+                    permissions
+                        .as_ref()
+                        .is_none_or(|held| held.may_describe_database(&database.name))
+                })
                 .collect();
 
             // The token is the last name of the previous page, so the page resumes at the

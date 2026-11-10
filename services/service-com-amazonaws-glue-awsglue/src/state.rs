@@ -255,6 +255,10 @@
 // re-exported, so a record, a constant or a helper keeps resolving as `crate::state::<name>`
 // wherever it lives.
 pub mod catalog_encryption;
+/// Whether the caller holds the Lake Formation permission a catalog metadata read needs;
+/// reached as `crate::state::lake_formation` rather than glob re-exported, because what it
+/// answers is a decision about a request and not a record this store holds.
+pub mod lake_formation;
 mod blueprints;
 mod catalog;
 mod classifiers;
