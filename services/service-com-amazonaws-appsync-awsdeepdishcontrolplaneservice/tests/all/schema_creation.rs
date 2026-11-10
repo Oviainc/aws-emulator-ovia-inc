@@ -49,13 +49,13 @@ use crate::source_api_association::{call, create_api, router, Answer, ACCOUNT, R
 /// How long a case that must observe the far side of the scheduled creation waits: the
 /// service's own span plus slack. Only the TEST waits — the handler stores the due
 /// instant.
-const PAST_THE_CREATION: Duration = Duration::from_millis(250);
+pub(crate) const PAST_THE_CREATION: Duration = Duration::from_millis(250);
 
 /// Every value of the `SchemaStatus` enum — the whole set the `status` member of either
 /// schema operation can take.
 ///
 /// Source: `smithy_query(query="shape", shape="SchemaStatus")`.
-const SCHEMA_STATUSES: &[&str] = &[
+pub(crate) const SCHEMA_STATUSES: &[&str] = &[
     "ACTIVE",
     "DELETING",
     "FAILED",
@@ -65,7 +65,7 @@ const SCHEMA_STATUSES: &[&str] = &[
 ];
 
 /// `StartSchemaCreation`'s and `GetSchemaCreationStatus`'s shared path.
-fn schema_path(api_id: &str) -> String {
+pub(crate) fn schema_path(api_id: &str) -> String {
     format!("/v1/apis/{api_id}/schemacreation")
 }
 
@@ -74,7 +74,11 @@ fn schema_path(api_id: &str) -> String {
 /// The definition is a blob, which restJson1 carries base64-encoded in the JSON body —
 /// the bytes are handed over exactly as a client would send them, so a payload that is
 /// not text can be exercised too.
-async fn start_creation(router: &MultiServiceRouter, api_id: &str, definition: &[u8]) -> Answer {
+pub(crate) async fn start_creation(
+    router: &MultiServiceRouter,
+    api_id: &str,
+    definition: &[u8],
+) -> Answer {
     let encoded = base64::engine::general_purpose::STANDARD.encode(definition);
     call(
         router,
@@ -86,12 +90,12 @@ async fn start_creation(router: &MultiServiceRouter, api_id: &str, definition: &
 }
 
 /// Read the schema creation status of `api_id`.
-async fn creation_status(router: &MultiServiceRouter, api_id: &str) -> Answer {
+pub(crate) async fn creation_status(router: &MultiServiceRouter, api_id: &str) -> Answer {
     call(router, "GET", &schema_path(api_id), None).await
 }
 
 /// Read the type `type_name` of `api_id` back, in `format`.
-async fn get_type(
+pub(crate) async fn get_type(
     router: &MultiServiceRouter,
     api_id: &str,
     type_name: &str,
