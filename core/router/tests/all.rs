@@ -1315,3 +1315,7 @@ mod logs_metric_filter_drives_the_alarm_notification_chain;
 // crate's test target can ask it.
 #[path = "all/sql_engine_single_locked_copy.rs"]
 mod sql_engine_single_locked_copy;
+// CloudFormation-deployed pipe DOES with the records on its source, which spans
+// CloudFormation, EventBridge Pipes, IAM and Amazon SQS at once.
+#[path = "all/cloudformation_deployed_pipe_delivery.rs"]
+mod cloudformation_deployed_pipe_delivery;
