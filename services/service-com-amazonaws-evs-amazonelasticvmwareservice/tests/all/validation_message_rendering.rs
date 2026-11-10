@@ -17,7 +17,12 @@
 //!   and `$` anchors the model wrote to require a whole-string match;
 //! * a violation of a collection ELEMENT is reported against the collection member that
 //!   holds it, with the element's requirement bundled as
-//!   `Member must satisfy constraint: [<requirement>]`.
+//!   `Member must satisfy constraint: [<requirement>]`;
+//! * a value outside an enumerated set on a member that is NOT a collection element is
+//!   stated by naming that member instead — `Member <member> must satisfy enum value set:
+//!   [<values>]`, under the `<n> validation error(s) detected: ` envelope — and the value
+//!   set is printed in the order this service states it for that type, which is its own
+//!   fixed text rather than the model's declaration order.
 //!
 //! The rows span what the rule generalises over: the constraint KIND (pattern, length,
 //! range, enum value set, absence), the member and the operation carrying it, the NESTING
@@ -47,16 +52,17 @@ const SIGNED: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDTESTONLY/20260101/us-west-2/evs/aws4_request, \
      SignedHeaders=host;x-amz-target, Signature=0";
 
-/// The five `EnvironmentState` values the model declares, in declaration order
-/// (`smithy_query(query="shape", shape="EnvironmentState")`). The ORDER inside a
-/// rendered enum value set is not part of the rule, so the assertions below look for
-/// each value rather than for one spelling of the set.
+/// The five `EnvironmentState` values the model declares, in the order this service
+/// STATES them inside a rendered enum value set — which is its own fixed text for that
+/// type and not the order the Smithy model declares them in (`smithy_query(query="shape",
+/// shape="EnvironmentState")` declares CREATING, CREATED, DELETING, DELETED,
+/// CREATE_FAILED).
 const ENVIRONMENT_STATES: [&str; 5] = [
-    "CREATING",
-    "CREATED",
-    "DELETING",
-    "DELETED",
     "CREATE_FAILED",
+    "DELETING",
+    "CREATED",
+    "DELETED",
+    "CREATING",
 ];
 
 /// The three `VcfVersion` values the model declares
@@ -78,6 +84,10 @@ fn emulator() -> MultiServiceRouter {
     // These tests exercise wording, not signing: the request below is unsigned.
     router.set_request_authentication(false);
     crate::environment_lifecycle::register_network(&engine, VPC_ID, SUBNET_ID);
+    // An environment is created only for an account holding a Premium Support
+    // subscription, which these rows need for the requests their constraints accept
+    // (`tests/all/premium_support_entitlement.rs` owns that rule).
+    crate::premium_support_entitlement::grant_premium_support(&engine);
     router.register_service(
         service_com_amazonaws_evs_amazonelasticvmwareservice::EmulatedService::new(engine),
     );
@@ -198,7 +208,7 @@ struct Row {
 
 /// One request refused for a value outside an enumerated set: where the clause reports
 /// it, whether the requirement is bundled inside the holding member's, and the values
-/// the rendered set must name.
+/// the rendered set must name — in the order this service states them.
 struct EnumRow {
     /// What this row is a case of.
     case: &'static str,
@@ -207,9 +217,10 @@ struct EnumRow {
     /// The member path the clause names.
     member: &'static str,
     /// Whether the offending value is a collection ELEMENT, so the element's
-    /// requirement is bundled inside the collection member's.
+    /// requirement is bundled inside the collection member's — which is also what
+    /// decides which of the two clause forms the refusal takes.
     wrapped: bool,
-    /// The values the model declares for the enumerated type.
+    /// The values the enumerated type declares, in the order the refusal states them.
     values: &'static [&'static str],
 }
 
@@ -494,34 +505,30 @@ async fn an_enum_violation_is_reported_against_the_member_that_holds_it() {
         } = row;
         let answer = call(&router, operation, &body).await;
         assert_refused(case, &answer);
-        // The element's requirement is bundled inside the collection member's.
-        let requirement = if wrapped {
-            "Member must satisfy constraint: [Member must satisfy enum value set: ["
+        // A collection ELEMENT is reported through the member that holds it, with its
+        // requirement bundled inside that member's; a member's OWN value outside an
+        // enumerated set is stated by naming the member instead, under the envelope that
+        // counts its failures as `error(s)`.
+        let expected = if wrapped {
+            format!(
+                "1 validation error detected: Value at '{member}' failed to satisfy \
+                 constraint: Member must satisfy constraint: [Member must satisfy enum \
+                 value set: [{}]]",
+                values.join(", ")
+            )
         } else {
-            "Member must satisfy enum value set: ["
+            format!(
+                "1 validation error(s) detected: Member {member} must satisfy enum value \
+                 set: [{}]",
+                values.join(", ")
+            )
         };
-        let prefix = format!(
-            "1 validation error detected: Value at '{member}' failed to satisfy \
-             constraint: {requirement}"
-        );
-        assert!(
-            answer.message().starts_with(&prefix),
-            "case {case:?}: expected a message starting {prefix:?}, got {:?}",
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
             answer.message()
         );
-        let closers = if wrapped { "]]" } else { "]" };
-        assert!(
-            answer.message().ends_with(closers),
-            "case {case:?}: expected a message ending {closers:?}, got {:?}",
-            answer.message()
-        );
-        for value in values {
-            assert!(
-                answer.message().contains(value),
-                "case {case:?}: the enum value set must name {value:?}, got {:?}",
-                answer.message()
-            );
-        }
     }
 }
 

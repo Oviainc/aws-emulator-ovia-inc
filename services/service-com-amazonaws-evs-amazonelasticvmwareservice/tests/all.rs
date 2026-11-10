@@ -86,6 +86,8 @@ mod environment_health_checks;
 mod environment_lifecycle;
 #[path = "all/error_wire_status.rs"]
 mod error_wire_status;
+#[path = "all/esx_build_catalogue.rs"]
+mod esx_build_catalogue;
 #[path = "all/finished_record_retention.rs"]
 mod finished_record_retention;
 #[path = "all/hcx_eip_associations.rs"]
@@ -112,6 +114,8 @@ mod list_while_initializing;
 mod page_size_bound;
 #[path = "all/page_token_binding.rs"]
 mod page_token_binding;
+#[path = "all/premium_support_entitlement.rs"]
+mod premium_support_entitlement;
 #[path = "all/public_vlan_netmask.rs"]
 mod public_vlan_netmask;
 #[path = "all/put_account_settings_due_transitions.rs"]

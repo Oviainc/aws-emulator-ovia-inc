@@ -26,6 +26,24 @@ service-com-amazonaws-evs-amazonelasticvmwareservice/
     └── ops/              # ONE FILE PER OPERATION
 ```
 
+## The Premium Support subscription (`SUPPORT_PLAN`)
+
+An Amazon EVS environment runs licensed VCF software under an Amazon Web Services
+Premium Support subscription, so `CreateEnvironment` is served only to an account
+holding a qualifying Support plan; from an account holding none it answers HTTP 400
+`ValidationException` whose first clause is `You must be subscribed to AWS Premium
+Support`. Nothing in this API buys a plan, so the emulated account starts with none —
+what a new Amazon Web Services account has — and an operator grants one out of band,
+through the same knob the Amazon Web Services Support emulator reads it from:
+
+```bash
+SUPPORT_PLAN=enterprise cargo run -p aws-emulator-router
+```
+
+The plan lives in that service's store (`support_plan`), and
+`src/state/premium_support.rs` reads it from there, so one plan serves both services.
+Every other operation of this service is served whatever plan the account holds.
+
 ## Implementing an operation
 
 Each file in `src/ops/` owns exactly one operation and declares which one

@@ -37,6 +37,10 @@ pub mod ec2_resources;
 /// named, which it may name by ARN or by name.
 pub mod secret_resources;
 
+/// Whether the account holds the Amazon Web Services Premium Support subscription
+/// `CreateEnvironment` requires of it.
+pub mod premium_support;
+
 /// The `EnvironmentState` / `VlanState` values this service moves a resource through.
 /// Both enums carry the same five values (`smithy_query(query="shape",
 /// shape="EnvironmentState,VlanState")`).
@@ -2726,44 +2730,109 @@ pub fn installs_vcf(vcf_version: &str) -> bool {
     vcf_version != VCF_VERSION_SELF_DEPLOYED
 }
 
-/// One VCF release line Amazon EVS installs, and the ESX version Broadcom's Bill Of
-/// Materials pairs that line with — the source `VcfVersionInfo$defaultEsxVersion` names:
-/// "The default ESX version for this VCF version. It is based on Broadcom's Bill Of
-/// Materials (BOM)."
+/// One ESXi BUILD Amazon EVS offers, as its version catalogue states it.
+///
+/// An ESX version Amazon EVS reports is a build identifier —
+/// `ESXi-<vSphere release>-<build number>` — and not a bare vSphere version number: a
+/// build is what Broadcom pins in a Bill Of Materials and what a host is installed from,
+/// so it is what `VcfVersionInfo$defaultEsxVersion` ("The default ESX version for this VCF
+/// version. It is based on Broadcom's Bill Of Materials (BOM)") and
+/// `InstanceTypeEsxVersionsInfo$esxVersions` ("The list of ESX versions offered for this
+/// instance type") carry. Both are `EsxVersion`, a string of at most 128 characters
+/// (`smithy_query(query="shape", shape="EsxVersion")`), which every identifier below is
+/// inside.
 #[derive(Debug, Clone, Copy)]
-pub struct VcfReleaseLine {
-    /// The prefix every `VcfVersion` value of this release line starts with.
-    pub prefix: &'static str,
-    /// The ESX version the line's BOM names, as ESXi itself reports its version
-    /// (`<major>.<minor>.<update>`).
+pub struct EsxBuild {
+    /// The build identifier itself: the value the catalogue reports for this build.
     pub esx_version: &'static str,
+    /// The prefix of every `VcfVersion` whose Bill Of Materials carries this build, so a
+    /// VCF version is offered the builds of its OWN release line and no others.
+    pub vcf_prefix: &'static str,
+    /// The `VcfVersion`s whose Bill Of Materials names this build as their DEFAULT —
+    /// usually none, because a line offers many builds and defaults to one of them per
+    /// VCF patch. Stated HERE rather than in a second table, so a version's default is
+    /// always a build this catalogue offers and the two halves of one `GetVersions`
+    /// response cannot disagree about which builds exist.
+    pub default_for: &'static [&'static str],
 }
 
-/// The VCF release lines this service knows a Bill Of Materials for.
-///
-/// Every `VcfVersion` the model declares besides [`VCF_VERSION_SELF_DEPLOYED`] is in the
-/// VCF 5.2 line (`smithy_query(query="shape", shape="VcfVersion")` reports `VCF-5.2.1`
-/// and `VCF-5.2.2`), and Broadcom's VCF 5.2 BOM is built on VMware ESXi 8.0 Update 3 —
-/// version `8.0.3` in the form ESXi reports its own version in. The BOM pins a BUILD
-/// within that update per VCF patch; a build number is published by Broadcom and is not
-/// derivable here, so the ESX version is reported at the granularity the version string
-/// itself has, which is inside `EsxVersion`'s modelled `@length(max: 128)`.
-///
-/// Add a line here when the model declares a `VcfVersion` of another release line;
-/// a version matching no line is reported by nothing rather than paired with a BOM that
-/// was never published for it.
-pub const VCF_RELEASE_LINES: &[VcfReleaseLine] = &[VcfReleaseLine {
-    prefix: "VCF-5.2.",
-    esx_version: "8.0.3",
-}];
+/// The prefix of the `VcfVersion` values of the VCF 5.2 release line, whose Bill Of
+/// Materials is built on VMware ESXi 8.0 Update 3. Every `VcfVersion` this model declares
+/// besides [`VCF_VERSION_SELF_DEPLOYED`] is in it
+/// (`smithy_query(query="shape", shape="VcfVersion")` reports `VCF-5.2.1` and
+/// `VCF-5.2.2`).
+const VCF_5_2_LINE: &str = "VCF-5.2.";
 
-/// The ESX version `vcf_version`'s Bill Of Materials names, or `None` for a version no
-/// line in [`VCF_RELEASE_LINES`] covers.
+/// The prefix of the `VcfVersion` values of the VCF 9 release line, whose Bill Of
+/// Materials is built on VMware ESXi 9. This model declares no `VcfVersion` of that line,
+/// so no version defaults to one of its builds — but Amazon EVS OFFERS them on the
+/// instance types it provides, and the catalogue states what the service offers.
+const VCF_9_LINE: &str = "VCF-9.";
+
+/// The ESXi builds Amazon EVS offers, in the order its catalogue states them.
+///
+/// Service-catalogue data: Broadcom publishes a build per release and Amazon EVS adds it
+/// to this list, so the entries change over time while their FORM does not. A build is
+/// offered on every EC2 instance type Amazon EVS provides (see
+/// [`instance_type_esx_versions`]), and a `VcfVersion` is offered the builds of its own
+/// release line ([`available_esx_versions`]), one of which its BOM makes the default
+/// ([`default_esx_version`]).
+pub const OFFERED_ESX_BUILDS: &[EsxBuild] = &[
+    EsxBuild {
+        esx_version: "ESXi-8.0U3b-24280767",
+        vcf_prefix: VCF_5_2_LINE,
+        default_for: &["VCF-5.2.1"],
+    },
+    EsxBuild {
+        esx_version: "ESXi-8.0U3g-24859861",
+        vcf_prefix: VCF_5_2_LINE,
+        default_for: &["VCF-5.2.2"],
+    },
+    EsxBuild {
+        esx_version: "ESXi-9.0.2.0.25148076",
+        vcf_prefix: VCF_9_LINE,
+        default_for: &[],
+    },
+    EsxBuild {
+        esx_version: "ESXi-9.0.2.0100.25595025",
+        vcf_prefix: VCF_9_LINE,
+        default_for: &[],
+    },
+    EsxBuild {
+        esx_version: "ESXi-9.1.0.0100.25433460",
+        vcf_prefix: VCF_9_LINE,
+        default_for: &[],
+    },
+    EsxBuild {
+        esx_version: "ESXi-9.1.0.0200.25557999",
+        vcf_prefix: VCF_9_LINE,
+        default_for: &[],
+    },
+    EsxBuild {
+        esx_version: "ESXi-8.0U3i-25205845",
+        vcf_prefix: VCF_5_2_LINE,
+        default_for: &[],
+    },
+    EsxBuild {
+        esx_version: "ESXi-8.0U3j-25429389",
+        vcf_prefix: VCF_5_2_LINE,
+        default_for: &[],
+    },
+    EsxBuild {
+        esx_version: "ESXi-8.0U3k-25595708",
+        vcf_prefix: VCF_5_2_LINE,
+        default_for: &[],
+    },
+];
+
+/// The ESX build `vcf_version`'s Bill Of Materials names as its default, or `None` for a
+/// version no entry of [`OFFERED_ESX_BUILDS`] names — a version Amazon EVS provides no
+/// build for, which the catalogue then reports nothing about.
 pub fn default_esx_version(vcf_version: &str) -> Option<&'static str> {
-    VCF_RELEASE_LINES
+    OFFERED_ESX_BUILDS
         .iter()
-        .find(|line| vcf_version.starts_with(line.prefix))
-        .map(|line| line.esx_version)
+        .find(|build| build.default_for.contains(&vcf_version))
+        .map(|build| build.esx_version)
 }
 
 /// The ESX versions Amazon EVS offers for `vcf_version` — the versions a caller finds
@@ -2771,14 +2840,20 @@ pub fn default_esx_version(vcf_version: &str) -> Option<&'static str> {
 /// use the GetVersions action" (`CreateEnvironmentHost` doc).
 ///
 /// Taken from the catalogue `GetVersions` itself reports, so the two cannot disagree about
-/// which versions exist: a provided VCF version offers the ESX version its Bill Of
-/// Materials names ([`default_esx_version`]), which is the version
-/// `VcfVersionInfo$defaultEsxVersion` and `InstanceTypeEsxVersionsInfo$esxVersions` carry
-/// for it. EMPTY for a VCF version no [`VCF_RELEASE_LINES`] entry covers — the catalogue
-/// then states no versions for it, which is no evidence about any particular version
-/// rather than evidence against all of them.
+/// which versions exist: a VCF version is offered every build of its OWN release line,
+/// among them the one its Bill Of Materials defaults to ([`default_esx_version`]). The
+/// release line alone decides it, independently of which build is the default, so adding a
+/// `VcfVersion` of a line the catalogue already carries offers that line's builds at once.
+/// EMPTY for a version of no line the catalogue carries — [`VCF_VERSION_SELF_DEPLOYED`],
+/// whose VCF the caller installs itself, is one — and the catalogue then states no versions
+/// for it, which is no evidence about any particular version rather than evidence against
+/// all of them.
 pub fn available_esx_versions(vcf_version: &str) -> Vec<&'static str> {
-    default_esx_version(vcf_version).into_iter().collect()
+    OFFERED_ESX_BUILDS
+        .iter()
+        .filter(|build| vcf_version.starts_with(build.vcf_prefix))
+        .map(|build| build.esx_version)
+        .collect()
 }
 
 /// The `fieldList` entry for an `esxVersion` that is not one of the versions
@@ -2806,12 +2881,12 @@ pub fn unavailable_esx_version_failure(
 /// instance types of each — what `GetVersions` reports as `vcfVersions`.
 ///
 /// The set is the `VcfVersion` enum the model declares, less
-/// [`VCF_VERSION_SELF_DEPLOYED`] and less any version no [`VCF_RELEASE_LINES`] entry
-/// covers, in the order the enum declares them (ascending version). The instance types
-/// are every `InstanceType` the model declares: nothing in the model narrows the types
-/// per VCF version, and this service's `CreateEnvironmentHost` accepts each of them on an
-/// environment of any version, so reporting fewer here would state a restriction the
-/// service does not apply.
+/// [`VCF_VERSION_SELF_DEPLOYED`] and less any version [`OFFERED_ESX_BUILDS`] names no
+/// default build for, in the order the enum declares them (ascending version). The
+/// instance types are every `InstanceType` the model declares: nothing in the model
+/// narrows the types per VCF version, and this service's `CreateEnvironmentHost` accepts
+/// each of them on an environment of any version, so reporting fewer here would state a
+/// restriction the service does not apply.
 pub fn provided_vcf_versions() -> Vec<VcfVersionInfo> {
     VCF_VERSION_VALUES
         .iter()
@@ -2833,26 +2908,26 @@ pub fn provided_vcf_versions() -> Vec<VcfVersionInfo> {
 /// The ESX versions offered for each EC2 instance type — what `GetVersions` reports as
 /// `instanceTypeEsxVersions`.
 ///
-/// Computed as the TRANSPOSE of [`provided_vcf_versions`]: an instance type is offered an
-/// ESX version exactly when some provided VCF version offers that instance type and
-/// defaults to that ESX version. So the two lists of one response cannot disagree about
-/// which types Amazon EVS provides or which ESX versions it installs. Both levels are
-/// deduplicated and in a stable order.
+/// One entry per `InstanceType` the model declares, each carrying every build of
+/// [`OFFERED_ESX_BUILDS`] in catalogue order: "The list of ESX versions offered for this
+/// instance type" is what Amazon EVS can install on that hardware, and neither the model
+/// nor this service ties a build to an instance type — `CreateEnvironmentHost` accepts
+/// every modelled instance type on an environment of any version — so narrowing one type's
+/// list would state a restriction the service does not apply.
+///
+/// Consistent with [`provided_vcf_versions`] BY CONSTRUCTION, because a version's default
+/// is an entry of that same catalogue ([`EsxBuild::default_for`]): every provided VCF
+/// version's `defaultEsxVersion` appears among the `esxVersions` of every instance type it
+/// lists, so the two halves of one response cannot disagree.
 pub fn instance_type_esx_versions() -> Vec<InstanceTypeEsxVersionsInfo> {
-    let mut by_instance_type: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for version in provided_vcf_versions() {
-        for instance_type in version.instance_types {
-            by_instance_type
-                .entry(instance_type)
-                .or_default()
-                .insert(version.default_esx_version.clone());
-        }
-    }
-    by_instance_type
-        .into_iter()
-        .map(|(instance_type, esx_versions)| InstanceTypeEsxVersionsInfo {
-            instance_type,
-            esx_versions: esx_versions.into_iter().collect(),
+    INSTANCE_TYPE_VALUES
+        .iter()
+        .map(|instance_type| InstanceTypeEsxVersionsInfo {
+            instance_type: (*instance_type).to_string(),
+            esx_versions: OFFERED_ESX_BUILDS
+                .iter()
+                .map(|build| build.esx_version.to_string())
+                .collect(),
         })
         .collect()
 }
@@ -3736,6 +3811,67 @@ const CONSTRAINT_MARKER: &str = " failed to satisfy constraint: ";
 /// What this service's envelope joins several clauses with: a bare comma, no space.
 const CLAUSE_JOINER: &str = ",";
 
+/// The orders Amazon EVS states an enumerated type's value set in when it refuses a value
+/// outside it.
+///
+/// The set a refusal names is the enumerated type's whole declared value set, but the
+/// ORDER it is printed in is the service's own fixed text for that type — it is neither
+/// derived from the request nor taken from the order the Smithy model happens to declare
+/// the values in — so it is stated here, one row per type: the values the model declares,
+/// and the same values in the order this service lists them. A type with no row keeps the
+/// order the violation carries (the model's), which is the only order there is evidence
+/// for.
+///
+/// A row is found by its declared values as a SET, so NO TWO ROWS may carry the same set.
+/// `VlanState` declares the same five values as the row below, but no input member of this
+/// service targets it (`smithy_query(query="operation", operation="ListEnvironmentVlans")`:
+/// the request carries `environmentId`, `maxResults` and `nextToken` and no state filter),
+/// so no request can violate it and no second row is needed for it.
+const PUBLISHED_ENUM_VALUE_SETS: &::service_common::validation_message::StatedEnumValueSets<
+    'static,
+> = &[
+    // `EnvironmentState`, the member of `EnvironmentStateList` that `ListEnvironments`
+    // filters on: the values as the model declares them
+    // (`smithy_query(query="shape", shape="EnvironmentState")`), then the same values in
+    // the order this service states them.
+    (
+        &["CREATING", "CREATED", "DELETING", "DELETED", "CREATE_FAILED"],
+        &["CREATE_FAILED", "DELETING", "CREATED", "DELETED", "CREATING"],
+    ),
+];
+
+/// The requirement a value outside an enumerated set failed, with the set in the order
+/// this service states it — the [`PUBLISHED_ENUM_VALUE_SETS`] row whose declared values
+/// are the ones the violation carries, and otherwise the order the violation carries.
+///
+/// The row LOOKUP is the shared one every service stating its own order uses
+/// (`service_common::validation_message::stated_enum_value_set`); only the rows, which are
+/// this service's own data, live here.
+fn enum_value_set_requirement(declared: &[String]) -> String {
+    let stated = ::service_common::validation_message::stated_enum_value_set(
+        declared,
+        PUBLISHED_ENUM_VALUE_SETS,
+    );
+    let values = match stated {
+        Some(stated) => stated.join(", "),
+        None => declared.join(", "),
+    };
+    format!("Member must satisfy enum value set: [{values}]")
+}
+
+/// One violation as this service states it.
+struct StatedClause {
+    /// The member path the violation is reported AGAINST, which the clauses are ordered
+    /// by and which the `fieldList` entry names.
+    path: String,
+    /// The clause itself, as it appears inside the envelope.
+    text: String,
+    /// Whether the clause NAMES the member itself (`Member <name> must satisfy …`) rather
+    /// than quoting its path (`Value at '<path>' failed to satisfy constraint: …`), which
+    /// is also the form whose envelope counts its failures as `error(s)`.
+    member_named: bool,
+}
+
 /// The `ValidationException` this service answers for a request the boundary validator
 /// refused against the model's own constraints — the ONE renderer behind every operation
 /// of this service, reached from `Service::override_refusal`.
@@ -3744,13 +3880,16 @@ const CLAUSE_JOINER: &str = ",";
 /// `@required` on it (`smithy_query(query="shape", shape="ValidationException")`): a
 /// refusal that dropped it would not deserialize as the error the model declares.
 ///
-/// The message envelope: `1 validation error detected: <clause>` for a single violation
-/// and `<n> validation error(s) detected: <clause>,<clause>` for several, with the clauses
-/// ordered by the member path they are reported against (never by the order the members
-/// appear in the request) and joined by [`CLAUSE_JOINER`]. A clause is
-/// `Value at '<member path>' failed to satisfy constraint: <requirement>`, with the
-/// rejected value never quoted back and only an ABSENT member keeping
-/// `Value null at '<path>' …`, because absence is the fact that clause states.
+/// The message envelope is `<n> validation error detected: <clause>,<clause>` — `error(s)`
+/// once it counts more than one failure, or once a clause NAMES its member
+/// ([`StatedClause::member_named`]) — with the clauses ordered by the member path they are
+/// reported against (never by the order the members appear in the request) and joined by
+/// [`CLAUSE_JOINER`]. A clause is `Value at '<member path>' failed to satisfy constraint:
+/// <requirement>`, with the rejected value never quoted back and only an ABSENT member
+/// keeping `Value null at '<path>' …`, because absence is the fact that clause states; a
+/// value outside an enumerated set on a member that is not a collection element is stated
+/// as `Member <member path> must satisfy enum value set: [<values>]` instead, which is the
+/// text this service words that one violation with.
 ///
 /// The `reason` is [`REASON_FIELD_VALIDATION_FAILED`]: what these violations are is a
 /// member of the input failing a check. The `fieldList` carries one entry per violation —
@@ -3769,25 +3908,29 @@ const CLAUSE_JOINER: &str = ",";
 /// (`artifact` joins with `"; "` and prints a `@pattern` WITH its anchors), so each
 /// service states its own envelope, as the other service crates carrying this helper do.
 pub fn constraint_validation_error(violations: &[Violation]) -> Option<ValidationException> {
-    let mut clauses: Vec<(String, String)> = violations.iter().map(clause).collect();
+    let mut clauses: Vec<StatedClause> = violations.iter().map(clause).collect();
     // Ordered by the member path the clause names, compared byte-wise. `sort_by` is
     // stable, so two violations of ONE member keep the order the walk found them in.
-    clauses.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let message = match clauses.len() {
-        0 => return None,
-        1 => format!("1 validation error detected: {}", clauses[0].1),
-        n => format!(
-            "{n} validation error(s) detected: {}",
-            clauses
-                .iter()
-                .map(|(_, clause)| clause.as_str())
-                .collect::<Vec<_>>()
-                .join(CLAUSE_JOINER)
-        ),
-    };
+    clauses.sort_by(|left, right| left.path.cmp(&right.path));
+    if clauses.is_empty() {
+        return None;
+    }
+    // `error(s)` once the envelope counts more than one failure, and for the
+    // member-named form whichever number of failures it counts.
+    let plural = clauses.len() > 1 || clauses.iter().any(|clause| clause.member_named);
+    let message = format!(
+        "{n} validation error{plural} detected: {joined}",
+        n = clauses.len(),
+        plural = if plural { "(s)" } else { "" },
+        joined = clauses
+            .iter()
+            .map(|clause| clause.text.as_str())
+            .collect::<Vec<_>>()
+            .join(CLAUSE_JOINER)
+    );
     let failures = clauses
         .into_iter()
-        .map(|(path, clause)| field_failure_stated(&path, clause))
+        .map(|clause| field_failure_stated(&clause.path, clause.text))
         .collect();
     Some(ValidationException {
         message,
@@ -3798,19 +3941,32 @@ pub fn constraint_validation_error(violations: &[Violation]) -> Option<Validatio
 
 /// One violation as this service states it: the member path it is reported AGAINST
 /// (which is what the clauses are ordered by), and the clause itself.
-fn clause(violation: &Violation) -> (String, String) {
+fn clause(violation: &Violation) -> StatedClause {
     let requirement = requirement_of(violation);
     // A violation of a collection ELEMENT is reported against the collection member
     // that holds it, with the element's requirement bundled inside the outer
     // constraint — a caller is told which member of the request to fix, and that the
     // requirement applies to the member's elements rather than to the member itself.
-    let (path, requirement) = match collection_holding(&violation.path) {
+    let (path, requirement, element) = match collection_holding(&violation.path) {
         Some(collection) => (
             collection.to_string(),
             format!("Member must satisfy constraint: [{requirement}]"),
+            true,
         ),
-        None => (violation.path.clone(), requirement),
+        None => (violation.path.clone(), requirement, false),
     };
+    // A value outside an enumerated set is the one violation this service states by
+    // NAMING the member rather than quoting its path — and only where the offending
+    // value is the member's own, because an element of a collection is reported through
+    // the collection member that holds it, with its requirement bundled inside that
+    // member's.
+    if !element && matches!(violation.kind, ViolationKind::EnumValue(_)) {
+        return StatedClause {
+            text: format!("Member {path} must satisfy {}", requirement_tail(&requirement)),
+            path,
+            member_named: true,
+        };
+    }
     // A present-but-invalid value is NOT quoted back at the caller — including one the
     // walk withheld, which was still sent; an absent member keeps the framework's
     // `Value null at …`, because absence IS what it states.
@@ -3819,8 +3975,19 @@ fn clause(violation: &Violation) -> (String, String) {
     } else {
         "Value null at"
     };
-    let clause = format!("{subject} '{path}'{CONSTRAINT_MARKER}{requirement}");
-    (path, clause)
+    StatedClause {
+        text: format!("{subject} '{path}'{CONSTRAINT_MARKER}{requirement}"),
+        path,
+        member_named: false,
+    }
+}
+
+/// A requirement without the `Member must satisfy ` it opens with, so the member-named
+/// clause can name the member where that wording names no particular one.
+fn requirement_tail(requirement: &str) -> &str {
+    requirement
+        .strip_prefix("Member must satisfy ")
+        .unwrap_or(requirement)
 }
 
 /// The requirement half of a violation's clause: what the value had to satisfy.
@@ -3834,14 +4001,19 @@ fn clause(violation: &Violation) -> (String, String) {
 /// the real separator whatever either half spells, while the first could fall inside
 /// caller text and copy the rest of it into the message.
 ///
-/// A `@pattern` is the one requirement reworded here: its anchors are the model's way of
-/// saying "the whole value", not part of the expression (see [`unanchored`]).
+/// A `@pattern` is one of the two requirements reworded here: its anchors are the model's
+/// way of saying "the whole value", not part of the expression (see [`unanchored`]). The
+/// other is an enumerated type's value set, whose ORDER is this service's own fixed text
+/// rather than the model's declaration order ([`enum_value_set_requirement`]).
 fn requirement_of(violation: &Violation) -> String {
     if let ViolationKind::Pattern(pattern) = &violation.kind {
         return format!(
             "Member must satisfy regular expression pattern: {}",
             unanchored(pattern)
         );
+    }
+    if let ViolationKind::EnumValue(declared) = &violation.kind {
+        return enum_value_set_requirement(declared);
     }
     let valueless = Violation {
         value: None,

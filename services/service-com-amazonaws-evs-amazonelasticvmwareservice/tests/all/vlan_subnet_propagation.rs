@@ -71,6 +71,9 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // These tests exercise behaviour, not signing: every request below is unsigned.
     router.set_request_authentication(false);
+    // An environment is created only for an account holding a Premium Support
+    // subscription (`tests/all/premium_support_entitlement.rs` owns that rule).
+    crate::premium_support_entitlement::grant_premium_support(&engine);
     router.register_service(
         service_com_amazonaws_evs_amazonelasticvmwareservice::EmulatedService::new(engine.clone()),
     );

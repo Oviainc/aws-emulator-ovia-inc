@@ -35,6 +35,10 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # Amazon EVS environment is deployed into: `CreateEnvironment` verifies the network it
 # names exists by asking EC2's own store rather than guessing.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# The Support store holds the account's Premium Support plan, which an operator grants out
+# of band: `CreateEnvironment` requires the subscription and reads it from that store
+# rather than keeping a second copy of the account's plan.
+service-com-amazonaws-support-awssupport-20130415 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

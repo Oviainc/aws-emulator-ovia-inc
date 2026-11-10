@@ -113,6 +113,14 @@
 //!    is SUPPLIED, public HCX VLAN or not, because the id is stored on the HCX VLAN and
 //!    reported back as `Vlan$networkAclId` either way.
 //!
+//! 16. The ACCOUNT holds an Amazon Web Services Premium Support subscription: an
+//!    environment runs licensed VCF software under one, so an account holding none
+//!    creates no environment, however well formed its request is. It is a fact about the
+//!    account rather than about any member of the request, so it is read from the Support
+//!    emulator's own store ([`crate::state::premium_support`]) — where an operator grants
+//!    a plan out of band — and its clause is collected as the FIRST of the request's
+//!    failures, ahead of every member-level check above it.
+//!
 //! Supplying a parameter the chosen VCF mode does not support is NOT one of them.
 //! `SELF_DEPLOYED` "does not support" `licenseInfo`, `hosts`, `vcfHostnames`, `siteId`
 //! and `connectivityInfo` in the sense that it does nothing with them — no hosts are
@@ -128,11 +136,6 @@
 //! `licenseInfo` ([`crate::state::StoredEnvironment::license_keys`]), so neither this
 //! environment's health checks nor another environment's see anything the mode does
 //! nothing with.
-//!
-//! The account's AWS Premium Support subscription is not a precondition either: this
-//! emulator holds no account-subscription state to decide it from, and a guess either
-//! way would refuse or admit every request alike. Only preconditions this service can
-//! actually evaluate are enforced.
 //!
 //! Every one of those checks runs before anything is minted, and they are all
 //! evaluated: a request that breaks several is refused ONCE, with one
@@ -409,6 +412,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let installs_vcf = crate::state::installs_vcf(&input.vcf_version);
 
         let mut failures: Vec<ValidationExceptionField> = Vec::new();
+        // The account's own entitlement comes FIRST: an environment runs licensed VCF
+        // software under an Amazon Web Services Premium Support subscription, so an
+        // account that holds none creates none, however well formed the rest of the
+        // request is. The subscription is the Support service's fact, read from its own
+        // store ([`crate::state::premium_support`]).
+        failures.extend(crate::state::premium_support::entitlement_failure(
+            &*self.engine,
+        ));
         failures.extend(terms_accepted_failure(&input));
         // A tag key in AWS's reserved `aws:` namespace is not the caller's to create,
         // whichever member carries it: the create path writes the request's `tags`
@@ -1082,12 +1093,17 @@ struct PlannedVlan<'a> {
 /// environment cannot be created while it is false.
 fn terms_accepted_failure(input: &CreateEnvironmentInput) -> Option<ValidationExceptionField> {
     (!input.terms_accepted).then(|| {
-        crate::state::field_failure(
+        crate::state::field_failure_stated(
             "termsAccepted",
-            "must be accepted (true) before an environment can be created",
+            TERMS_NOT_ACCEPTED_CLAUSE,
         )
     })
 }
+
+/// The clause Amazon EVS states for a request that has not accepted the terms. Fixed
+/// text in full: it names no member and interpolates nothing from the request.
+const TERMS_NOT_ACCEPTED_CLAUSE: &str =
+    "Terms and Conditions must be accepted before creating an environment";
 
 /// Every host that names both placement mechanisms, refused through the shape's own
 /// rule ([`crate::state::placement_conflict_failure`]), which `CreateEnvironmentHost`

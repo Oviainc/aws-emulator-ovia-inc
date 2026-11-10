@@ -6,10 +6,12 @@
 //! each `VcfVersion` the model declares except the value that means the caller installs
 //! VCF itself — with that version's availability status, the default ESX version its Bill
 //! Of Materials names and the EC2 instance types it is offered on, plus, for each of
-//! those instance types, the ESX versions offered on it, which is the TRANSPOSE of the
-//! first list; it is a read, so it reports the same catalogue however often it is called
-//! and whatever a caller has created, and the catalogue it reports is the one the rest of
-//! the service acts on.
+//! those instance types, the ESX versions offered on it; it is a read, so it reports the
+//! same catalogue however often it is called and whatever a caller has created, and the
+//! catalogue it reports is the one the rest of the service acts on. Every ESX version it
+//! reports — each `esxVersions` entry and each `defaultEsxVersion` — is an ESXi BUILD
+//! identifier, and a version's default is one of the builds every instance type it lists
+//! is offered: `tests/all/esx_build_catalogue.rs` owns that half of the rule.
 //!
 //! Where each clause comes from (`smithy_query(query="operation",
 //! operation="GetVersions")`, `smithy_query(query="shape",
@@ -271,13 +273,13 @@ async fn the_catalogue_reports_every_vcf_version_amazon_evs_provides() {
 async fn each_instance_type_is_offered_the_esx_versions_of_the_versions_that_provide_it() {
     let router = emulator();
     let body = get_versions(&router).await;
-    let versions = reported_versions("the transpose", &body);
-    let instance_types = reported_instance_types("the transpose", &body);
+    let versions = reported_versions("the catalogue's two halves", &body);
+    let instance_types = reported_instance_types("the catalogue's two halves", &body);
 
-    // The TRANSPOSE of the VCF version list: an instance type is offered an ESX version
-    // exactly when some provided VCF version offers that type and defaults to that
-    // version. Computed from the SAME response, so the two lists of one answer are
-    // checked against each other rather than against a value written here.
+    // The two halves of ONE response, checked against each other rather than against a
+    // value written here: every instance type a provided VCF version lists is reported,
+    // and the ESX versions it is offered include that version's default — the build a
+    // host of that version runs when the request names none.
     let mut expected: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for version in &versions {
         for instance_type in &version.instance_types {
@@ -297,16 +299,24 @@ async fn each_instance_type_is_offered_the_esx_versions_of_the_versions_that_pro
             )
         })
         .collect();
-    assert_eq!(
-        actual, expected,
-        "case \"the transpose\": every instance type a provided VCF version offers must be \
-         reported with exactly those versions' default ESX versions, expected {expected:?}, \
-         got {actual:?}"
-    );
+    for (instance_type, defaults) in &expected {
+        let offered = actual.get(instance_type).unwrap_or_else(|| {
+            panic!(
+                "case {instance_type:?}: an instance type a provided VCF version lists must \
+                 be reported with the ESX versions offered on it, got {actual:?}"
+            )
+        });
+        assert!(
+            defaults.is_subset(offered),
+            "case {instance_type:?}: every default ESX version of a VCF version this type \
+             is offered must be among its esxVersions, expected {defaults:?} within \
+             {offered:?}"
+        );
+    }
     assert_eq!(
         instance_types.len(),
         actual.len(),
-        "case \"the transpose\": no instance type may be reported twice, got {:?}",
+        "case \"the catalogue's two halves\": no instance type may be reported twice, got {:?}",
         instance_types
             .iter()
             .map(|(instance_type, _)| instance_type.as_str())

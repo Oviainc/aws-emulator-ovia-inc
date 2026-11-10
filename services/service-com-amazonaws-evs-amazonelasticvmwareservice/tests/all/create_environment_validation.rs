@@ -34,6 +34,16 @@ use crate::environment_lifecycle::{call, emulator, error_type, vlans_with_prefix
 /// values are `unknownOperation`, `cannotParse`, `fieldValidationFailed`, `other`).
 const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
+/// The clauses Amazon EVS states as FIXED text for a failed precondition of this
+/// operation: the sentence names no member of the request and interpolates nothing from
+/// it, so a client keys on the sentence itself. Both are pinned exactly where their own
+/// rule is covered — the terms clause here, the account-entitlement clause in
+/// `tests/all/premium_support_entitlement.rs`.
+const FIXED_CLAUSES: &[&str] = &[
+    "Terms and Conditions must be accepted before creating an environment",
+    "You must be subscribed to AWS Premium Support",
+];
+
 /// Four hosts, as `hosts` requires (len 4..4), with `extra` merged into the host at
 /// each index in `at`.
 fn hosts_with(extra: &Value, at: &[usize]) -> Value {
@@ -119,6 +129,14 @@ pub(crate) fn assert_aggregated_refusal(case: &str, status: u16, body: &Value, e
         .collect();
     for (entry, text) in entries.iter().zip(&texts) {
         let name = entry["name"].as_str().unwrap_or_default();
+        // A clause Amazon EVS words as FIXED text names no member at all — the
+        // unaccepted-terms clause is one, and the account-entitlement clause
+        // `tests/all/premium_support_entitlement.rs` owns is the other — so it is the
+        // sentence itself a client keys on, and there is no member name to look for in
+        // it.
+        if FIXED_CLAUSES.contains(text) {
+            continue;
+        }
         // The clause has to NAME the member it refuses, but not necessarily in the
         // member's camelCase spelling: the network clauses state it the way AWS's own
         // recorded wording does ("The VPC id <id> is not valid …"), so the comparison

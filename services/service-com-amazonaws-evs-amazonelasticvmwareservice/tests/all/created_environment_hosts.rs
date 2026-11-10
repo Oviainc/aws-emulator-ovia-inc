@@ -65,6 +65,9 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         // These tests exercise behaviour, not signing.
         router.set_request_authentication(false);
+        // An environment is created only for an account holding a Premium Support
+        // subscription (`tests/all/premium_support_entitlement.rs` owns that rule).
+        crate::premium_support_entitlement::grant_premium_support(&engine);
         router.register_service(evs::EmulatedService::new(Arc::clone(&engine)));
         router.register_service(ec2::EmulatedService::new(Arc::clone(&engine)));
         Self { router, engine }

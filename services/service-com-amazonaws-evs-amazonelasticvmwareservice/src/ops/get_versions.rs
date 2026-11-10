@@ -13,8 +13,10 @@
 //! ([`crate::state::provided_vcf_versions`], [`crate::state::instance_type_esx_versions`])
 //! so the versions this operation reports are the SAME ones the rest of the service acts
 //! on — `CreateEnvironmentHost` resolves a host's default ESX version out of it — rather
-//! than a list only this response knows. `instanceTypeEsxVersions` is computed as the
-//! transpose of the VCF version list, so the two halves of one response cannot disagree.
+//! than a list only this response knows. Both halves are read from the one build catalogue
+//! ([`crate::state::OFFERED_ESX_BUILDS`]), so the two cannot disagree: a VCF version's
+//! `defaultEsxVersion` is an entry of that catalogue and so appears among the
+//! `esxVersions` of every instance type that version lists.
 //!
 //! ## Shape of an operation
 //!
