@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMap
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMap`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMap::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates and persists a map resource in
+//! [`crate::state::ComAmazonawsLocationLocationserviceState::maps`], keyed by
+//! `MapName`, and answers with the stored name, the generated ARN and the stored
+//! creation timestamp. A `Configuration.Style` outside the published style catalog,
+//! or a retired `PricingPlan`, is a `ValidationException`; a name that already
+//! exists is a `ConflictException`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,6 +149,20 @@ impl From<CreateMapErrorModeled> for CreateMapError {
     }
 }
 
+/// A member the request got wrong, stated the way this service states one: the
+/// sentence as `message`, the reason the model's enum has for a bad field value,
+/// and a `fieldList` entry naming the member and repeating the sentence.
+fn field_validation_failed(member: &str, why: String) -> CreateMapErrorModeled {
+    CreateMapErrorModeled::ValidationException(ValidationException {
+        message: why.clone(),
+        reason: "FieldValidationFailed".to_string(),
+        field_list: vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why,
+        }],
+    })
+}
+
 /// The `CreateMap` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -187,18 +199,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMap` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMapErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMap"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMapErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        // `MapConfiguration$Style` is a plain string in the model, so the request
+        // boundary accepts any word-shaped value: which styles exist, and the
+        // provider each one's tiles come from, are this service's own catalog.
+        let data_source = crate::state::map_data_source(&input.configuration.style)
+            .map_err(|why| field_validation_failed(crate::state::MAP_STYLE_MEMBER, why))?;
+        // `PricingPlan` is deprecated and admits only one of its enum's values.
+        crate::state::validate_deprecated_pricing_plan(input.pricing_plan.as_deref())
+            .map_err(|why| field_validation_failed("PricingPlan", why))?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        // A map name is unique within an account, so creating one that already
+        // exists is a conflict rather than a silent overwrite. The sentence is this
+        // service's own refusal form: the resource, then the name the request asked
+        // for.
+        if store.maps.contains_key(&input.map_name) {
+            return Err(CreateMapErrorModeled::ConflictException(ConflictException {
+                message: crate::state::resource_already_exists(
+                    crate::state::MAP_RESOURCE,
+                    &input.map_name,
+                ),
+            })
+            .into());
+        }
+
+        // Bound the store: refuse past the emulator's ceiling with the modelled
+        // quota error rather than growing without limit.
+        if store.maps.len() >= crate::state::MAX_MAPS {
+            return Err(CreateMapErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of map resources ({}) has been reached.",
+                        crate::state::MAX_MAPS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let map = crate::state::Map {
+            name: input.map_name.clone(),
+            arn: crate::state::map_arn(&region, &input.map_name),
+            description: input.description.unwrap_or_default(),
+            configuration: input.configuration.clone(),
+            data_source: data_source.to_string(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            create_time: now,
+            update_time: now,
+        };
+
+        let output = CreateMapOutput {
+            map_name: map.name.clone(),
+            map_arn: map.arn.clone(),
+            create_time: crate::state::to_date_time(map.create_time),
+        };
+        store.maps.insert(map.name.clone(), map);
+        Ok(output)
     }
 }

@@ -14,6 +14,15 @@ use std::collections::{BTreeMap, BTreeSet};
 mod geofence_geometry;
 pub use geofence_geometry::validate_geofence_geometry;
 
+/// The map styles a map resource can carry and the data provider each is sourced
+/// from, kept beside this module because a map write checks the style and every map
+/// read reports its provider.
+mod map_styles;
+pub use map_styles::{
+    map_data_source, map_style, MapStyle, MAP_STYLES, MAP_STYLE_MEMBER, PROVIDER_ESRI,
+    PROVIDER_GRAB, PROVIDER_HERE, PROVIDER_OPEN_DATA,
+};
+
 /// Epoch milliseconds. Amazon Location renders every timestamp in ISO 8601
 /// `YYYY-MM-DDThh:mm:ss.sssZ` (see the `CreateTime`/`SampleTime` member docs in the
 /// Smithy model), so millisecond resolution is the precision the wire carries.
@@ -44,6 +53,28 @@ pub struct ComAmazonawsLocationLocationserviceState {
     /// Geofence collection resources by `CollectionName`, ordered for the same
     /// reason as [`Self::trackers`].
     pub geofence_collections: BTreeMap<String, GeofenceCollection>,
+    /// Map resources by `MapName`, ordered for the same reason as
+    /// [`Self::trackers`].
+    pub maps: BTreeMap<String, Map>,
+}
+
+/// One map resource: the members a map read reports for it, with the configuration
+/// kept as the modelled `MapConfiguration` the map was created with so a read
+/// reports the configuration the create stored.
+#[derive(Debug, Clone)]
+pub struct Map {
+    pub name: String,
+    pub arn: String,
+    /// `DescribeMap`/`ListMaps` model `Description` as required, and the member is
+    /// `len 0..1000`, so an unset description is the empty string.
+    pub description: String,
+    pub configuration: crate::ops::types::MapConfiguration,
+    /// The data provider the configured style's tiles come from, resolved from the
+    /// style catalog when the map was created.
+    pub data_source: String,
+    pub tags: BTreeMap<String, String>,
+    pub create_time: EpochMillis,
+    pub update_time: EpochMillis,
 }
 
 /// One tracker resource and everything stored under it.
@@ -177,6 +208,11 @@ pub const MAX_ROUTE_CALCULATORS: usize = 1_000;
 /// once. `CreateGeofenceCollection` refuses past it with the modelled
 /// `ServiceQuotaExceededException` rather than growing the store without limit.
 pub const MAX_GEOFENCE_COLLECTIONS: usize = 1_000;
+
+/// Emulator memory bound, NOT an AWS quota: map resources held at once. `CreateMap`
+/// refuses past it with the modelled `ServiceQuotaExceededException` rather than
+/// growing the store without limit.
+pub const MAX_MAPS: usize = 1_000;
 
 /// Emulator memory bound, NOT an AWS quota: geofences held per collection, the
 /// least recently updated evicted first. The real service bounds a collection with
@@ -408,6 +444,13 @@ pub fn geofence_collection_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("geo", region, &format!("geofence-collection/{name}"))
 }
 
+/// `arn:aws:geo:<region>:<account>:map/<name>` — the format
+/// `CreateMapResponse$MapArn` documents ("Format example:
+/// arn:aws:geo:region:account-id:map/ExampleMap").
+pub fn map_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("geo", region, &format!("map/{name}"))
+}
+
 /// The data providers a route calculator can source traffic and road network data
 /// from, spelled exactly as a request must spell them.
 ///
@@ -575,6 +618,9 @@ pub const GEOFENCE_RESOURCE: &str = "Geofence";
 
 /// How this service names a route calculator resource in a refusal about it.
 pub const ROUTE_CALCULATOR_RESOURCE: &str = "Route calculator";
+
+/// How this service names a map resource in a refusal about it.
+pub const MAP_RESOURCE: &str = "Map";
 
 /// The `ResourceNotFoundException` sentence stated for a name no resource of that
 /// kind is stored under: the resource's own name as this service writes it, then the

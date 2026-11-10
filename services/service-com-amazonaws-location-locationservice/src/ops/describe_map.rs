@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMap
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMap`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMap::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the map resource stored under the requested `MapName` in
+//! [`crate::state::ComAmazonawsLocationLocationserviceState::maps`] — its ARN,
+//! description, configuration, data provider, tags and timestamps — and answers
+//! `ResourceNotFoundException` for a name no map is stored under. Reads only; this
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +171,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMap` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMapErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMap"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeMapErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        let store = state.lock();
+        let map = store.maps.get(&input.map_name).ok_or_else(|| {
+            DescribeMapErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::resource_not_found(
+                    crate::state::MAP_RESOURCE,
+                    &input.map_name,
+                ),
+            })
+        })?;
+
+        Ok(DescribeMapOutput {
+            map_name: map.name.clone(),
+            map_arn: map.arn.clone(),
+            description: map.description.clone(),
+            // The configuration the create stored, reported member for member.
+            configuration: map.configuration.clone(),
+            // The provider of the configured style, resolved from the style catalog
+            // when the map was created.
+            data_source: map.data_source.clone(),
+            // `PricingPlan` is documented as fixed: "Always returns
+            // RequestBasedUsage".
+            pricing_plan: Some(crate::state::ALWAYS_PRICING_PLAN.to_string()),
+            // The tag map is projected unconditionally: an untagged map reads back
+            // as an empty map, never as an absent member.
+            tags: crate::state::projected_tags(&map.tags),
+            create_time: crate::state::to_date_time(map.create_time),
+            update_time: crate::state::to_date_time(map.update_time),
+        })
     }
 }
