@@ -115,6 +115,10 @@ mod load_balancer_target_groups;
 // beside the option the stored template reports (`probe_monitoring`).
 #[path = "all/managed_instances_monitoring_spelling.rs"]
 mod managed_instances_monitoring_spelling;
+// The members BESIDE `monitoring` a Managed Instances provider configuration carries: every
+// one of them optional, and what a create makes of each.
+#[path = "all/managed_instances_provider_members.rs"]
+mod managed_instances_provider_members;
 #[path = "all/name_pattern_refusals.rs"]
 mod name_pattern_refusals;
 #[path = "all/page_size_range_refusals.rs"]
