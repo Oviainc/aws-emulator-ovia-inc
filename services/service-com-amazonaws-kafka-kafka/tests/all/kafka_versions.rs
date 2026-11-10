@@ -59,13 +59,14 @@ fn catalog() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The status the stored catalog publishes for `version`, if it holds the version
-/// at all — looked up the way the handler resolves one.
-fn stored_status(version: &str) -> Option<&'static str> {
+/// The statuses the stored catalog publishes for `version`, in published order —
+/// one per ROW it publishes for that version, which for two of them is two rows.
+fn stored_statuses(version: &str) -> Vec<&'static str> {
     KAFKA_VERSION_CATALOG
         .iter()
-        .find(|entry| entry.version == version)
+        .filter(|entry| entry.version == version)
         .map(|entry| entry.status)
+        .collect()
 }
 
 /// Walk every page of `ListKafkaVersions` at `page_size`, asserting the per-page
@@ -147,39 +148,45 @@ async fn the_catalog_is_reported_with_every_version_and_its_support_status() {
         reply.body
     );
 
-    // Rows hand-written from the Amazon MSK developer guide's "Supported Apache
-    // Kafka versions" list — entries of several SHAPES (three numbers, a fourth
+    // Rows hand-written from the catalog Amazon MSK publishes (the Developer
+    // Guide's "Supported Apache Kafka versions" list, and the rows the service
+    // itself publishes) — entries of several SHAPES (three numbers, a fourth
     // component, the `.tiered` and `.link` spellings, the `.x` patch name and the
-    // `.kraft` metadata-mode lines) and both support statuses, so the table spans
-    // the class rather than one example.
-    let expected: &[(&str, &str)] = &[
-        ("1.1.1", "DEPRECATED"),
-        ("2.4.1.1", "DEPRECATED"),
-        ("2.8.0", "DEPRECATED"),
-        ("2.8.1", "DEPRECATED"),
-        ("2.8.2.tiered", "DEPRECATED"),
-        ("3.5.1", "DEPRECATED"),
-        ("3.6.0", "ACTIVE"),
-        ("3.6.0.1", "DEPRECATED"),
-        ("3.7.x", "ACTIVE"),
-        ("3.7.x.kraft", "ACTIVE"),
-        ("3.8.link", "DEPRECATED"),
-        ("3.9.x", "ACTIVE"),
-        ("3.9.x.kraft", "ACTIVE"),
-        ("4.0.x.kraft", "ACTIVE"),
-        ("4.1.x.kraft", "ACTIVE"),
-        ("4.2.x.kraft", "DEPRECATED"),
+    // `.kraft` metadata-mode lines), both support statuses, and the two versions
+    // the catalog publishes under TWO rows, so the table spans the class rather
+    // than one example. Each row is the statuses published for that version, in
+    // published order.
+    let expected: &[(&str, &[&str])] = &[
+        ("1.1.1", &["DEPRECATED"]),
+        ("2.4.1.1", &["DEPRECATED"]),
+        ("2.8.0", &["DEPRECATED"]),
+        ("2.8.1", &["DEPRECATED"]),
+        ("2.8.2.tiered", &["DEPRECATED"]),
+        ("3.5.1", &["DEPRECATED"]),
+        ("3.6.0", &["ACTIVE"]),
+        ("3.6.0.1", &["DEPRECATED"]),
+        ("3.7.x", &["ACTIVE"]),
+        ("3.7.x.kraft", &["ACTIVE"]),
+        ("3.8.link", &["DEPRECATED"]),
+        ("3.9.x", &["ACTIVE", "DEPRECATED"]),
+        ("3.9.x.kraft", &["ACTIVE"]),
+        ("4.0.x.kraft", &["ACTIVE"]),
+        ("4.1.x.kraft", &["ACTIVE"]),
+        ("4.2.x.kraft", &["DEPRECATED", "ACTIVE"]),
     ];
-    for (version, status) in expected {
-        let found = versions.iter().find(|(name, _)| name == version);
+    for (version, statuses) in expected {
+        let reported: Vec<&str> = versions
+            .iter()
+            .filter(|(name, _)| name == version)
+            .map(|(_, status)| status.as_str())
+            .collect();
         assert_eq!(
-            found.map(|(_, status)| status.as_str()),
-            Some(*status),
-            "case version={version:?}: expected status {status:?}, got {found:?}"
+            reported, *statuses,
+            "case version={version:?}: expected the published rows {statuses:?}, got {reported:?}"
         );
         assert_eq!(
-            stored_status(version),
-            Some(*status),
+            stored_statuses(version),
+            *statuses,
             "case version={version:?}: the catalog lookup must agree with the wire"
         );
     }
@@ -200,21 +207,26 @@ async fn the_catalog_is_reported_with_every_version_and_its_support_status() {
             "case version={absent:?}: must not appear in the catalog, got {versions:?}"
         );
         assert!(
-            stored_status(absent).is_none(),
+            stored_statuses(absent).is_empty(),
             "case version={absent:?}: the catalog lookup must not resolve it"
         );
     }
 
     // Every reported entry is well formed: a modelled status value, a non-empty
-    // version, and no version reported twice — one version, one published status.
-    let mut names: Vec<&str> = versions.iter().map(|(name, _)| name.as_str()).collect();
-    let total = names.len();
-    names.sort_unstable();
-    names.dedup();
+    // version, and no ROW published twice — a version may carry more than one row
+    // (one per status the catalog publishes for it), but never the same row twice,
+    // so no entry of the catalog is reported redundantly.
+    let mut rows: Vec<(&str, &str)> = versions
+        .iter()
+        .map(|(name, status)| (name.as_str(), status.as_str()))
+        .collect();
+    let total = rows.len();
+    rows.sort_unstable();
+    rows.dedup();
     assert_eq!(
-        names.len(),
+        rows.len(),
         total,
-        "the catalog must not report a version twice, got {versions:?}"
+        "the catalog must not report the same row twice, got {versions:?}"
     );
     for (name, status) in &versions {
         assert!(
@@ -228,12 +240,14 @@ async fn the_catalog_is_reported_with_every_version_and_its_support_status() {
     }
 }
 
-/// RULE: the reported order is the catalog's own published order, and it is
-/// STRICT: entries ascend by the `major.minor` release they name, then within one
-/// release by the patch the version spells out, then by the build line the
-/// version is on (the ZooKeeper-mode base version, then its `.kraft` version,
-/// then any other line) — so no version is ever reported twice and a client walks
-/// the lines in the order the service publishes them.
+/// RULE: the reported order is the catalog's own published order: rows never
+/// descend by the release they name, and the versions themselves appear in one
+/// strict order — the first row of each version ascends by the `major.minor`
+/// release it names, then by the patch the version spells out, then by the build
+/// line the version is on (the ZooKeeper-mode base version, then its `.kraft`
+/// version, then any other line) — so a client walks the releases and the lines
+/// in the order the service publishes them, and a version's further rows sit
+/// inside its own release.
 #[tokio::test]
 async fn the_catalog_is_ordered_by_ascending_release() {
     /// The published-order key of a version: the `major.minor` release, the build
@@ -268,14 +282,41 @@ async fn the_catalog_is_ordered_by_ascending_release() {
         ((release), rank, numbers.into_iter().skip(2).collect())
     }
 
+    /// The `major.minor` release a version names: neither the patch it spells out
+    /// nor its build line is part of it, so every row of one release — a base
+    /// version, its variant lines and a version published under more than one row
+    /// — shares this key.
+    fn release(version: &str) -> (u32, u32) {
+        key(version).0
+    }
+
     let emulator = Emulator::new();
     let versions = reported(&list_versions(&emulator, "").await);
     for pair in versions.windows(2) {
         let (earlier, later) = (&pair[0].0, &pair[1].0);
         assert!(
+            release(earlier) <= release(later),
+            "case pair=({earlier:?}, {later:?}): the catalog must not descend by release, \
+             got {:?} then {:?}",
+            release(earlier),
+            release(later)
+        );
+    }
+
+    // The versions themselves ascend strictly: a version's FIRST row is where the
+    // catalog publishes it, and no two versions share a position.
+    let mut first_rows: Vec<&str> = Vec::new();
+    for (version, _) in &versions {
+        if !first_rows.contains(&version.as_str()) {
+            first_rows.push(version.as_str());
+        }
+    }
+    for pair in first_rows.windows(2) {
+        let (earlier, later) = (pair[0], pair[1]);
+        assert!(
             key(earlier) < key(later),
-            "case pair=({earlier:?}, {later:?}): the catalog must ascend strictly, \
-             got {versions:?}"
+            "case pair=({earlier:?}, {later:?}): the published versions must ascend strictly, \
+             got {first_rows:?}"
         );
     }
 }

@@ -529,16 +529,19 @@ async fn kafka_versions_must_name_versions_the_service_publishes() {
         // version verbatim from the request, and the catalogue in its published
         // order — exactly the set this check admits, deprecated entries
         // included, since a configuration may name a version clusters still
-        // run.
+        // run, and each version named once however many rows the catalogue
+        // publishes it under.
         let message = reply.at("/message").as_str().unwrap_or_default();
         let first_unknown = versions
             .iter()
             .find(|entry| !KAFKA_VERSION_CATALOG.iter().any(|row| row.version == **entry))
             .unwrap_or_else(|| panic!("case {case}: the row names no uncatalogued version"));
-        let catalogued: Vec<&str> = KAFKA_VERSION_CATALOG
-            .iter()
-            .map(|row| row.version)
-            .collect();
+        let mut catalogued: Vec<&str> = Vec::new();
+        for row in KAFKA_VERSION_CATALOG {
+            if !catalogued.contains(&row.version) {
+                catalogued.push(row.version);
+            }
+        }
         let expected = format!(
             "Unsupported KafkaVersion [{first_unknown}]. Valid values: [{}]",
             catalogued.join(", ")

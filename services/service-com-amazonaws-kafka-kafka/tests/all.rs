@@ -83,6 +83,8 @@ mod describe_cluster_v2;
 mod iso8601_timestamps;
 #[path = "all/kafka_harness.rs"]
 mod kafka_harness;
+#[path = "all/kafka_version_catalog_rows.rs"]
+mod kafka_version_catalog_rows;
 #[path = "all/kafka_version_update.rs"]
 mod kafka_version_update;
 #[path = "all/kafka_versions.rs"]

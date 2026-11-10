@@ -17,15 +17,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::kafka_harness::{Emulator, Reply};
+use crate::kafka_harness::{
+    kafka_version_line as line, kafka_version_release as release, Emulator, Reply, OTHER_LINE,
+};
 
 /// A `KafkaVersionStatus` value: a version the service still offers.
 const ACTIVE: &str = "ACTIVE";
-
-/// What [`line`] answers for a build line that is neither ZooKeeper mode nor
-/// KRaft: MSK publishes no newer member of such a line, and offers no upgrade off
-/// it, so a source on one is terminal.
-const OTHER_LINE: &str = "other";
 
 /// `ListKafkaVersions`, which the model binds to `GET /v1/kafka-versions`.
 async fn list_versions(emulator: &Emulator) -> Reply {
@@ -40,10 +37,11 @@ async fn matrix(emulator: &Emulator) -> Reply {
         .await
 }
 
-/// The catalog as the wire reports it: the status published for each version,
-/// which the catalog publishes once.
-fn published(reply: &Reply) -> BTreeMap<String, String> {
-    let mut catalog: BTreeMap<String, String> = BTreeMap::new();
+/// The catalog as the wire reports it: the statuses published for each version,
+/// in published order. A version the catalog publishes under more than one row
+/// carries one status per row, and the same row is never published twice.
+fn published(reply: &Reply) -> BTreeMap<String, Vec<String>> {
+    let mut catalog: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for entry in reply
         .at("/kafkaVersions")
         .as_array()
@@ -57,13 +55,35 @@ fn published(reply: &Reply) -> BTreeMap<String, String> {
             .as_str()
             .unwrap_or_else(|| panic!("an entry without a status: {entry}"))
             .to_string();
+        let rows = catalog.entry(version.clone()).or_default();
         assert!(
-            catalog.insert(version.clone(), status).is_none(),
-            "case version={version:?}: the catalog publishes a version once, got {}",
+            !rows.contains(&status),
+            "case version={version:?}: the catalog publishes a row once, got {}",
             reply.body
         );
+        rows.push(status);
     }
     catalog
+}
+
+/// Whether the catalog still OFFERS `version`: whether it publishes any
+/// [`ACTIVE`] row for it, which is what makes a version an upgrade target.
+fn offered(catalog: &BTreeMap<String, Vec<String>>, version: &str) -> bool {
+    catalog
+        .get(version)
+        .is_some_and(|statuses| statuses.iter().any(|status| status == ACTIVE))
+}
+
+/// The release at which the catalog offers the KRaft migration: the newest
+/// release it publishes an OFFERED ZooKeeper-mode version of, which is the last
+/// release published in both metadata modes.
+fn migration_release(catalog: &BTreeMap<String, Vec<String>>) -> Vec<u32> {
+    catalog
+        .keys()
+        .filter(|version| offered(catalog, version) && line(version).is_empty())
+        .map(|version| release(version.as_str()))
+        .max()
+        .unwrap_or_default()
 }
 
 /// The matrix as `(sourceVersion, targetVersions)` pairs, in the order reported.
@@ -94,37 +114,6 @@ fn rows(reply: &Reply) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// The `major.minor[.patch…]` release a version names, as the components that
-/// order one release against another: a numeric component as itself, `x` ("the
-/// newest patch of this minor") above every numbered patch, and the trailing
-/// variant word dropped, because it names a build of the release.
-fn release(version: &str) -> Vec<u32> {
-    version
-        .split('.')
-        .filter_map(|part| match part.parse::<u32>() {
-            Ok(number) => Some(number),
-            Err(_) if part == "x" => Some(u32::MAX),
-            Err(_) => None,
-        })
-        .collect()
-}
-
-/// The build line a version is on: `"kraft"` for the KRaft metadata-mode versions,
-/// `""` for the ZooKeeper-mode ones — which the `.tiered` spelling of a release is
-/// also on — and [`OTHER_LINE`] for any other build, which carries no upgrade path.
-fn line(version: &str) -> &str {
-    match version
-        .rsplit('.')
-        .next()
-        .filter(|last| *last != "x" && last.parse::<u32>().is_err())
-        .unwrap_or_default()
-    {
-        "" | "tiered" => "",
-        "kraft" => "kraft",
-        _ => OTHER_LINE,
-    }
-}
-
 /// RULE: both read paths answer from one catalog — every source the matrix reports
 /// is a version the listing publishes, every target is one the listing reports as
 /// still offered, and the matrix covers every published entry.
@@ -147,9 +136,8 @@ async fn the_matrix_is_derived_from_the_published_catalog() {
             catalog.keys().collect::<Vec<_>>()
         );
         for target in targets {
-            assert_eq!(
-                catalog.get(target).map(String::as_str),
-                Some(ACTIVE),
+            assert!(
+                offered(&catalog, target),
                 "case source={source:?}: target {target:?} must be a version the catalog still \
                  offers, got {:?}",
                 catalog.get(target)
@@ -157,7 +145,9 @@ async fn the_matrix_is_derived_from_the_published_catalog() {
         }
     }
     // Every published version is a source the matrix answers for, so a client
-    // choosing an upgrade finds the row for whatever its cluster runs.
+    // choosing an upgrade finds the row for whatever its cluster runs — and
+    // answers for it ONCE, however many rows the catalog publishes it under: the
+    // matrix answers about versions, not about catalog rows.
     let sources: BTreeSet<&String> = matrix.iter().map(|(source, _)| source).collect();
     for version in catalog.keys() {
         assert!(
@@ -166,18 +156,26 @@ async fn the_matrix_is_derived_from_the_published_catalog() {
              got {sources:?}"
         );
     }
+    assert_eq!(
+        sources.len(),
+        matrix.len(),
+        "every published version must be a source exactly once, got {matrix:?}"
+    );
 }
 
 /// RULE: the matrix is a per-source upgrade GRAPH, not one blanket list: each
 /// source's targets are the versions the catalog permits an upgrade to FROM it —
-/// still offered, on that source's own build line and strictly newer, or the KRaft
-/// version of the source's own release — so a terminal version reports an EMPTY
-/// list and two sources on different lines are offered different things.
+/// still offered, on that source's own build line and strictly newer, or, at the
+/// one release the catalog offers the crossing at (its final offered
+/// ZooKeeper-mode release), the KRaft version of that release — so a terminal
+/// version reports an EMPTY list and two sources on different lines are offered
+/// different things.
 #[tokio::test]
 async fn each_source_is_offered_only_the_upgrades_its_own_line_permits() {
     let emulator = Emulator::new();
     let catalog = published(&list_versions(&emulator).await);
     let matrix = rows(&matrix(&emulator).await);
+    let crossing = migration_release(&catalog);
 
     for (source, targets) in &matrix {
         // No self-upgrade, and no duplicate: a version is offered once or not at
@@ -196,11 +194,13 @@ async fn each_source_is_offered_only_the_upgrades_its_own_line_permits() {
             let same_line = line(target) == line(source) && line(source) != OTHER_LINE;
             let kraft_migration = line(source).is_empty()
                 && line(target) == "kraft"
-                && release(target) == release(source);
+                && release(target) == release(source)
+                && release(source) == crossing;
             assert!(
                 same_line || kraft_migration,
-                "case source={source:?}: target {target:?} is on another build line, or on a \
-                 line with no upgrade path, so MSK does not offer it, got {targets:?}"
+                "case source={source:?}: target {target:?} is on another build line, on a \
+                 line with no upgrade path, or at a release the crossing to KRaft is not \
+                 offered at, so MSK does not offer it, got {targets:?}"
             );
             if same_line {
                 assert!(
@@ -213,9 +213,8 @@ async fn each_source_is_offered_only_the_upgrades_its_own_line_permits() {
         // And every version the catalog permits is offered: the row is the whole
         // subset, not a sample of it.
         let permitted: BTreeSet<&String> = catalog
-            .iter()
-            .filter(|(_, status)| status.as_str() == ACTIVE)
-            .map(|(version, _)| version)
+            .keys()
+            .filter(|version| offered(&catalog, version))
             .filter(|version| {
                 if line(version) == line(source) {
                     line(source) != OTHER_LINE && release(version) > release(source)
@@ -223,6 +222,7 @@ async fn each_source_is_offered_only_the_upgrades_its_own_line_permits() {
                     line(source).is_empty()
                         && line(version) == "kraft"
                         && release(version) == release(source)
+                        && release(source) == crossing
                 }
             })
             .collect();
@@ -256,7 +256,9 @@ async fn the_catalog_carries_the_variant_lines_and_both_statuses() {
 
     for status in [ACTIVE, "DEPRECATED"] {
         assert!(
-            catalog.values().any(|served| served == status),
+            catalog
+                .values()
+                .any(|statuses| statuses.iter().any(|served| served == status)),
             "case status={status:?}: the catalog must publish it, got {catalog:?}"
         );
     }
@@ -272,8 +274,8 @@ async fn the_catalog_carries_the_variant_lines_and_both_statuses() {
     }
     assert!(
         catalog
-            .iter()
-            .any(|(version, status)| line(version) == "kraft" && status == ACTIVE),
+            .keys()
+            .any(|version| line(version) == "kraft" && offered(&catalog, version)),
         "the catalog must offer a KRaft version, got {catalog:?}"
     );
     // Every reported entry is one the published catalog holds, under a modelled

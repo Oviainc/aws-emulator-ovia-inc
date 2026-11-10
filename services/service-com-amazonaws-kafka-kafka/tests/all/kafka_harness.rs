@@ -1245,3 +1245,51 @@ pub fn sleep_past_update() {
 pub fn sleep_past_configuration_deletion() {
     std::thread::sleep(CONFIGURATION_DELETION_DELAY + Duration::from_millis(250));
 }
+
+/// The name of the `.kraft` build line, as an Apache Kafka version MSK publishes
+/// spells it: the versions whose cluster metadata a KRaft controller quorum
+/// holds.
+pub const KRAFT_LINE: &str = "kraft";
+
+/// What [`kafka_version_line`] answers for a build line that is neither
+/// ZooKeeper mode nor KRaft — the `.link` spelling, say: MSK publishes no newer
+/// member of such a line and offers no upgrade off it.
+pub const OTHER_LINE: &str = "other";
+
+/// The build line an Apache Kafka version is on, read from the trailing
+/// non-numeric component MSK spells the line with: [`KRAFT_LINE`] for the KRaft
+/// metadata-mode versions, `""` for the ZooKeeper-mode ones — which the
+/// `.tiered` spelling of a release is also on, tiered storage being a storage
+/// option of that same build — and [`OTHER_LINE`] for any other build.
+///
+/// `x` is not a line: it is MSK's name for "the newest patch of this minor", so
+/// it belongs to the release ([`kafka_version_release`] reads it). Shared by
+/// every suite that places one published version against another, so a suite
+/// cannot disagree with its neighbour about what a version spelling means.
+pub fn kafka_version_line(version: &str) -> &str {
+    match version
+        .rsplit('.')
+        .next()
+        .filter(|last| *last != "x" && last.parse::<u32>().is_err())
+        .unwrap_or_default()
+    {
+        "" | "tiered" => "",
+        KRAFT_LINE => KRAFT_LINE,
+        _ => OTHER_LINE,
+    }
+}
+
+/// The release an Apache Kafka version names, as the components that order one
+/// release against another: a numeric component as itself, `x` ("the newest
+/// patch of this minor") above every numbered patch, and the trailing line word
+/// dropped, because it names a build OF that release rather than a release.
+pub fn kafka_version_release(version: &str) -> Vec<u32> {
+    version
+        .split('.')
+        .filter_map(|part| match part.parse::<u32>() {
+            Ok(number) => Some(number),
+            Err(_) if part == "x" => Some(u32::MAX),
+            Err(_) => None,
+        })
+        .collect()
+}

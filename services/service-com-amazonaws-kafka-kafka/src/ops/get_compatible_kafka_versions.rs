@@ -11,7 +11,17 @@
 //!   ([`crate::state::compatible_target_versions`]) — a per-source subset, empty
 //!   for a terminal version, never one blanket list shared by every source.
 //! * Without `ClusterArn` (the member is optional in the model): the whole matrix,
-//!   one entry per catalogued source version, each with its own target list.
+//!   one entry per version the catalog publishes
+//!   ([`crate::state::catalogued_kafka_versions`] — each published version once,
+//!   whatever number of rows the catalog publishes it under), each with its own
+//!   target list.
+//!
+//! That the matrix names each version ONCE while `ListKafkaVersions` serves the
+//! catalog's repeated rows is not an inconsistency: the listing PUBLISHES the
+//! catalog, so a row it drops is a row a client never sees, while this operation
+//! answers a question about a VERSION — which upgrades a cluster running it may
+//! take — and that answer does not depend on how many rows the catalog publishes
+//! the version under.
 //!
 //! A `ClusterArn` that is not shaped like an MSK cluster ARN is a
 //! `BadRequestException`; a well-formed one this endpoint's region holds no cluster
@@ -231,9 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 vec![cluster.kafka_version.clone()]
             }
-            None => crate::state::KAFKA_VERSION_CATALOG
+            None => crate::state::catalogued_kafka_versions()
                 .iter()
-                .map(|entry| entry.version.to_string())
+                .map(ToString::to_string)
                 .collect(),
         };
 

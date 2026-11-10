@@ -2,15 +2,15 @@
 
 //! @op ListKafkaVersions
 //! Pages the service's Apache Kafka version catalog
-//! ([`crate::state::KAFKA_VERSION_CATALOG`]), reporting each entry's version
-//! string and its `ACTIVE`/`DEPRECATED` support status.
+//! ([`crate::state::KAFKA_VERSION_CATALOG`]), reporting each published ROW: its
+//! version string and that row's `ACTIVE`/`DEPRECATED` support status.
 //!
 //! The catalog is service-wide published metadata rather than caller state: the
 //! same versions are offered to every account in every region, so this operation
 //! creates and mutates nothing. `MaxResults` bounds the page and `NextToken` is an
-//! opaque encoding of the last version returned, resolved back to its position in
-//! the catalog — so each page is a contiguous run of one fixed, duplicate-free
-//! order and the pages of any walk partition the catalog exactly.
+//! opaque encoding of the catalog position the previous page stopped at — so each
+//! page is a contiguous run of one fixed published order and the pages of any walk
+//! partition the catalog exactly, row for row.
 //!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
@@ -155,16 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // engine nor the request's signing scope selects what this call reports.
         let _ = (ctx, &self.engine);
 
-        // A token names the version the previous page stopped at; the next page
-        // starts at the catalog position after it. A token that is not one of
-        // ours, or that names a version this catalog does not hold, is a bad
+        // A token names the catalog ROW the previous page stopped at; the next
+        // page starts at the position after it. A token that is not one of
+        // ours, or that names a row this catalog does not hold, is a bad
         // request rather than an empty page.
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
-                let position = crate::state::decode_kafka_version_page_token(token)
-                    .as_deref()
-                    .and_then(crate::state::kafka_version_index);
+                let position = crate::state::decode_kafka_version_page_token(token);
                 match position {
                     Some(index) => Some(index),
                     None => {

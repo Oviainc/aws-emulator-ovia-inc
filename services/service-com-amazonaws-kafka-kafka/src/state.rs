@@ -102,9 +102,10 @@
 //! [`Replicator::replication_info_descriptions`] for `DescribeReplicator`.
 //!
 //! The service's Apache Kafka version catalog lives here too
-//! ([`KAFKA_VERSION_CATALOG`], with [`kafka_version_status`] and
-//! [`compatible_target_versions`]), for the same reason: it is the single list
-//! every version-aware operation answers from.
+//! ([`KAFKA_VERSION_CATALOG`], with [`catalogued_kafka_versions`],
+//! [`kafka_version_status`] and [`compatible_target_versions`]), for the same
+//! reason: it is the single list every version-aware operation answers from —
+//! the listing publishes its rows, and everything else asks it about a version.
 //!
 //! A cluster's resource-based policy is held ON that cluster record, as a
 //! [`ClusterPolicy`]: `PutClusterPolicy` attaches or replaces it through
@@ -828,25 +829,33 @@ pub const KAFKA_VERSION_VARIANT_KRAFT: &str = "kraft";
 /// release from 3.6.0 on carries it without a spelling of its own).
 pub const KAFKA_VERSION_VARIANT_TIERED: &str = "tiered";
 
-/// Every Apache Kafka version this emulator's MSK knows, each published ONCE, in
-/// the order the service publishes them: ascending by release, with a release's
-/// base version ahead of the variant lines built on it.
+/// Every ROW Amazon MSK publishes in its Apache Kafka version catalog, in the
+/// order it publishes them: ascending by release, with a release's base version
+/// ahead of the variant lines built on it.
 ///
 /// Source: the Amazon MSK Developer Guide, "Supported Apache Kafka versions"
 /// (<https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html>),
 /// which lists the versions MSK offers, the variants it offers them in (the
 /// `.kraft` metadata-mode lines, the `.tiered` storage line, the `.link` line)
-/// and the ones it has deprecated. A deprecated version is still a valid SOURCE
-/// version — a cluster already running it can be upgraded away from it — but
-/// never a target.
+/// and the ones it has deprecated, together with the catalog the service itself
+/// publishes, which this table reproduces ROW FOR ROW. A deprecated version is
+/// still a valid SOURCE version — a cluster already running it can be upgraded
+/// away from it — but never a target.
 ///
-/// Where a version's published status and the upgrade matrix the service also
-/// publishes disagree about it, the status that AGREES WITH THE MATRIX is the one
-/// kept, because the matrix is the answer a caller acts on: `3.9.x` is offered as
-/// an upgrade from every older ZooKeeper-mode version, so it is ACTIVE here, while
-/// `4.2.x.kraft` is in no published target list, so it is DEPRECATED — which is
-/// why the newest KRaft release the catalog names is not an upgrade target and
-/// `4.1.x.kraft` is the terminal one.
+/// A row is a version together with the status published FOR THAT ROW, which is
+/// not the same as one status per version: the catalog publishes two of its
+/// versions TWICE, each row carrying its own status (`3.9.x` and `4.2.x.kraft`,
+/// each with one `ACTIVE` and one `DEPRECATED` row). Whatever distinguishes the
+/// two rows of such a version is not part of this API's `{version, status}`
+/// projection, so on the wire they differ only in that status, and
+/// `ListKafkaVersions` serves the published rows rather than folding them,
+/// because a folded catalog drops a row a client reads.
+///
+/// Everything that asks a QUESTION about a version — rather than publishing the
+/// catalog — reads these rows through [`kafka_version_status`] (a version the
+/// catalog publishes any `ACTIVE` row for is one the service still offers) and
+/// [`catalogued_kafka_versions`] (each published version once, in published
+/// order), so a repeated row never doubles an answer about the version itself.
 ///
 /// This is the one catalog: `GetCompatibleKafkaVersions` derives its matrix from
 /// it, so nothing has to keep a second copy of the version list in step.
@@ -883,10 +892,60 @@ pub const KAFKA_VERSION_CATALOG: &[KafkaVersionEntry] = &[
     KafkaVersionEntry { version: "3.8.link", status: KAFKA_VERSION_DEPRECATED },
     KafkaVersionEntry { version: "3.9.x", status: KAFKA_VERSION_ACTIVE },
     KafkaVersionEntry { version: "3.9.x.kraft", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.9.x", status: KAFKA_VERSION_DEPRECATED },
     KafkaVersionEntry { version: "4.0.x.kraft", status: KAFKA_VERSION_ACTIVE },
     KafkaVersionEntry { version: "4.1.x.kraft", status: KAFKA_VERSION_ACTIVE },
     KafkaVersionEntry { version: "4.2.x.kraft", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "4.2.x.kraft", status: KAFKA_VERSION_ACTIVE },
 ];
+
+/// Every version the catalog publishes, each ONCE, in the order its first
+/// published row appears.
+///
+/// This is the version SET every version-aware answer is computed over — the
+/// compatibility matrix's sources and targets, the create and update gates and
+/// the valid-value lists their refusals carry — because a question about a
+/// version is about the version, not about the row it was read from, and the
+/// catalog publishes two of its versions under more than one row
+/// ([`KAFKA_VERSION_CATALOG`]).
+///
+/// A derived CONSTANT of that catalog, so it is computed once rather than on
+/// every call: the matrix answers one row per source and each row reads it.
+pub fn catalogued_kafka_versions() -> &'static [&'static str] {
+    static CATALOGUED: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        let mut versions: Vec<&'static str> = Vec::with_capacity(KAFKA_VERSION_CATALOG.len());
+        for entry in KAFKA_VERSION_CATALOG {
+            if !versions.contains(&entry.version) {
+                versions.push(entry.version);
+            }
+        }
+        versions
+    });
+    &CATALOGUED
+}
+
+/// The release of the FINAL ZooKeeper-mode version the service still offers: the
+/// newest release it publishes an offered ZooKeeper-mode version of.
+///
+/// That one release is where the KRaft migration is offered
+/// ([`compatible_target_versions`]): Apache Kafka removed ZooKeeper, so the last
+/// release the service publishes in BOTH metadata modes is the release at which a
+/// ZooKeeper-mode cluster crosses over to the KRaft line, and an older release's
+/// cluster climbs its own line to that release first.
+///
+/// Derived from the catalog once, like [`catalogued_kafka_versions`].
+pub fn final_zookeeper_release() -> &'static [u32] {
+    static FINAL_RELEASE: std::sync::LazyLock<Vec<u32>> = std::sync::LazyLock::new(|| {
+        catalogued_kafka_versions()
+            .iter()
+            .filter(|version| is_offered_kafka_version(version))
+            .filter(|version| kafka_version_line(version) == KafkaVersionLine::ZooKeeper)
+            .map(|version| kafka_version_release(version))
+            .max()
+            .unwrap_or_default()
+    });
+    &FINAL_RELEASE
+}
 
 /// The versions a cluster running `source` can be upgraded to: the per-source
 /// upgrade graph the catalog itself describes, in catalog order.
@@ -896,10 +955,15 @@ pub const KAFKA_VERSION_CATALOG: &[KafkaVersionEntry] = &[
 /// stays inside the source's own LINE ([`kafka_version_line`]), because a line is
 /// a different build of the broker rather than a later release of the same one.
 /// So a target must be [`KAFKA_VERSION_ACTIVE`], sit on the SAME line as the
-/// source and name a strictly newer release; the one cross-line move MSK offers
-/// is the KRaft migration, from a ZooKeeper-mode version to the `.kraft` version
-/// of its OWN release. A version with no newer active member of its line, and no
-/// KRaft version of its release, is terminal and reports an EMPTY list.
+/// source and name a strictly newer release.
+///
+/// The one cross-line move MSK offers is the KRaft migration, to the `.kraft`
+/// version of the source's own release, and it is offered at ONE release: the
+/// final ZooKeeper-mode release the service still offers
+/// ([`final_zookeeper_release`]). A cluster on an older ZooKeeper-mode release
+/// climbs its own line to that release first, and is offered no `.kraft` target
+/// before it gets there. A version with no newer offered member of its line, and
+/// no KRaft version to cross over to, is terminal and reports an EMPTY list.
 ///
 /// `source` need not be catalogued: a cluster running a version this catalog does
 /// not list is still placed against it by [`kafka_version_release`] and
@@ -907,23 +971,25 @@ pub const KAFKA_VERSION_CATALOG: &[KafkaVersionEntry] = &[
 pub fn compatible_target_versions(source: &str) -> Vec<String> {
     let release = kafka_version_release(source);
     let line = kafka_version_line(source);
-    KAFKA_VERSION_CATALOG
+    let migration_release = final_zookeeper_release();
+    catalogued_kafka_versions()
         .iter()
-        .filter(|entry| is_offered_kafka_version(entry.version))
-        .filter(|entry| {
-            let target_release = kafka_version_release(entry.version);
-            match (line, kafka_version_line(entry.version)) {
+        .filter(|version| is_offered_kafka_version(version))
+        .filter(|version| {
+            let target_release = kafka_version_release(version);
+            match (line, kafka_version_line(version)) {
                 // The same line, further along it.
                 (KafkaVersionLine::ZooKeeper, KafkaVersionLine::ZooKeeper)
                 | (KafkaVersionLine::Kraft, KafkaVersionLine::Kraft) => target_release > release,
-                // The KRaft migration: the same release, in KRaft metadata mode.
+                // The KRaft migration: the same release, in KRaft metadata mode,
+                // at the one release the service offers the crossing at.
                 (KafkaVersionLine::ZooKeeper, KafkaVersionLine::Kraft) => {
-                    target_release == release
+                    target_release == release && release == migration_release
                 }
                 _ => false,
             }
         })
-        .map(|entry| entry.version.to_string())
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -994,9 +1060,13 @@ pub fn kafka_version_release(version: &str) -> Vec<u32> {
 }
 
 /// Where `version` sits in [`KAFKA_VERSION_CATALOG`], or `None` when MSK knows
-/// no such version. The catalog publishes each version once, so this is both the
-/// membership lookup and the position a `ListKafkaVersions` pagination token
-/// resolves through.
+/// no such version — the FIRST row the catalog publishes for it, which is the
+/// membership lookup every version gate reads.
+///
+/// A pagination token does NOT resolve through this: the catalog publishes two of
+/// its versions under more than one row, so a version string names a version and
+/// not a row, and a page resumes after a row
+/// ([`decode_kafka_version_page_token`]).
 pub fn kafka_version_index(version: &str) -> Option<usize> {
     KAFKA_VERSION_CATALOG
         .iter()
@@ -1005,42 +1075,53 @@ pub fn kafka_version_index(version: &str) -> Option<usize> {
 
 /// The support status the catalog publishes for `version`, or `None` when MSK
 /// knows no such version.
+///
+/// Where the catalog publishes more than one row for a version, the OFFERED
+/// status wins: a version the service still offers under any published row is a
+/// version it still offers, so a create may name it and an upgrade may target it.
 pub fn kafka_version_status(version: &str) -> Option<&'static str> {
-    KAFKA_VERSION_CATALOG
+    let mut published = None;
+    for entry in KAFKA_VERSION_CATALOG
         .iter()
-        .find(|entry| entry.version == version)
-        .map(|entry| entry.status)
+        .filter(|entry| entry.version == version)
+    {
+        if entry.status == KAFKA_VERSION_ACTIVE {
+            return Some(KAFKA_VERSION_ACTIVE);
+        }
+        published = published.or(Some(entry.status));
+    }
+    published
 }
 
 /// The sentence Amazon MSK answers a request naming an Apache Kafka version it
 /// does not offer with: the fixed text `Unsupported KafkaVersion [`, `].
 /// Valid values: [`, `]`, around two variable parts — the rejected version,
 /// taken verbatim from the request, and the versions that ARE valid, read from
-/// [`KAFKA_VERSION_CATALOG`] in its published order.
+/// [`catalogued_kafka_versions`] in the catalog's published order.
 ///
 /// The listed set is exactly the set the check this refusal comes from admits
 /// ([`kafka_version_index`]): every version the catalog publishes, a deprecated
 /// one included, since a configuration may name a version existing clusters
 /// still run. A list narrower than the gate would name a value the same request
-/// is accepted with, which is worse than no list at all.
+/// is accepted with, which is worse than no list at all. Each version is named
+/// ONCE, however many rows the catalog publishes it under: the list answers which
+/// versions are valid, not how the catalog is published.
 ///
 /// The valid-value list is the actionable half of this refusal, so it is
 /// derived from the catalog rather than written out: a version the catalog gains
 /// or loses is gained or lost here too.
 pub fn unsupported_kafka_version_message(rejected: &str) -> String {
-    let valid: Vec<&str> = KAFKA_VERSION_CATALOG
-        .iter()
-        .map(|entry| entry.version)
-        .collect();
     format!(
         "Unsupported KafkaVersion [{rejected}]. Valid values: [{}]",
-        valid.join(", ")
+        catalogued_kafka_versions().join(", ")
     )
 }
 
 /// Whether the service still OFFERS `version`: whether the catalog publishes it
-/// and its status is [`KAFKA_VERSION_ACTIVE`]. This is what makes a version an
-/// upgrade target and what a deprecation check reads.
+/// and the status it publishes for it ([`kafka_version_status`], the offered one
+/// where the catalog publishes more than one row for the version) is
+/// [`KAFKA_VERSION_ACTIVE`]. This is what makes a version an upgrade target and
+/// what a deprecation check reads.
 pub fn is_offered_kafka_version(version: &str) -> bool {
     kafka_version_status(version) == Some(KAFKA_VERSION_ACTIVE)
 }
@@ -1093,10 +1174,10 @@ pub fn create_kafka_version_violation(kafka_version: &str, instance_type: &str) 
     if kafka_version_index(kafka_version).is_some() {
         return None;
     }
-    let offered: Vec<&str> = KAFKA_VERSION_CATALOG
+    let offered: Vec<&str> = catalogued_kafka_versions()
         .iter()
-        .filter(|entry| is_offered_kafka_version(entry.version))
-        .map(|entry| entry.version)
+        .filter(|version| is_offered_kafka_version(version))
+        .copied()
         .collect();
     Some(format!(
         "{} instance types are not supported for Kafka version {kafka_version}. \
@@ -1110,19 +1191,27 @@ pub fn create_kafka_version_violation(kafka_version: &str, instance_type: &str) 
 /// some other list cannot be mistaken for one of these.
 const KAFKA_VERSION_PAGE_TOKEN_PREFIX: &str = "kafka:kafka-versions:";
 
-/// Encode the catalog version a page stopped at as a token, through the same
-/// [`encode_page_token`] every listing here mints its tokens with. The version
-/// inside is only resolved against the public catalog, so a forged resume point
-/// can only skip or repeat entries every caller may already list.
-pub fn encode_kafka_version_page_token(last_version: &str) -> String {
-    encode_page_token(KAFKA_VERSION_PAGE_TOKEN_PREFIX, last_version)
+/// Encode the catalog ROW a page stopped at — its position in
+/// [`KAFKA_VERSION_CATALOG`] — as a token, through the same [`encode_page_token`]
+/// every listing here mints its tokens with.
+///
+/// A page resumes after a row rather than after a version string because the
+/// catalog publishes two of its versions under more than one row, so a version
+/// string would not name the row a page stopped at. The position inside is only
+/// resolved against the public catalog, so a forged resume point can only skip or
+/// repeat entries every caller may already list.
+pub fn encode_kafka_version_page_token(last_index: usize) -> String {
+    encode_page_token(KAFKA_VERSION_PAGE_TOKEN_PREFIX, &last_index.to_string())
 }
 
-/// The version a token resumes after, or `None` when the token is not one the
-/// version listing minted — which that listing refuses as a bad request rather
-/// than serving as a first page.
-pub fn decode_kafka_version_page_token(token: &str) -> Option<String> {
-    decode_page_token(KAFKA_VERSION_PAGE_TOKEN_PREFIX, token)
+/// The catalog row a token resumes after, or `None` when the token is not one the
+/// version listing minted or does not name a row the catalog holds — which that
+/// listing refuses as a bad request rather than serving as a first page.
+pub fn decode_kafka_version_page_token(token: &str) -> Option<usize> {
+    decode_page_token(KAFKA_VERSION_PAGE_TOKEN_PREFIX, token)?
+        .parse::<usize>()
+        .ok()
+        .filter(|index| *index < KAFKA_VERSION_CATALOG.len())
 }
 
 /// One page of the version catalog: the entries it reports, and the token that
@@ -1133,18 +1222,19 @@ pub struct KafkaVersionPage {
     pub next_token: Option<String>,
 }
 
-/// Choose one page of [`KAFKA_VERSION_CATALOG`]: the `page_size` entries that
+/// Choose one page of [`KAFKA_VERSION_CATALOG`]: the `page_size` rows that
 /// follow `resume_after` (a catalog position, as
-/// [`decode_kafka_version_page_token`] plus [`kafka_version_index`] resolve one),
-/// or the first `page_size` entries when a request names no token.
+/// [`decode_kafka_version_page_token`] resolves one), or the first `page_size`
+/// rows when a request names no token.
 ///
 /// `page_size` is clamped into the `MaxResults` range the model declares, so no
 /// caller of this module can size the page from an unchecked value. Every page is
 /// a contiguous run of the catalog in its published order, so the pages of any
-/// walk partition the catalog exactly once.
+/// walk partition the catalog exactly once — row for row, a version the catalog
+/// publishes twice included.
 ///
-/// A `resume_after` naming the LAST catalogued version yields an empty final page
-/// with no token: the listing never mints a token for the last entry (the page
+/// A `resume_after` naming the LAST catalogued row yields an empty final page
+/// with no token: the listing never mints a token for the last row (the page
 /// that reports it closes the list), so only a forged resume point reaches that
 /// case, and an empty page is the truthful answer to "what follows the end".
 pub fn kafka_version_page(resume_after: Option<usize>, page_size: usize) -> KafkaVersionPage {
@@ -1156,13 +1246,11 @@ pub fn kafka_version_page(resume_after: Option<usize>, page_size: usize) -> Kafk
         .saturating_add(page_size)
         .min(KAFKA_VERSION_CATALOG.len());
     let entries = &KAFKA_VERSION_CATALOG[start..end];
-    // The token names the entry this page stopped at — the same value the resume
+    // The token names the row this page stopped at — the same position the resume
     // lookup resolves — and is absent once the page reaches the end of the
     // catalog, which is what tells a paginating client to stop.
-    let next_token = if end < KAFKA_VERSION_CATALOG.len() {
-        entries
-            .last()
-            .map(|entry| encode_kafka_version_page_token(entry.version))
+    let next_token = if end < KAFKA_VERSION_CATALOG.len() && !entries.is_empty() {
+        Some(encode_kafka_version_page_token(end - 1))
     } else {
         None
     };

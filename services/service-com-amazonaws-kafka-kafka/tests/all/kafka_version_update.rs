@@ -160,18 +160,18 @@ fn assert_version_token(version: &str, case: &str) {
 /// Whether the catalog offers `target` as an update for a cluster running
 /// `source`, decided here from the PUBLISHED catalog rather than from the
 /// helper the handler uses: a target is offered when the service still offers it
-/// (the catalog publishes it as `ACTIVE`) and it is either a strictly newer
-/// release on the SOURCE's own upgradable build line or the `.kraft` version of
-/// the source's own release — the KRaft migration. A source on a line MSK
-/// publishes no upgrade path off is terminal. Source: the `KAFKA_VERSION_CATALOG`
-/// entries (the Amazon MSK Developer Guide's "Supported Apache Kafka versions"),
-/// plus the Developer Guide's rule that an MSK cluster's Apache Kafka version is
-/// updated in place and cannot be downgraded.
+/// (the catalog publishes an `ACTIVE` row for it) and it is either a strictly
+/// newer release on the SOURCE's own upgradable build line or, when the source
+/// sits at the final offered ZooKeeper-mode release, the `.kraft` version of that
+/// release — the KRaft migration, which MSK offers at that one release. A source
+/// on a line MSK publishes no upgrade path off is terminal. Source: the
+/// `KAFKA_VERSION_CATALOG` rows (the Amazon MSK Developer Guide's "Supported
+/// Apache Kafka versions"), plus the Developer Guide's rule that an MSK cluster's
+/// Apache Kafka version is updated in place and cannot be downgraded.
 fn catalog_offers(source: &str, target: &str) -> bool {
     let offered = KAFKA_VERSION_CATALOG
         .iter()
-        .find(|entry| entry.version == target)
-        .is_some_and(|entry| entry.status == KAFKA_VERSION_ACTIVE);
+        .any(|entry| entry.version == target && entry.status == KAFKA_VERSION_ACTIVE);
     if !offered {
         return false;
     }
@@ -180,7 +180,18 @@ fn catalog_offers(source: &str, target: &str) -> bool {
     if source_line == target_line {
         return source_line != "other" && target_release > source_release;
     }
-    source_line.is_empty() && target_line == "kraft" && target_release == source_release
+    // The crossing to the KRaft line is offered at the newest release the catalog
+    // publishes an offered ZooKeeper-mode version of, and at no other.
+    let crossing = KAFKA_VERSION_CATALOG
+        .iter()
+        .filter(|entry| entry.status == KAFKA_VERSION_ACTIVE && build_line(entry.version).is_empty())
+        .map(|entry| version_key(entry.version).0)
+        .max()
+        .unwrap_or_default();
+    source_line.is_empty()
+        && target_line == "kraft"
+        && target_release == source_release
+        && source_release == crossing
 }
 
 /// The build line a version is on: `"kraft"` for the KRaft metadata-mode
@@ -454,21 +465,24 @@ async fn only_a_target_the_service_offers_is_accepted() {
     // update — the version the cluster already runs, an older one, a newer one the
     // service has deprecated, one it does not list at all, an abbreviated or
     // differently cased spelling, an empty value, and a version on another build
-    // line (a KRaft version of another release, and the way back to ZooKeeper
-    // mode, neither of which MSK offers).
+    // line (a KRaft version of another release, the KRaft version of the source's
+    // own release at a release the crossing is not offered at, and the way back to
+    // ZooKeeper mode, none of which MSK offers).
     let rows: &[(&str, &'static str, &str)] = &[
-        // Offered: the next minor, a far newer minor, the top of the ladder, and
-        // the KRaft migration of the source's own release.
+        // Offered: the next minor, a far newer minor, the top of the ZooKeeper
+        // ladder, the KRaft migration at the release MSK offers it at, and the top
+        // of the KRaft ladder.
         ("next-minor", "3.6.0", "3.7.x"),
         ("far-minor", "2.8.1", "3.7.x"),
         ("ladder-top", "3.8.x", "3.9.x"),
-        ("kraft-migration", "3.8.x", "3.8.x.kraft"),
+        ("kraft-migration", "3.9.x", "3.9.x.kraft"),
+        ("kraft-ladder-top", "4.1.x.kraft", "4.2.x.kraft"),
         // Not offered.
         ("same-version", "3.4.0", "3.4.0"),
         ("one-patch-back", "3.3.2", "3.3.1"),
         ("far-downgrade", "3.6.0", "2.8.1"),
         ("newer-but-deprecated", "2.6.0", "2.7.0"),
-        ("newer-but-withdrawn", "3.9.x.kraft", "4.2.x.kraft"),
+        ("kraft-before-the-crossing", "3.8.x", "3.8.x.kraft"),
         ("kraft-of-another-release", "3.8.x", "3.9.x.kraft"),
         ("back-to-zookeeper", "3.9.x.kraft", "3.9.x"),
         ("uncatalogued", "3.4.0", "9.9.9"),
