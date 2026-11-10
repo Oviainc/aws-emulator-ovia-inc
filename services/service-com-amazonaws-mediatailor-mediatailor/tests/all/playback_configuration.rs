@@ -56,17 +56,12 @@ impl Reply {
         self.get(pointer).as_str().unwrap_or_default().to_string()
     }
 
-    /// The refusal's text, under either key this service's error envelopes use:
-    /// the modelled `BadRequestException` renders the member name the model
-    /// declares (`Message`), the service's own not-found envelope renders AWS's
-    /// lowercase `message`.
+    /// The refusal's text. Every error body of this service — the modelled
+    /// `BadRequestException` and the service's own not-found and
+    /// not-implemented envelopes alike — carries it under one wire key,
+    /// AWS's lowercase `message`.
     pub(crate) fn message(&self) -> String {
-        let lower = self.string("/message");
-        if lower.is_empty() {
-            self.string("/Message")
-        } else {
-            lower
-        }
+        self.string("/message")
     }
 }
 

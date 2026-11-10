@@ -23,6 +23,8 @@ mod channel_start_stop;
 mod configure_logs_scope;
 #[path = "all/create_channel_name_collision.rs"]
 mod create_channel_name_collision;
+#[path = "all/error_envelope.rs"]
+mod error_envelope;
 #[path = "all/playback_configuration.rs"]
 mod playback_configuration;
 #[path = "all/playback_configuration_logging.rs"]

@@ -39,9 +39,33 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Naming the request a response answers
+//!
+//! Every error response MediaTailor sends names the request it answered, in the
+//! `requestId` member of its JSON error body beside the `__type` and the `message`. No
+//! error shape of this model declares that member — it belongs to the response, so no
+//! handler can set it, and the framework's `restJson1` error renderers write the `__type`
+//! and the `message` alone.
+//!
+//! The rule is not restated here: `service_common::query_error_envelope` owns it for every
+//! emulated service, and this file only chooses the report this service's envelope takes
+//! (the body member) and wires it at the two layers every response of this service passes
+//! through:
+//!
+//! * [`RequestIdErrorMemberOperation`], handed back from `override_operation` for a request
+//!   the generated routing table can serve, covers everything an operation answers — a
+//!   success (untouched), a modelled error, this service's own not-found and
+//!   not-implemented envelopes, and a constraint refusal raised while it was being served;
+//! * [`RequestIdEnvelopeDefinition::error_member`], the definition wrapper `definition`
+//!   hands back, covers a response NO operation produced: a routing failure, a transport
+//!   failure detected up front, and a pre-dispatch authentication refusal.
 
+use service_common::query_error_envelope::{
+    RequestIdEnvelopeDefinition, RequestIdErrorMemberOperation,
+};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -51,7 +75,14 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// response no operation produced still names the request it answers.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// The report every operation's response passes through, held on the service because
+    /// [`Service::override_operation`] hands back a borrow of `self`. It stores no
+    /// operation of its own: the one it serves is the one the generated routing table
+    /// names for the request.
+    reporting: RequestIdErrorMemberOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +91,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::error_member(crate::ServiceDefinition::new(engine)),
+            reporting: RequestIdErrorMemberOperation,
         }
     }
 }
@@ -69,7 +101,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // The router reads it through this one accessor. Do not edit the entry: what is
+        // handed back is the shared `RequestIdEnvelopeDefinition` over that entry, which
+        // reads identity, protocol and the routing table straight off it and names the
+        // request in the error body of the three framework-level renderers.
         &self.entry
     }
 
@@ -87,12 +122,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Not a routing decision: the operation served is the one the generated routing
+        // table names for this request, and the wrapper only reports the request id on
+        // what it answered. A request the table can serve is claimed so every response of
+        // every operation passes through that report; a request it cannot is left to the
+        // framework's routing failure, which the definition wrapper above reports on.
+        self.entry
+            .routes(req)
+            .then_some(&self.reporting as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

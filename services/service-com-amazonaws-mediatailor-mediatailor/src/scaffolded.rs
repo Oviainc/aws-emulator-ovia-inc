@@ -45,6 +45,24 @@ use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use smithy_server_runtime::OperationError;
 
+/// The wire key every error body of this service carries its explanatory text
+/// under.
+///
+/// The JSON codecs key a struct member by its `@jsonName` or else by its member
+/// name, and this service's one modelled client error spells that member
+/// `Message` with no `@jsonName`, so a model-derived error shape would put
+/// `Message` on the wire while every synthetic shape below put `message` — two
+/// keys for one thing. This service answers one: the key an SDK surfaces as the
+/// exception's user-facing text, so a caller reading "why was this refused"
+/// finds the sentence whichever error it got. It is written once, here, so no
+/// error shape of this service can drift from the others.
+///
+/// The other member of this service's error envelope, the `requestId` naming the
+/// response, belongs to the RESPONSE rather than to any of these shapes: it is
+/// reported by `service_common::query_error_envelope`, wired in
+/// [`crate::service`].
+pub const ERROR_MESSAGE_WIRE_KEY: &str = "message";
+
 /// The `message` member of the synthetic `NotImplemented` error shape.
 ///
 /// `with_xml_name("Message")` matches the casing the restXml / awsQuery error
@@ -54,10 +72,10 @@ static NOT_IMPLEMENTED_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
         "smithy.framework#NotImplemented$message",
         "smithy.framework",
-        "message",
+        ERROR_MESSAGE_WIRE_KEY,
     ),
     ShapeType::String,
-    "message",
+    ERROR_MESSAGE_WIRE_KEY,
     0,
 )
 .with_xml_name("Message");
@@ -119,10 +137,10 @@ static VALIDATION_EXCEPTION_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
         "smithy.framework#ValidationException$message",
         "smithy.framework",
-        "message",
+        ERROR_MESSAGE_WIRE_KEY,
     ),
     ShapeType::String,
-    "message",
+    ERROR_MESSAGE_WIRE_KEY,
     0,
 )
 .with_xml_name("Message");
@@ -182,10 +200,10 @@ static NOT_FOUND_EXCEPTION_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
         "smithy.framework#NotFoundException$message",
         "smithy.framework",
-        "message",
+        ERROR_MESSAGE_WIRE_KEY,
     ),
     ShapeType::String,
-    "message",
+    ERROR_MESSAGE_WIRE_KEY,
     0,
 )
 .with_xml_name("Message");

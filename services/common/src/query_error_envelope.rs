@@ -25,9 +25,11 @@
 //! * [`RequestIdEnvelopeOperation`], the operation wrapper a service hands back from
 //!   `Service::override_operation`, covers a handler-returned modelled error and a
 //!   framework refusal raised while a matched operation was being served (an absent
-//!   required member, a value outside a declared bound) — or
-//!   [`RequestIdReportingOperation`], for a service that holds its operations already
-//!   wrapped and composes the report around them;
+//!   required member, a value outside a declared bound) — with
+//!   [`RequestIdHeaderOperation`] and [`RequestIdErrorMemberOperation`] as the same
+//!   wrapper under the other two reports, or [`RequestIdReportingOperation`], for a
+//!   service that holds its operations already wrapped and composes the report around
+//!   them;
 //! * [`RequestIdEnvelopeDefinition`], the definition wrapper a service hands back from
 //!   `Service::definition`, covers a routing failure (an `Action` naming no modelled
 //!   operation), a transport failure detected before any operation was named, and a
@@ -55,8 +57,9 @@
 //! * [`with_request_id_error_member`], the JSON-error-body report: the `requestId` MEMBER
 //!   beside the `__type` and the `message`, which is what a service whose recorded failures
 //!   carry the id in the body itself answers with. Reached through
-//!   [`RequestIdReportingOperation::error_member`] and
-//!   [`RequestIdEnvelopeDefinition::error_member`].
+//!   [`RequestIdErrorMemberOperation`] (a service serving its generated routing table
+//!   unchanged), [`RequestIdReportingOperation::error_member`] (one serving its operations
+//!   already wrapped) and [`RequestIdEnvelopeDefinition::error_member`].
 //!
 //! Only the request id is this module's business: the HTTP status, the `<Type>`, the
 //! `<Code>`, the `<Message>`, the body of a success and every other header stay with the
@@ -121,7 +124,11 @@ pub fn new_request_id() -> String {
 
 /// Whether `id` has the 8-4-4-4-12 lowercase-hex form every AWS request id carries — what
 /// [`new_request_id`] mints, and the only shape this module will report as one.
-fn is_request_id(id: &str) -> bool {
+///
+/// Public so a service's own test can assert the FORM of the id its responses name the
+/// request by without restating that form; the module's writers below are its only other
+/// readers.
+pub fn is_request_id(id: &str) -> bool {
     let mut groups = id.split('-');
     for width in [8usize, 4, 4, 4, 12] {
         let Some(group) = groups.next() else {
@@ -514,6 +521,34 @@ impl ErasedOperation for RequestIdHeaderOperation {
     }
 }
 
+/// Serves a modelled operation exactly as the routing table would, then names the request
+/// in the `requestId` member of the response's JSON error body — the body-member report, for
+/// a service whose own error envelope carries the id there.
+///
+/// The counterpart of [`RequestIdHeaderOperation`] for that report: the same wrapper serves
+/// every operation of such a service and stores none of its own, which is the whole operation
+/// half of the wiring for a service that serves its generated routing table unchanged. A
+/// service that serves its operations wrapped composes
+/// [`RequestIdReportingOperation::error_member`] around each of them instead.
+pub struct RequestIdErrorMemberOperation;
+
+impl ErasedOperation for RequestIdErrorMemberOperation {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(serve_reporting(svc, req, ctx, with_request_id_error_member))
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // See [`RequestIdEnvelopeOperation::auth_schemes`]: the modelled operation this
+        // wrapper delegates to is what decides, so wrapping cannot weaken its schemes.
+        None
+    }
+}
+
 /// Serves an operation a service already WRAPPED — behind its front door, say — and reports
 /// the request id on whatever that wrapper answered.
 ///
@@ -622,10 +657,11 @@ impl<D: ErasedServiceDefinition> RequestIdEnvelopeDefinition<D> {
     }
 
     /// Whether the generated routing table can serve this request — the condition under
-    /// which a service claims it for [`RequestIdEnvelopeOperation`] or
-    /// [`RequestIdHeaderOperation`], so a request naming no modelled operation (an
-    /// `Action` the model does not declare, a method and path the model does not bind)
-    /// stays the framework's (or the service's own) routing failure.
+    /// which a service claims it for [`RequestIdEnvelopeOperation`],
+    /// [`RequestIdHeaderOperation`] or [`RequestIdErrorMemberOperation`], so a request
+    /// naming no modelled operation (an `Action` the model does not declare, a method and
+    /// path the model does not bind) stays the framework's (or the service's own) routing
+    /// failure.
     pub fn routes(&self, req: &RtRequest) -> bool {
         self.inner
             .protocol()

@@ -25,6 +25,10 @@ tracing = { workspace = true }
 # from its ARN.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `service-common` owns this tree's ONE statement of the request id a response
+# names its request by, which this service reports in the `requestId` member of
+# its JSON error bodies.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

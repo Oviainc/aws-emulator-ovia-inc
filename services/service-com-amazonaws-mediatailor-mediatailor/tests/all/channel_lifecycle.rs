@@ -42,8 +42,8 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/u
 /// member's own documentation: "The minimum allowed maximum time delay is 0
 /// seconds, and the maximum allowed maximum time delay is 21600 seconds (6
 /// hours)."
-const MIN_TIME_SHIFT_SECONDS: i64 = 0;
-const MAX_TIME_SHIFT_SECONDS: i64 = 21_600;
+pub(crate) const MIN_TIME_SHIFT_SECONDS: i64 = 0;
+pub(crate) const MAX_TIME_SHIFT_SECONDS: i64 = 21_600;
 
 /// The refusal every route that addresses a stored MediaTailor resource answers
 /// a name or an ARN the account holds no such resource under with: HTTP 404
@@ -81,17 +81,18 @@ impl Reply {
         self.get(pointer).as_str().unwrap_or_default().to_string()
     }
 
-    /// The refusal's text. The service renders a modelled `BadRequestException`
-    /// under the member name the model declares (`Message`) and its own
-    /// not-found envelope under AWS's lowercase `message`, so a caller reading
-    /// "why was this refused" looks under both.
+    /// The refusal's text. Every error body of this service — the modelled
+    /// `BadRequestException` and the service's own not-found and
+    /// not-implemented envelopes alike — carries it under one wire key,
+    /// AWS's lowercase `message`.
     pub(crate) fn message(&self) -> String {
-        let lower = self.string("/message");
-        if lower.is_empty() {
-            self.string("/Message")
-        } else {
-            lower
-        }
+        self.string("/message")
+    }
+
+    /// The `requestId` the error body names its response by, or the empty
+    /// string when the body carries none.
+    pub(crate) fn request_id(&self) -> String {
+        self.string("/requestId")
     }
 }
 

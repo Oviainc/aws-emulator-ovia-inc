@@ -314,7 +314,7 @@ async fn a_refused_configure_call_writes_nothing() {
         );
         if let Some(expected_message) = expected_message {
             assert_eq!(
-                refused.string("/Message"),
+                refused.message(),
                 expected_message,
                 "case {case:?}: expected the refusal to name the limit, got {:?}",
                 refused.body
