@@ -21,6 +21,8 @@ mod discovery_pass_settings_change;
 mod discovery_resumes_where_it_stopped;
 #[path = "all/discovery_switch_off.rs"]
 mod discovery_switch_off;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/error_taxonomy.rs"]
 mod error_taxonomy;
 #[path = "all/harness.rs"]

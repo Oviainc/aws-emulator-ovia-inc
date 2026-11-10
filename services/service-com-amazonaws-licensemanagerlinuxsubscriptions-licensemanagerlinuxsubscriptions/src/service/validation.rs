@@ -48,6 +48,15 @@
 //!    [`Clause::render`]). A violation on the collection ITSELF (its `@length`, its
 //!    `@uniqueItems`) is not nested, and neither is one on a member INSIDE a structure
 //!    element, which keeps its own full path.
+//! 5. **An enumerated type's admissible values are LISTED in the order this front door
+//!    walks its own table of them**, not in the order the model declares them: the
+//!    values are held in a table keyed on each value's own text and the table is
+//!    enumerated, so the listing is derived from the values themselves
+//!    (`service_common::validation_message::in_hashed_enum_order`) and belongs to the
+//!    enumerated TYPE rather than to a member, an operation or a depth — every member
+//!    targeting one enum is stated alike, and a type the model gains needs no row
+//!    anywhere. WHICH values are admitted is never decided here: that is the enum the
+//!    member targets, which the framework's walk enforces.
 //!
 //! Nothing here is keyed to an operation or to a value: the rules are applied to
 //! whatever [`Violation`] the walk produces, so they hold for every constrained member
@@ -59,18 +68,20 @@
 //! (`None`), which keeps the framework's default sentence rather than inventing one:
 //! [`ViolationKind`] is `#[non_exhaustive]`, so a class can be added upstream.
 //!
-//! The halves of rules 3 and 4 that are NOT a per-service dialect are READ from
-//! `services/common/src/validation.rs`, the one home for them in this tree, rather than
-//! restated here: a `@pattern` printed without the anchors the model wraps it in
-//! ([`unanchored`]) and the recognition of a collection-element path
-//! ([`list_of_element`]). What stays this service's own is the tag-API taxonomy of rule
-//! 1, the collection-VALUE rendering of rule 4 (see [`Clause::render`]), and the
-//! requirement wording of every other class, which is read back off the framework's own
-//! clause rather than copied from it ([`framework_requirement`]).
+//! The halves of rules 3, 4 and 5 that are NOT a per-service dialect are READ from
+//! `services/common/src`, the one home for them in this tree, rather than restated here:
+//! a `@pattern` printed without the anchors the model wraps it in ([`unanchored`]), the
+//! recognition of a collection-element path ([`list_of_element`]) and the order an
+//! enumerated type's values are listed in ([`in_hashed_enum_order`]). What stays this
+//! service's own is the tag-API taxonomy of rule 1, the collection-VALUE rendering of
+//! rule 4 (see [`Clause::render`]), and the requirement wording of every other class,
+//! which is read back off the framework's own clause rather than copied from it
+//! ([`framework_requirement`]).
 
 use std::collections::{HashMap, HashSet};
 
 use service_common::validation::{list_of_element, unanchored};
+use service_common::validation_message::in_hashed_enum_order;
 use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 
 use crate::scaffolded::{UnmodeledRefusal, BAD_REQUEST_CODE};
@@ -108,6 +119,10 @@ const CONSTRAINT_MARKER: &str = "failed to satisfy constraint: ";
 /// class whose clause the framework words differently enough that the requirement cannot
 /// be read off it answers `None`, and only THAT clause falls back to the framework's own
 /// sentence (see [`envelope`]); the rest of the refusal is still worded here.
+///
+/// Rule 5's listing order is NOT applied here: the violation reaches [`envelope`]
+/// already restated ([`in_hashed_enum_order`]), so the requirement and the framework's
+/// own sentence for the same violation cannot state the set two ways.
 fn requirement(kind: &ViolationKind) -> Option<String> {
     match kind {
         ViolationKind::Pattern(pattern) => Some(format!(
@@ -276,6 +291,11 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
     // the count AWS states is a fact about the request, so it is not truncated.
     let mut distinct: HashSet<(String, String)> = HashSet::new();
     for violation in violations {
+        // Rule 5, applied BEFORE anything is read off the violation: an enumerated type's
+        // admissible values are listed in the order the front door walks its own table of
+        // them, which the shared derivation computes from the values themselves. Every
+        // other violation comes back unchanged.
+        let violation = &in_hashed_enum_order(violation);
         let (path, depth) = collapsed(&violation.path);
         // Nest the requirement once per collection step: a list of lists nests twice,
         // for the same reason it nests once. The depth is already clamped by
