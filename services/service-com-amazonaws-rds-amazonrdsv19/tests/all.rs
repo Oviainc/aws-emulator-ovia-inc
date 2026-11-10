@@ -278,6 +278,8 @@ mod sibling_control_plane_clusters;
 mod snapshot_export_to_s3;
 #[path = "all/state_precondition_refusal_sentences.rs"]
 mod state_precondition_refusal_sentences;
+#[path = "all/statement_budget_bounds.rs"]
+mod statement_budget_bounds;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_reference_catalogs.rs"]

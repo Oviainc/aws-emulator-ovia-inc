@@ -1253,3 +1253,9 @@ mod elbv2_host_counts_and_interfaces;
 mod cloudformation_provisions_eventbridge_pipes;
 #[path = "all/cloudformation_deployed_schedule_invokes_its_target.rs"]
 mod cloudformation_deployed_schedule_invokes_its_target;
+// Declared in the appended tail, beside the suite above: the UPDATE half of that same
+// flow — a stack that re-declares its `AWS::Scheduler::Schedule` re-arms it, so the next
+// occurrence reaches the target the new declaration names and the one it dropped is
+// handed nothing more.
+#[path = "all/cloudformation_stack_update_redirects_a_schedule.rs"]
+mod cloudformation_stack_update_redirects_a_schedule;
