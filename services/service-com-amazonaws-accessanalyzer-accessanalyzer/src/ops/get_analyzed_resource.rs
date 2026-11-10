@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAnalyzedResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAnalyzedResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAnalyzedResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports what the analyzer the request names found when it analyzed ONE resource of its
+//! own account, COMPUTED from the resource-based policy this emulator holds for that
+//! resource: the record is the resource's external-access findings, aggregated.
+//!
+//! Nothing is stored for an analyzed resource. The findings are derived on each read from
+//! the policy its owning service holds ([`crate::state::monitored_resources`]) by the
+//! crate's ONE external-access analysis ([`crate::state::external_access_findings`]) and
+//! aggregated by [`crate::state::analyzed_resource`] — so this operation writes nothing and
+//! two reads of one resource report the same record.
+//!
+//! ## What is reported
+//!
+//! * `analyzerArn` must name a stored analyzer (404 otherwise), and that analyzer must be
+//!   an EXTERNAL access analyzer: "This action is supported only for external access
+//!   analyzers", so a request naming an analyzer of the unused-access or internal-access
+//!   family is refused with the service's fixed `ValidationException` for an unsupported
+//!   action rather than answered with a record it does not report.
+//! * A resource the analyzer ANALYZED — one of its own account whose resource-based policy
+//!   this emulator holds — is reported as one `AnalyzedResource`, whether or not that
+//!   policy grants anything outside the zone of trust: `isPublic` when any of its findings
+//!   is public, `actions` every action they report, `sharedVia` how they say the access is
+//!   granted, `status` theirs, and `error` the analysis' own when the policy could not be
+//!   read. A resource granting no external access carries none of those finding members,
+//!   `isPublic` false and the instants of the analysis that looked at it.
+//! * A `resourceArn` the analyzer analyzed NOTHING for — one whose resource-based policy
+//!   this emulator does not hold, or one that belongs to another account — carries no
+//!   `resource` member at all: `resource` is optional, and there is no analysis of such a
+//!   resource to report.
+//!
+//! ## What bounds the work
+//!
+//! The record is not stored, so every call re-derives the resource's findings from its
+//! policy. The analysis of that ONE resource is bounded exactly as a findings listing is:
+//! at most [`MAX_RESOURCE_FINDINGS`] findings and at most [`MAX_ANALYSIS_UNITS`] units of
+//! work charged for the policy read, every statement visited, every principal considered
+//! and every string copied into a finding. A call past either ceiling is refused with the
+//! modelled `ValidationException` naming the member to change rather than run. The analysis
+//! runs on the blocking pool with every store lock already released, exactly as
+//! `ListFindings` and `CheckNoNewAccess` run theirs.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +106,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// What bounds one call's analysis, shared with every other analysis in this crate so no
+// two of them answer the same question differently.
+use crate::state::{Budget, Exhausted};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +183,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAnalyzedResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAnalyzedResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAnalyzedResource"))
+        // A read: what the analyzer found about the resource is a function of the policy
+        // the resource's owning service holds, the analyzer and the clock, so nothing of
+        // the request metadata is consulted and nothing is written — not by this call and
+        // not by the stores it reads.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAnalyzedResourceErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        // The analyzer is read under this service's lock, which is RELEASED (the block ends
+        // here) before any other store is read or any analysis runs.
+        let (analyzer_arn, analyzer_created_at) = {
+            let state = state.lock();
+
+            // Fixed text, the ARN the caller named in the modelled `resourceId`: every
+            // resource-scoped refusal in this service goes through `crate::state`'s
+            // constructors.
+            let analyzer = state.analyzer_by_arn(&input.analyzer_arn).ok_or_else(|| {
+                GetAnalyzedResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::analyzer_not_found(&input.analyzer_arn),
+                )
+            })?;
+
+            // "This action is supported only for external access analyzers" — an analyzer
+            // of either configured family reports no external access at all, so the request
+            // is refused rather than answered with no record, which would claim the
+            // analyzer found nothing about the resource. The refusal is about the analyzer
+            // the request names rather than about one malformed member, so it carries no
+            // `fieldList` and its message is the service's fixed text for an unsupported
+            // action, the same one `ListFindings` refuses that family with.
+            if analyzer.configured_access().is_some() {
+                return Err(GetAnalyzedResourceErrorModeled::ValidationException(
+                    crate::state::unsupported_action_exception(),
+                )
+                .into());
+            }
+
+            (analyzer.arn.clone(), analyzer.created_at)
+        };
+
+        // The zone of trust of an account analyzer is the account it monitors, which its
+        // own ARN names; the resources of that account are read out of the services that
+        // own them, each under its own lock and none of them held past the read.
+        let account = crate::state::resource_owner_account(&analyzer_arn, None);
+        let resources = crate::state::monitored_resources(&*self.engine, &account);
+
+        // The analyzer analyzes a resource of its own account whose resource-based policy
+        // this emulator holds, so an ARN naming no such resource was analyzed by nothing:
+        // `resource` is an optional member and the answer carries none, rather than a
+        // record claiming an analysis of a resource that was never looked at.
+        let Some(resource) = resources
+            .into_iter()
+            .find(|monitored| monitored.arn == input.resource_arn)
+        else {
+            return Ok(GetAnalyzedResourceOutput { resource: None });
+        };
+
+        // Reading the policy, deriving the resource's findings and aggregating them
+        // allocates and parses, so it is CPU-bound: it runs on the blocking pool, the way
+        // `ListFindings` sends its own analysis there, under ONE budget of
+        // [`MAX_ANALYSIS_UNITS`], with every store lock already released.
+        let analysed = ::tokio::task::spawn_blocking(move || {
+            let mut budget = Budget::new(MAX_ANALYSIS_UNITS);
+            let findings = crate::state::external_access_findings(
+                &analyzer_arn,
+                analyzer_created_at,
+                ::std::slice::from_ref(&resource),
+                MAX_RESOURCE_FINDINGS,
+                &mut budget,
+            )?;
+            let findings: Vec<FindingSummary> =
+                findings.into_iter().map(|(_, finding)| finding).collect();
+            Ok::<_, Exhausted>(crate::state::analyzed_resource(
+                &resource,
+                analyzer_created_at,
+                &findings,
+            ))
+        })
+        .await;
+
+        match analysed {
+            Ok(Ok(resource)) => Ok(GetAnalyzedResourceOutput {
+                resource: Some(resource),
+            }),
+            // The resource's policy is analyzable, but reporting what it grants would cost
+            // more than this emulator spends on one call: refused, naming the request
+            // member at fault, rather than allocating further.
+            Ok(Err(exhausted)) => {
+                ::tracing::info!(
+                    operation = Self::NAME,
+                    refusal = "budget",
+                    "refused an analyzed-resource read past this emulator's analysis ceiling"
+                );
+                Err(GetAnalyzedResourceErrorModeled::ValidationException(
+                    crate::state::field_validation_exception(exhausted.member, exhausted.detail),
+                )
+                .into())
+            }
+            // A panic or a cancellation on the pool says nothing about the resource's
+            // policy, so it is reported as the server fault it is rather than as a resource
+            // the analyzer found nothing about.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = Self::NAME,
+                    error = %error,
+                    "the external access analysis did not complete"
+                );
+                Err(GetAnalyzedResourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the external access analysis did not complete".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into())
+            }
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// What one call of this operation may spend
+// ---------------------------------------------------------------------------
+
+/// How many findings this emulator will derive for the ONE resource this call reports on.
+///
+/// The record is not stored, so every call re-derives them; this is the emulator's OWN
+/// ceiling on that work, the counterpart of the one a findings listing applies to the whole
+/// account — the policy parser bounds each factor (document bytes, statements, element
+/// values) but not their PRODUCT, and it is the product that decides how many findings one
+/// policy produces.
+const MAX_RESOURCE_FINDINGS: usize = 1_000;
+
+/// How much work ONE call's analysis may spend: reading the resource's policy, deriving its
+/// findings and aggregating them, under one ceiling.
+///
+/// A unit is one policy read, one statement visited, one principal considered or one string
+/// copied into a finding — so this bounds the allocation and the byte-level work of the
+/// analysis in the PRODUCT of its factors rather than in each factor alone, whatever the
+/// stored policy looks like.
+const MAX_ANALYSIS_UNITS: u64 = 500_000;

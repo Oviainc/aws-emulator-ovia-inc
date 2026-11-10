@@ -46,7 +46,7 @@ use std::time::SystemTime;
 
 use super::{derived_uuid, resource_owner_account};
 use crate::ops::check_no_new_access::policy;
-use crate::ops::types::{FindingSource, FindingSummary};
+use crate::ops::types::{AnalyzedResource, FindingSource, FindingSummary};
 
 /// The `FindingStatus` a reported external-access finding carries: `ACTIVE`, the status of
 /// a finding whose access the resource's policy still grants and which no archive rule has
@@ -430,6 +430,77 @@ pub fn external_access_findings(
     }
     findings.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(findings)
+}
+
+/// What the analyzer reports ABOUT one resource it analyzed: the resource itself, and its
+/// external-access findings aggregated into the one `AnalyzedResource` record.
+///
+/// A resource the analyzer analyzed is reported whether or not its policy grants anything
+/// outside the zone of trust — "information about a resource that was analyzed" is what the
+/// record is, and `isPublic` is a REQUIRED member of it, so a resource granting no external
+/// access is reported as granting none rather than not reported at all.
+///
+/// The members that speak about a FINDING are the optional ones, and a resource the analysis
+/// produced no finding for carries none of them: `status` is "the current status of the
+/// finding generated from the analyzed resource", `actions` what "an external principal is
+/// granted permission to use by the policy that generated the finding", and `sharedVia` how
+/// "the access that generated the finding is granted". A resource whose findings reach
+/// several principals is reported ONCE, with what all of them say about the resource taken
+/// together: the access is public when any of them is public, the actions are every action
+/// they report, and `sharedVia` is every way they say the access is granted (which the
+/// finding's own `sources` states, and which the model populates for Amazon S3 bucket
+/// findings).
+///
+/// Derived from the findings rather than from the policy a second time, so the record and
+/// the findings of one resource cannot disagree about it.
+pub fn analyzed_resource(
+    resource: &MonitoredResource,
+    analyzer_created_at: SystemTime,
+    findings: &[FindingSummary],
+) -> AnalyzedResource {
+    // The analysis that produced the findings is what analyzed the resource, and nothing
+    // has updated the record since, so all three instants are the one instant it ran at —
+    // the same instant its findings carry.
+    let analyzed_at = ::aws_smithy_types::DateTime::from(resource.analyzed_at(analyzer_created_at));
+    let mut is_public = false;
+    let mut actions: Vec<String> = Vec::new();
+    let mut shared_via: Vec<String> = Vec::new();
+    let mut error: Option<String> = None;
+    for finding in findings {
+        is_public |= finding.is_public.unwrap_or(false);
+        // Deduplicated in the order the policy names them, so two statements granting the
+        // same action report it once and the list stays the policy's own order.
+        for action in finding.action.iter().flatten() {
+            if !actions.iter().any(|held| held == action) {
+                actions.push(action.clone());
+            }
+        }
+        for source in finding.sources.iter().flatten() {
+            if !shared_via.iter().any(|held| held == &source.r#type) {
+                shared_via.push(source.r#type.clone());
+            }
+        }
+        if error.is_none() {
+            error = finding.error.clone();
+        }
+    }
+    AnalyzedResource {
+        resource_arn: resource.arn.clone(),
+        resource_type: resource.resource_type.to_string(),
+        created_at: analyzed_at,
+        analyzed_at,
+        updated_at: analyzed_at,
+        is_public,
+        // Every finding member is optional: a resource the analysis found no finding for
+        // carries none of them, and so does one whose findings report no action or say
+        // nothing about how the access is granted — an empty list would claim a finding
+        // that reports nothing.
+        actions: Some(actions).filter(|actions| !actions.is_empty()),
+        shared_via: Some(shared_via).filter(|shared_via| !shared_via.is_empty()),
+        status: findings.first().map(|finding| finding.status.clone()),
+        resource_owner_account: resource.owner_account.clone(),
+        error,
+    }
 }
 
 /// The analysis of this account's resources takes more work than one call spends.
