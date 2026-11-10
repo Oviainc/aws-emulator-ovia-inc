@@ -1163,19 +1163,43 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
         self.configured_table_associations.get(id)
     }
 
-    /// The stored configured table association `association_id`, but only when it belongs
-    /// to `membership_id`: an association is a sub-resource of one membership (both
-    /// operations address it as
-    /// `/memberships/{membershipIdentifier}/configuredTableAssociations/{id}`), so one of
-    /// another membership is not visible through this one.
+    /// The stored configured table association a `configuredTableAssociationIdentifier`
+    /// addresses under `membership_id`, or `None` when the membership holds none the
+    /// identifier names.
+    ///
+    /// An association is a sub-resource of one membership (every operation addresses it as
+    /// `/memberships/{membershipIdentifier}/configuredTableAssociations/{identifier}`), so
+    /// one of another membership is not visible through this one.
+    ///
+    /// The identifier itself is NOT only the association's own id: the member is
+    /// documented as accepting either the association ("Currently accepts the configured
+    /// table association ID" —
+    /// `CreateConfiguredTableAssociationAnalysisRuleInput$configuredTableAssociationIdentifier`)
+    /// or the configured table the association was created for ("Currently accepts the
+    /// configured table ID" — `GetConfiguredTableAssociationInput` and
+    /// `DeleteConfiguredTableAssociationInput`). Both are resolved here, in that order, so
+    /// every operation that addresses an association accepts both forms and no caller has
+    /// to know which of the two an operation's doc happens to name. When a membership
+    /// holds several associations of one configured table, the table's id resolves to the
+    /// first of them in creation order, so the answer does not depend on map iteration
+    /// order.
     pub fn configured_table_association_in(
         &self,
         membership_id: &str,
-        association_id: &str,
+        association_identifier: &str,
     ) -> Option<&ConfiguredTableAssociation> {
         self.configured_table_associations
-            .get(association_id)
+            .get(association_identifier)
             .filter(|association| association.membership_id == membership_id)
+            .or_else(|| {
+                self.configured_table_association_order
+                    .iter()
+                    .filter_map(|id| self.configured_table_associations.get(id))
+                    .find(|association| {
+                        association.membership_id == membership_id
+                            && association.configured_table_id == association_identifier
+                    })
+            })
     }
 
     /// The analysis rule of `analysis_rule_type` stored for the configured table
