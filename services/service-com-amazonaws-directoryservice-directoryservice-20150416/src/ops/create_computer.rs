@@ -196,13 +196,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Creating a computer object writes into the directory itself, so it needs a
         // directory that is in service: one still being built by the transition its create
         // owes is unavailable, which is the modelled refusal for exactly that. The
-        // diagnostic is this service's shared one for a directory a call cannot reach
-        // ([`crate::state::directory_unavailable`]) — the requested id and nothing about
-        // the stage it is in.
+        // diagnostic is this family's own
+        // ([`crate::state::computer_directory_unavailable`]) — the quoted id the request
+        // asked for and that the directory the join needs is not one the service has, with
+        // nothing about the stage its build has reached.
         if directory.stage != crate::state::STAGE_ACTIVE {
             return Err(
                 CreateComputerErrorModeled::DirectoryUnavailableException(
-                    crate::state::refusal(crate::state::directory_unavailable(
+                    crate::state::refusal(crate::state::computer_directory_unavailable(
                         &input.directory_id,
                     )),
                 )
@@ -243,17 +244,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An account name is unique within the directory, and Active Directory compares
         // account names case-insensitively, so the stored accounts are keyed by the folded
         // name — which is what makes a second create of the same name, in any case, the
-        // modelled "specified entity already exists".
+        // modelled "specified entity already exists". The diagnostic is this family's own
+        // ([`crate::state::computer_already_exists`]): the fixed sentence that the computer
+        // could not be created, closing with this call's request id, and nothing about the
+        // directory or the account that collided.
         let key = crate::state::Directory::computer_key(&input.computer_name);
-        if let Some(existing) = directory.computers.get(&key) {
+        if directory.computers.contains_key(&key) {
             return Err(
-                CreateComputerErrorModeled::EntityAlreadyExistsException(crate::state::refusal(
-                    format!(
-                        "Directory {id} already holds the computer account {name}",
-                        id = directory.directory_id,
-                        name = existing.computer_name
+                CreateComputerErrorModeled::EntityAlreadyExistsException(
+                    crate::state::refusal_naming_its_request_id(
+                        crate::state::computer_already_exists,
                     ),
-                ))
+                )
                 .into(),
             );
         }

@@ -29,6 +29,8 @@ mod certificate_functions;
 mod certificate_listing;
 #[path = "all/certificates.rs"]
 mod certificates;
+#[path = "all/computer_account_unavailable_wording.rs"]
+mod computer_account_unavailable_wording;
 #[path = "all/computer_attributes.rs"]
 mod computer_attributes;
 #[path = "all/computers.rs"]
@@ -119,6 +121,8 @@ mod state_roundtrip;
 mod trust_conflict_message;
 #[path = "all/trust_outcomes.rs"]
 mod trust_outcomes;
+#[path = "all/trust_peer_resolution.rs"]
+mod trust_peer_resolution;
 #[path = "all/trusts.rs"]
 mod trusts;
 #[path = "all/user_passwords.rs"]

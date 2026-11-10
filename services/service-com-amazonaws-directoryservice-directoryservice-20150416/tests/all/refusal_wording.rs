@@ -66,22 +66,12 @@ struct UnavailableCase {
 ///
 /// The conditional-forwarder mutations are NOT here: Directory Service checks the
 /// directory's stage as a PARAMETER of those calls and states the stages they need, which
-/// `tests/all/refusal_texts.rs` is what asserts.
+/// `tests/all/refusal_texts.rs` is what asserts. `CreateComputer` is not here either: the
+/// computer-account family states the directory-lookup sentence for this failure instead,
+/// which `tests/all/computer_account_unavailable_wording.rs` is what asserts.
 fn unavailable_rows(certificate: &str) -> Vec<UnavailableCase> {
     let certificate = certificate.to_string();
     vec![
-        UnavailableCase {
-            case: "CreateComputer",
-            operation: "CreateComputer",
-            microsoft_ad: false,
-            body: Box::new(|id| {
-                json!({
-                    "DirectoryId": id,
-                    "ComputerName": "early",
-                    "Password": "Cmp-1-Time!Pw"
-                })
-            }),
-        },
         UnavailableCase {
             case: "AddIpRoutes",
             operation: "AddIpRoutes",

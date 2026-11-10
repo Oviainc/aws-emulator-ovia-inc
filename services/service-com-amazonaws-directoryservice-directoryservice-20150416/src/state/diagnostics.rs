@@ -62,10 +62,40 @@ pub fn invalid_directory_ids(directory_ids: &[String]) -> String {
 /// that is not there from one that is not ready. [`refusal`] appends the request id, once.
 ///
 /// Some families state their own sentence for the same failure, and those say it rather
-/// than this one: [`ldaps_directory_unavailable`] for the LDAPS settings, and
+/// than this one: [`ldaps_directory_unavailable`] for the LDAPS settings,
+/// [`computer_directory_unavailable`] for a computer-account write, and
 /// [`stage_defect`] for a call whose refusal names the stage it needs.
 pub fn directory_unavailable(directory_id: &str) -> String {
     format!("Operation could not be performed because directory {directory_id} is unavailable.")
+}
+
+/// The `DirectoryUnavailableException` message a computer-account write on a directory
+/// that is not in service is refused with.
+///
+/// Directory Service words this one in the directory-LOOKUP family's sentence
+/// ([`no_such_directory`]) rather than the family-neutral [`directory_unavailable`] one: a
+/// computer account is created in the directory's own domain, and a directory that is still
+/// being built has no domain to create it in, so the join path reports the directory as one
+/// it does not have — under the modelled `DirectoryUnavailableException`, which is what
+/// tells the caller to wait for the directory rather than to fix the id it sent.
+/// `CreateComputer` states it; the family-neutral sentence is what every operation whose
+/// family states none of its own says. [`refusal`] appends the request id, once.
+pub fn computer_directory_unavailable(directory_id: &str) -> String {
+    no_such_directory(directory_id)
+}
+
+/// The `EntityAlreadyExistsException` diagnostic a computer account the directory already
+/// holds is refused with, built around `request_id` — the id of the call being answered.
+///
+/// Directory Service states this one as the account it could not create and nothing about
+/// what collided: the FIXED sentence that the computer could not be created, closing with
+/// the call's own request id, and neither the directory nor the name the request sent — so a
+/// caller learns that the account is there without the service disclosing anything of the
+/// one it holds. The id is therefore named TWICE in the answer's `Message`, once by this
+/// sentence and once by the suffix [`refusal_naming_its_request_id`] appends, and both are
+/// this call's, the one the modelled `RequestId` member reports.
+pub fn computer_already_exists(request_id: &str) -> String {
+    format!("Could not create computer. RequestId: {request_id}")
 }
 
 /// The `DirectoryUnavailableException` message the LDAPS settings of a directory that is

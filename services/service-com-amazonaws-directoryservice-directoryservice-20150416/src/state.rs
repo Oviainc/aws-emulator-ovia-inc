@@ -814,9 +814,8 @@ pub const TRUST_STATE_VERIFIED: &str = "Verified";
 /// the `Failed` value of the modelled `TrustState` enum.
 ///
 /// The Amazon Web Services side of a trust can only be established against a peer the
-/// remote domain actually has, so a create naming a domain under a top-level domain the
-/// IETF reserves as never-installed settles here instead of on [`TRUST_STATE_CREATED`] —
-/// see [`remote_domain_has_a_reserved_top_level_domain`] and
+/// remote domain actually has, so a create naming a domain no peer answers for settles here
+/// instead of on [`TRUST_STATE_CREATED`] — see [`remote_domain_has_a_peer`] and
 /// [`TRUST_CREATE_FAILURE_REASON`].
 pub const TRUST_STATE_FAILED: &str = "Failed";
 
@@ -854,6 +853,33 @@ pub fn remote_domain_has_a_reserved_top_level_domain(remote_domain_name: &str) -
     let key = domain_key(remote_domain_name);
     let top_level = key.rsplit('.').next().unwrap_or_default();
     NON_RESOLVABLE_TOP_LEVEL_DOMAINS.contains(&top_level)
+}
+
+/// Whether a peer answers for `remote_domain_name`, which is what decides whether the
+/// Amazon Web Services side of a trust with it can be established at all.
+///
+/// Two ways a peer can be there, and the order matters:
+///
+/// * `domains_served` holds the domains this service itself serves — the domain name of
+///   every directory it stores
+///   ([`ComAmazonawsDirectoryserviceDirectoryservice20150416State::domains_served`]) — and a
+///   directory IS a peer at its own domain, answering DNS at the addresses
+///   `DirectoryDescription$DnsIpAddrs` reports for it. A trust pointed at one of those
+///   domains therefore has a peer whatever the name looks like, which is what makes a trust
+///   between two directories of this service establish;
+/// * otherwise the name is external, and one under a top-level domain the IETF reserves as
+///   never installed ([`remote_domain_has_a_reserved_top_level_domain`]) can have no peer
+///   anywhere, so a trust to it cannot be established;
+/// * every other external name is taken to have one.
+///
+/// A STRING comparison over stored state and nothing else: no name is resolved, no resolver
+/// is consulted and no socket is opened, so the outcome is the same on every host.
+pub fn remote_domain_has_a_peer(
+    remote_domain_name: &str,
+    domains_served: &BTreeSet<String>,
+) -> bool {
+    domains_served.contains(&domain_key(remote_domain_name))
+        || !remote_domain_has_a_reserved_top_level_domain(remote_domain_name)
 }
 
 /// The `TrustState` a trust relationship carries between `DeleteTrust` and
@@ -3765,20 +3791,26 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             }
         }
         // The state transitions the trust writes owe: the transient `Creating` a create
-        // answers in settles on `Created`, and on `Failed` for a remote domain under a
-        // top-level domain the IETF reserves as never installed — establishing the Amazon
-        // Web Services side needs a peer at that domain, and such a name can have none,
-        // which is the state reason the failed trust then carries. The branch is decided by
-        // a STRING comparison over the stored name (see
-        // [`remote_domain_has_a_reserved_top_level_domain`]): nothing here resolves a name,
-        // consults a resolver or opens a socket, so no caller-supplied value leaves this
-        // process and the outcome is the same on every host. The
+        // answers in settles on `Created` when a peer answers for its remote domain, and on
+        // `Failed` when none does — establishing the Amazon Web Services side needs a peer
+        // at that domain, and that is the state reason the failed trust then carries. Which
+        // domains have a peer is decided from STORED state and a string comparison (see
+        // [`remote_domain_has_a_peer`]): the domains this service itself serves are peers,
+        // and of the external names the ones the IETF reserves as never installed can have
+        // none. Nothing here resolves a name, consults a resolver or opens a socket, so no
+        // caller-supplied value leaves this process and the outcome is the same on every
+        // host. The
         // `Verifying` a verify answers in settles on `Verified`, and the `Deleting` a
         // delete answers in settles on `Deleted` — after which the relationship leaves
         // the store one span later, because a trust this service no longer holds is not
         // one `DescribeTrusts` reports. The transition `UpdateTrust` owes belongs to that
         // handler, which is still scaffolded, so it lands with it rather than as a branch
         // nothing can reach.
+        //
+        // Read once, before the trusts are walked, so every trust falling due in this pass
+        // resolves its remote domain against the same directories — the ones this service
+        // holds at `now`, with the stage transitions above already materialised.
+        let domains_served = self.domains_served();
         for trust in self.trusts.values_mut() {
             let Some(due) = trust.trust_state_due_at else {
                 continue;
@@ -3788,13 +3820,13 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             }
             let (settled, reason) = match trust.trust_state.as_str() {
                 TRUST_STATE_CREATING => {
-                    if remote_domain_has_a_reserved_top_level_domain(&trust.remote_domain_name) {
+                    if remote_domain_has_a_peer(&trust.remote_domain_name, &domains_served) {
+                        (TRUST_STATE_CREATED, None)
+                    } else {
                         (
                             TRUST_STATE_FAILED,
                             Some(TRUST_CREATE_FAILURE_REASON.to_string()),
                         )
-                    } else {
-                        (TRUST_STATE_CREATED, None)
                     }
                 }
                 TRUST_STATE_VERIFYING => (TRUST_STATE_VERIFIED, None),
@@ -3919,6 +3951,20 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 && domain_key(&trust.remote_domain_name) == key
                 && !TRUST_STATES_NOT_HELD.contains(&trust.trust_state.as_str())
         })
+    }
+
+    /// The DNS domains this service itself serves: the fully qualified domain name of
+    /// every directory it stores, folded by [`domain_key`] so a lookup agrees with DNS.
+    ///
+    /// A trust's remote domain is resolved against this set
+    /// ([`remote_domain_has_a_peer`]): a directory this service holds IS a peer at its own
+    /// domain, so a trust pointed at one establishes, and `DeleteDirectory` taking that
+    /// directory away takes the peer with it.
+    pub fn domains_served(&self) -> BTreeSet<String> {
+        self.directories
+            .values()
+            .map(|directory| domain_key(&directory.name))
+            .collect()
     }
 
     /// Directory shares in creation order — the order `DescribeSharedDirectories` pages
@@ -4299,6 +4345,23 @@ modeled_failures!(
 pub fn refusal<E: ModeledFailure>(message: impl Into<String>) -> E {
     let request_id = next_request_id();
     E::from_parts(with_request_id(&message.into(), &request_id), request_id)
+}
+
+/// Refuse the call with one of this service's modelled errors whose diagnostic NAMES the
+/// call's own request id — `diagnostic` is handed the id this refusal reports and words the
+/// sentence around it, after which the envelope's suffix follows as usual.
+///
+/// A family whose recorded text closes with the request id itself
+/// ([`computer_already_exists`]) cannot be built before the id is minted, which is why the
+/// sentence arrives as a function of it rather than as a string. One id is minted, so the
+/// message and the modelled `RequestId` member still report exactly one correlation handle,
+/// the one of THIS call.
+pub fn refusal_naming_its_request_id<E: ModeledFailure>(
+    diagnostic: impl FnOnce(&str) -> String,
+) -> E {
+    let request_id = next_request_id();
+    let stated = diagnostic(&request_id);
+    E::from_parts(with_request_id(&stated, &request_id), request_id)
 }
 
 /// Refuse the call with one of this service's modelled errors whose diagnostic is NOT this
