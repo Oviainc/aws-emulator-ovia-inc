@@ -16,12 +16,12 @@
 //! 1. the catalog an account enumerates carries the long-standing AWS managed policies a
 //!    client resolves BY NAME, each at the path, ARN and attachability AWS publishes for
 //!    it;
-//! 2. `Policy$IsAttachable` is a report of whether that policy may be attached to an
-//!    identity: a policy reported as not attachable is one AWS reserves, so it is refused
-//!    by every operation that would attach it or make it an identity's permissions
-//!    boundary (400 `PolicyNotAttachable`, IAM's fixed sentence for that reservation
-//!    naming the identity kind the call addressed, nothing persisted), and one reported as
-//!    attachable is accepted by all of them.
+//! 2. `Policy$IsAttachable` is the flag AWS publishes for the policy, reported per entry;
+//!    the policies AWS files under the path it RESERVES for service-linked roles belong to
+//!    that role alone, so every operation that would attach one to an identity or make it
+//!    an identity's permissions boundary refuses it (400 `PolicyNotAttachable`, IAM's fixed
+//!    sentence for that reservation naming the identity kind the call addressed, nothing
+//!    persisted), and a policy outside that path is accepted by all of them.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the
 //! policy's path (the account root, `/service-role/`, the path reserved for
@@ -314,19 +314,19 @@ async fn create_identity(router: &MultiServiceRouter, which: Use, identity: &str
     }
 }
 
-/// The catalog entries whose `IsAttachable` is false — the service-linked-role policies.
-fn non_attachable_entries() -> Vec<&'static state::AwsManagedPolicy> {
+/// The catalog entries AWS reserves for the service-linked role they were written for.
+fn reserved_entries() -> Vec<&'static state::AwsManagedPolicy> {
     state::AWS_MANAGED_POLICIES
         .iter()
-        .filter(|entry| !entry.is_attachable())
+        .filter(|entry| entry.is_reserved_for_service_linked_role())
         .collect()
 }
 
-/// The catalog entries whose `IsAttachable` is true.
-fn attachable_entries() -> Vec<&'static state::AwsManagedPolicy> {
+/// The catalog entries AWS reserves for nothing, so any identity may take them.
+fn unreserved_entries() -> Vec<&'static state::AwsManagedPolicy> {
     state::AWS_MANAGED_POLICIES
         .iter()
-        .filter(|entry| entry.is_attachable())
+        .filter(|entry| !entry.is_reserved_for_service_linked_role())
         .collect()
 }
 
@@ -386,11 +386,11 @@ async fn the_enumerated_catalog_carries_the_well_known_aws_managed_policies() {
     }
 }
 
-/// RULE: `Policy$IsAttachable` is reported per policy, so the enumerated catalog offers
-/// BOTH kinds — the policies published to be attached, and the ones AWS files under the
-/// path it reserves for service-linked roles, which belong to that role alone.
+/// RULE: `Policy$IsAttachable` is reported per policy from the catalog's own data, so the
+/// enumeration reports the attachability AWS publishes for each entry rather than a value
+/// read off the entry's path.
 #[tokio::test]
-async fn the_enumerated_catalog_reports_both_kinds_of_policy() {
+async fn the_enumerated_catalog_reports_the_published_attachability_of_each_policy() {
     let router = router();
     let reported = aws_scope_catalog(&router).await;
     assert!(
@@ -399,53 +399,44 @@ async fn the_enumerated_catalog_reports_both_kinds_of_policy() {
          {reported:?}"
     );
 
-    let attachable: Vec<&CatalogPolicy> = reported
-        .iter()
-        .filter(|policy| policy.is_attachable == "true")
-        .collect();
-    let not_attachable: Vec<&CatalogPolicy> = reported
-        .iter()
-        .filter(|policy| policy.is_attachable == "false")
-        .collect();
-    assert!(
-        !attachable.is_empty(),
-        "the catalog must offer policies an identity can attach, got {reported:?}"
-    );
-    assert!(
-        !not_attachable.is_empty(),
-        "the catalog must offer at least one policy that is NOT attachable, got {reported:?}"
-    );
-
-    // Every row's flag follows the published rule, so a client can pre-screen an ARN on
-    // the path as well as on the flag, and the two never disagree.
+    // Every row's flag is the one the catalog publishes for that policy — including the
+    // entries under the path AWS reserves for service-linked roles, which AWS publishes as
+    // attachable like the rest and refuses an attach of.
     for policy in &reported {
-        let expected = (!policy.path.starts_with("/aws-service-role/")).to_string();
+        let entry = state::aws_managed_policy(&policy.arn).unwrap_or_else(|| {
+            panic!(
+                "case {:?}: the enumeration must report a policy the catalog carries",
+                policy.arn
+            )
+        });
         assert_eq!(
-            policy.is_attachable, expected,
-            "case {:?}: a policy under the service-linked-role path is not attachable and \
-             every other one is, got IsAttachable {:?}",
-            policy.arn, policy.is_attachable
+            policy.is_attachable,
+            entry.is_attachable.to_string(),
+            "case {:?}: expected the attachability AWS publishes for this policy, got \
+             IsAttachable {:?}",
+            policy.arn,
+            policy.is_attachable
         );
     }
 }
 
-/// RULE: a managed policy reported as NOT attachable cannot be attached to an identity or
-/// used to set one's permissions boundary — 400 `PolicyNotAttachable` with IAM's fixed
-/// text, and nothing is recorded on the identity.
+/// RULE: a managed policy AWS RESERVES for the service-linked role it was written for
+/// cannot be attached to an identity or used to set one's permissions boundary — 400
+/// `PolicyNotAttachable` with IAM's fixed text, and nothing is recorded on the identity.
 #[tokio::test]
-async fn a_policy_that_is_not_attachable_is_refused_by_every_use() {
+async fn a_policy_aws_reserves_is_refused_by_every_use() {
     let router = router();
 
-    // Rows: every non-attachable catalog entry, plus ARNs in that same namespace the
-    // catalog does not carry — the refusal is about the policy's attachability, not about
-    // which entries this emulator happens to hold.
-    let mut policies: Vec<(String, String)> = non_attachable_entries()
+    // Rows: every reserved catalog entry, plus ARNs in that same namespace the catalog
+    // does not carry — the refusal is about AWS's reservation of the path, not about which
+    // entries this emulator happens to hold.
+    let mut policies: Vec<(String, String)> = reserved_entries()
         .iter()
         .map(|entry| (format!("the catalog entry {}", entry.policy_name), entry.arn()))
         .collect();
     assert!(
         !policies.is_empty(),
-        "the catalog must carry a non-attachable policy for this suite to span anything"
+        "the catalog must carry a reserved policy for this suite to span anything"
     );
     for arn in [
         "arn:aws:iam::aws:policy/aws-service-role/AWSLambdaRole",
@@ -493,16 +484,16 @@ async fn a_policy_that_is_not_attachable_is_refused_by_every_use() {
     }
 }
 
-/// RULE: the refusal is about the policy's attachability and nothing else, so every
-/// policy the catalog reports as attachable IS accepted by the same operations, and
-/// the identity reports it afterwards.
+/// RULE: the refusal is about AWS's reservation and nothing else, so every policy outside
+/// the reserved path IS accepted by the same operations, and the identity reports it
+/// afterwards.
 #[tokio::test]
-async fn a_policy_that_is_attachable_is_accepted_by_every_use() {
+async fn a_policy_aws_does_not_reserve_is_accepted_by_every_use() {
     let router = router();
 
-    // Rows: catalog entries at the account root and under `/service-role/` — the two
-    // paths an attachable AWS managed policy is published under.
-    let entries = attachable_entries();
+    // Rows: catalog entries at the account root and under `/service-role/` — two of the
+    // paths an unreserved AWS managed policy is published under.
+    let entries = unreserved_entries();
     let root = entries
         .iter()
         .find(|entry| entry.path == "/")

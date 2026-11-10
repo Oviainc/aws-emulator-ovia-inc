@@ -488,7 +488,7 @@ async fn the_report_lists_every_service_the_resources_policies_allow_an_action_o
             "a wildcard inside the namespace",
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3*:Get*","Resource":"*"}]}"#,
             // Every namespace the catalog carries that the run `s3*` reaches.
-            Expected::Only(&["s3", "s3-object-lambda", "s3express", "s3outposts"]),
+            Expected::Only(&["s3", "s3-object-lambda", "s3express", "s3outposts", "s3tables"]),
         ),
         (
             "the whole-element wildcard",
@@ -517,7 +517,7 @@ async fn the_report_lists_every_service_the_resources_policies_allow_an_action_o
         ),
         (
             "a service outside the ones a report covers",
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"deepracer:ListModels","Resource":"*"}]}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"nosuchservicehere:ListModels","Resource":"*"}]}"#,
             Expected::Only(&[]),
         ),
     ];
@@ -611,12 +611,12 @@ fn the_services_a_report_covers_are_a_sorted_catalog_of_distinct_namespaces() {
     }
     // And a prefix the catalog does not carry names no service a report covers.
     assert!(
-        state::reported_service("deepracer").is_none(),
+        state::reported_service("nosuchservicehere").is_none(),
         "a namespace outside the catalog names no service a report covers"
     );
     // The catalog is the published breadth of AWS service prefixes rather than a
-    // shortlist, so a report of it runs past one page of the default `MaxItems` — which
-    // is what makes the pagination of the read observable at all.
+    // shortlist: a report of it covers hundreds of services, which is what a
+    // least-privilege review of a wide grant reads.
     assert!(
         state::REPORTED_SERVICES.len() > 100,
         "the services a report covers must be the published catalog, not a shortlist, got \
@@ -982,7 +982,7 @@ async fn a_service_namespace_covering_no_service_is_refused_as_an_invalid_input(
     let longest = "n".repeat(64);
     for (what, namespace) in [
         ("a value naming no service at all", "not-a-real-aws-service-namespace"),
-        ("a published prefix the report covers nothing for", "deepracer"),
+        ("a published prefix the report covers nothing for", "mechanicalturk"),
         ("a prefix that merely extends a covered one", "iotjobsdata"),
         ("the shortest namespace the shape admits", "x"),
         ("the longest namespace the shape admits", longest.as_str()),

@@ -342,19 +342,6 @@ pub const SERVICE_LINKED_ROLE_PATH_PREFIX: &str = "/aws-service-role/";
 /// customer-managed policies an account creates.
 pub const AWS_MANAGED_POLICY_ACCOUNT: &str = "aws";
 
-/// The instant every entry of the AWS-managed policy catalog
-/// ([`AWS_MANAGED_POLICIES`]) reports as its `CreateDate` and `UpdateDate`:
-/// 2015-02-06T18:39:46Z in seconds since the epoch, the creation time the AWS
-/// Managed Policy Reference publishes for the policies AWS created when managed
-/// policies launched (`AdministratorAccess` among them).
-///
-/// AWS publishes a creation instant per managed policy; this emulator carries ONE
-/// for the catalog as a whole, so a catalog entry's dates are of the modelled type
-/// (`dateType`) and stable across reads — the same value for every reader and every
-/// run — but they are the catalog's instant rather than that one policy's. Nothing
-/// derives them from a request, and no read moves them.
-const AWS_MANAGED_POLICY_CREATE_DATE_SECS: i64 = 1_423_247_986;
-
 /// How many managed policies one IAM role may carry. AWS's "IAM and STS quotas"
 /// page gives the quota "Managed policies attached to an IAM role: 10", and an
 /// attach past it is refused with `LimitExceededException`, whose documentation
@@ -3269,18 +3256,19 @@ pub fn policy_not_attachable(arn: &str) -> String {
 }
 
 /// The message IAM refuses an attach or a permissions-boundary put with when the policy
-/// the `PolicyArn` resolves to EXISTS but reports `IsAttachable` false — the
+/// the `PolicyArn` resolves to EXISTS but AWS reserves it — the
 /// `PolicyNotAttachableException` message, whose fixed text is `Cannot attach AWS reserved
 /// policy to an IAM ` and `.` around the KIND of identity the policy would have been
 /// attached to (`role`, `user`, `group`).
 ///
-/// A policy a reader reports as not attachable is one AWS RESERVES: it is published in
-/// AWS's own namespace under the path reserved for service-linked roles, so it belongs to
-/// that role alone ([`AwsManagedPolicy::is_attachable`]) and no identity of this account
-/// may take it, as a permissions policy or as a permissions boundary. What the refusal
-/// states is that reservation — not a property of the ARN the request supplied — so the
-/// sentence carries nothing of the policy, and the only value in it is the kind of
-/// identity the call addressed.
+/// A reserved policy is one published in AWS's own namespace under the path reserved for
+/// service-linked roles, so it belongs to that role alone
+/// ([`AwsManagedPolicy::is_reserved_for_service_linked_role`]) and no identity of this
+/// account may take it, as a permissions policy or as a permissions boundary — whatever
+/// `Policy$IsAttachable` reports for it, which is the flag AWS publishes for the policy.
+/// What the refusal states is that reservation — not a property of the ARN the request
+/// supplied — so the sentence carries nothing of the policy, and the only value in it is
+/// the kind of identity the call addressed.
 ///
 /// Distinct from [`policy_not_attachable`], which is the `NoSuchEntityException` text for
 /// an ARN that resolves to NOTHING: here the policy is one the account can read, and what

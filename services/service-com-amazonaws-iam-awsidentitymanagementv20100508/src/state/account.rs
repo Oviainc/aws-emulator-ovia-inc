@@ -1398,10 +1398,20 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     ///
     /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id)
     /// is: the counter is bijectively mixed into the suffix, and the id is minted
-    /// once and then stored with the policy.
+    /// once and then stored with the policy. An id already carried by an entry of AWS's
+    /// catalog ([`AWS_MANAGED_POLICIES`], whose ids are published data this account did
+    /// not mint) is passed over, because a `PolicyId` identifies ONE policy.
     pub fn next_policy_id(&mut self) -> String {
-        self.policy_id_seq += 1;
-        unique_id(POLICY_ID_PREFIX, self.policy_id_seq)
+        loop {
+            self.policy_id_seq += 1;
+            let minted = unique_id(POLICY_ID_PREFIX, self.policy_id_seq);
+            if !AWS_MANAGED_POLICIES
+                .iter()
+                .any(|entry| entry.policy_id == minted)
+            {
+                return minted;
+            }
+        }
     }
 
     /// Mint the next instance profile's `InstanceProfileId`.
@@ -1528,20 +1538,20 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         })
     }
 
-    /// Whether the managed policy `arn` names may be attached to an identity, or used
-    /// to set one's permissions boundary — the `IsAttachable` flag every reader of that
-    /// policy reports ("specifies whether the policy can be attached to an IAM user,
-    /// group, or role", `Policy$IsAttachable`).
+    /// Whether the managed policy `arn` names may be attached to an identity of this
+    /// account, or used to set one's permissions boundary — the decision behind
+    /// `PolicyNotAttachableException`, "Amazon Web Services service role policies can
+    /// only be attached to the service-linked role for that service".
     ///
     /// ONE decision, consulted by the attach calls and by the permissions-boundary
-    /// puts, so the flag a client pre-screens an ARN with is exactly what those
-    /// operations enforce: a policy a reader reports as not attachable is refused, and
-    /// one it reports as attachable is accepted. The resolved record answers for every
-    /// policy this emulator can report — the account's own, and the entries of AWS's
-    /// catalog. An ARN in AWS's namespace the catalog does not carry resolves to no
-    /// record, so AWS's published rule answers for it instead: a policy filed under the
-    /// path reserved for service-linked roles belongs to that role alone
-    /// ([`AwsManagedPolicy::is_attachable`]).
+    /// puts, so a policy one of them accepts is accepted by all of them. For a policy
+    /// THIS account created it is the policy's own `IsAttachable`. For a policy AWS
+    /// owns it is AWS's reservation: a policy filed under the path reserved for
+    /// service-linked roles belongs to that role alone
+    /// ([`AwsManagedPolicy::is_reserved_for_service_linked_role`]), whether or not the
+    /// catalog carries that entry. The reservation is NOT what a reader reports:
+    /// `Policy$IsAttachable` is the flag AWS publishes for the policy, and AWS
+    /// publishes every policy of its catalog as attachable.
     ///
     /// A value that is not a managed-policy ARN at all is not this question's business
     /// and is taken as attachable: an operation taking a `PolicyArn` refuses such a
@@ -1549,9 +1559,6 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn policy_is_attachable(&self, arn: &str) -> bool {
         if let Some(held) = self.policy_by_arn(arn) {
             return held.policy.is_attachable;
-        }
-        if let Some(entry) = aws_managed_policy(arn) {
-            return entry.is_attachable();
         }
         parse_policy_arn(arn).is_none_or(|parsed| !is_service_linked_role_path(&parsed.path))
     }

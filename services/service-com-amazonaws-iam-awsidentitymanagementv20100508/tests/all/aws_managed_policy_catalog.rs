@@ -205,16 +205,16 @@ async fn every_catalog_policy_is_readable_and_serves_its_default_version() {
             entry.path,
             "case {case:?}: the reported Path must be the catalog's: {body}"
         );
-        // SOURCE: the path AWS reserves for service-linked roles, written out here so the
-        // expectation comes from the published rule rather than from the function the
-        // service derives the flag with.
-        let attachable = !entry.path.starts_with("/aws-service-role/");
+        // SOURCE: `Policy$IsAttachable` is the flag AWS publishes for the policy, carried
+        // per catalog entry, so the expectation is the entry's own datum rather than a
+        // value derived from its path. AWS's reservation of the service-linked-role
+        // family is a separate rule, enforced by the attach calls
+        // (`tests/all/aws_managed_policy_attachability.rs`).
         assert_eq!(
             element(&body, "IsAttachable"),
-            attachable.to_string(),
-            "case {case:?}: a policy AWS files under the path reserved for service-linked \
-             roles belongs to that role alone and is not attachable; every other one is: \
-             {body}"
+            entry.is_attachable.to_string(),
+            "case {case:?}: a read must report the attachability AWS publishes for this \
+             policy: {body}"
         );
         assert_eq!(
             element(&body, "AttachmentCount"),
@@ -236,6 +236,10 @@ async fn every_catalog_policy_is_readable_and_serves_its_default_version() {
             !element(&body, "CreateDate").is_empty(),
             "case {case:?}: GetPolicy must report a CreateDate: {body}"
         );
+        assert!(
+            !element(&body, "UpdateDate").is_empty(),
+            "case {case:?}: GetPolicy must report an UpdateDate: {body}"
+        );
         assert_eq!(
             optional(&body, "Description"),
             None,
@@ -247,6 +251,11 @@ async fn every_catalog_policy_is_readable_and_serves_its_default_version() {
             is_policy_version_id(&default_version),
             "case {case:?}: DefaultVersionId must be a policy version id, got \
              {default_version:?}"
+        );
+        assert_eq!(
+            default_version, entry.default_version_id,
+            "case {case:?}: the reported DefaultVersionId must be the version this policy \
+             is published at: {body}"
         );
 
         let (status, body) = get_policy_version(&router, &arn, &default_version).await;
@@ -278,15 +287,15 @@ async fn every_catalog_policy_is_readable_and_serves_its_default_version() {
     }
 }
 
-/// Every catalog entry is a well-formed managed policy, distinct from the others, and the
-/// catalog offers both kinds of entry: the policies published to be attached and the ones
-/// AWS files under the path it reserves for service-linked roles, which report
-/// `IsAttachable` false. The table is the catalog itself, so an entry added later is
-/// checked too.
+/// Every catalog entry is a well-formed managed policy, distinct from the others, and
+/// carries its OWN publication data: the id AWS spells a policy's unique id with, the
+/// version it is published at, and the two instants of its history. The table is the
+/// catalog itself, so an entry added later is checked too.
 ///
 /// The constraints are the modelled ones (`policyPathType`, `policyNameType`,
-/// `arnType`, `idType`, from `smithy_query(query="shape", shape="Policy")`) plus the
-/// managed-policy size quota this crate records.
+/// `arnType`, `idType`, `policyVersionIdType`, from
+/// `smithy_query(query="shape", shape="Policy")`) plus the managed-policy size quota this
+/// crate records.
 #[test]
 fn catalog_entries_are_well_formed_and_distinct() {
     let mut arns: Vec<String> = Vec::new();
@@ -351,15 +360,30 @@ fn catalog_entries_are_well_formed_and_distinct() {
             "case {case:?}: the catalog must resolve its own entry by ARN"
         );
         assert_well_formed_policy_id(&case, entry.policy_id);
-        // The two id spaces cannot collide: a catalog id carries `_`, which is not in
-        // the base32 alphabet an id MINTED for an account-created policy is drawn from
-        // (`state`'s `unique_id`), so no catalog id can ever be handed out by
-        // `next_policy_id`.
-        assert!(
-            entry.policy_id.contains('_'),
-            "case {case:?}: a catalog PolicyId must carry the `_` that keeps it out of \
-             the minted id space, got {:?}",
+        // AWS spells a policy's unique id as `ANPA` followed by 17 further characters,
+        // which is the form every catalog entry carries. The two id spaces cannot
+        // collide: the minter passes over an id a catalog entry already carries
+        // (`state`'s `next_policy_id`).
+        assert_eq!(
+            entry.policy_id.len(),
+            21,
+            "case {case:?}: an AWS policy id is ANPA plus 17 characters, got {:?}",
             entry.policy_id
+        );
+        assert!(
+            entry
+                .policy_id
+                .strip_prefix("ANPA")
+                .is_some_and(|suffix| suffix
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())),
+            "case {case:?}: an AWS policy id is ANPA plus uppercase alphanumerics, got {:?}",
+            entry.policy_id
+        );
+        assert!(
+            is_policy_version_id(entry.default_version_id),
+            "case {case:?}: policyVersionIdType matches ^v[1-9][0-9]*, got {:?}",
+            entry.default_version_id
         );
 
         if let Some(previous) = arns.last() {
@@ -378,19 +402,33 @@ fn catalog_entries_are_well_formed_and_distinct() {
         arns.push(arn);
     }
 
-    // Both kinds of entry are present, so a client enumerating the catalog can find a
-    // policy it may attach and one it may not.
+    // The catalog's publication data is PER ENTRY, not one template's values: a client
+    // sorting the catalog by its dates, or pinning a default version before reading it,
+    // sees policies that differ.
+    let versions: ::std::collections::BTreeSet<&str> = state::AWS_MANAGED_POLICIES
+        .iter()
+        .map(|entry| entry.default_version_id)
+        .collect();
     assert!(
-        state::AWS_MANAGED_POLICIES
-            .iter()
-            .any(|entry| entry.is_attachable()),
-        "the catalog must carry policies an identity can attach"
+        versions.len() > 1,
+        "the catalog must carry each policy's own default version, got {versions:?}"
+    );
+    let published: ::std::collections::BTreeSet<&str> = state::AWS_MANAGED_POLICIES
+        .iter()
+        .map(|entry| entry.published)
+        .collect();
+    assert!(
+        published.len() > 1,
+        "the catalog must carry each policy's own publication instant, got {} distinct \
+         instants",
+        published.len()
     );
     assert!(
         state::AWS_MANAGED_POLICIES
             .iter()
-            .any(|entry| !entry.is_attachable()),
-        "the catalog must carry at least one policy that is NOT attachable"
+            .any(|entry| entry.revised != entry.published),
+        "a revised policy's UpdateDate is the instant of its revision, so the catalog must \
+         carry an entry whose two instants differ"
     );
 }
 

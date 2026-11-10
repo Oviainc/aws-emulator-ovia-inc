@@ -44,19 +44,23 @@ const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Al
 /// `(path, policy_name, is_attachable)`.
 ///
 /// SOURCE: that reference, read per entry — the path it files the policy under, the friendly
-/// name it publishes, and whether the policy may be attached to an identity (the policies
-/// under the path AWS reserves for service-linked roles belong to one role and may not).
-/// The rows span the four paths the catalog carries and deliberately name entries no other
-/// fixture in this crate cites.
+/// name it publishes, and the attachability it publishes for the policy (AWS publishes every
+/// policy of this catalog as one that can be attached; the service-linked-role family is
+/// RESERVED at attach time instead, which `tests/all/aws_managed_policy_attachability.rs`
+/// asserts). The rows span the five paths the catalog carries and deliberately name entries
+/// no other fixture in this crate cites.
 const PUBLISHED: &[(&str, &str, bool)] = &[
     ("/", "AdministratorAccess", true),
     ("/", "CloudWatchLogsFullAccess", true),
-    ("/aws-service-role/", "AWSTrustedAdvisorServiceRolePolicy", false),
-    ("/aws-service-role/", "AmazonGuardDutyServiceRolePolicy", false),
-    ("/aws-service-role/", "AmazonRedshiftServiceLinkedRolePolicy", false),
+    ("/aws-service-role/", "AWSTrustedAdvisorServiceRolePolicy", true),
+    ("/aws-service-role/", "AmazonGuardDutyServiceRolePolicy", true),
+    ("/aws-service-role/", "AmazonRedshiftServiceLinkedRolePolicy", true),
     ("/job-function/", "Billing", true),
     ("/job-function/", "NetworkAdministrator", true),
     ("/job-function/", "ViewOnlyAccess", true),
+    ("/root-task/", "IAMAuditRootUserCredentials", true),
+    ("/root-task/", "S3UnlockBucketPolicy", true),
+    ("/root-task/", "SQSUnlockQueuePolicy", true),
     ("/service-role/", "AWSLambdaBasicExecutionRole", true),
 ];
 
@@ -191,11 +195,12 @@ async fn the_catalog_enumerates_every_published_policy_family() {
     }
 }
 
-/// RULE: every policy the catalog reports under the path AWS reserves for service-linked
-/// roles is reported as not attachable, and every policy it reports under any other path as
-/// attachable — the flag is a property of the family, not of the entry.
+/// RULE: every policy the catalog reports carries the publication data of that policy — the
+/// attachability AWS publishes for it, its own id, its own default version and its own two
+/// instants — rather than one value stamped on the whole catalog, so two entries of one
+/// family differ in them.
 #[tokio::test]
-async fn attachability_follows_the_family_the_policy_is_published_under() {
+async fn each_published_policy_carries_its_own_publication_data() {
     let router = router();
     // The paths the catalog carries, taken from the catalog itself, so a family added later
     // is covered too.
@@ -206,40 +211,90 @@ async fn attachability_follows_the_family_the_policy_is_published_under() {
     paths.sort_unstable();
     paths.dedup();
     assert!(
-        paths.len() >= 4,
+        paths.len() >= 5,
         "AWS publishes its managed policies under more than one path, got {paths:?}"
     );
 
     for path in paths {
-        let reported = walk_policies(
+        // SOURCE: `state::AWS_MANAGED_POLICIES`, the catalog's own per-entry data, selected
+        // by the prefix and put in the ARN order the listing walks.
+        let mut selected: Vec<(String, &'static state::AwsManagedPolicy)> =
+            state::AWS_MANAGED_POLICIES
+                .iter()
+                .filter(|entry| entry.path.starts_with(path))
+                .map(|entry| (entry.arn(), entry))
+                .collect();
+        selected.sort_by(|(left, _), (right, _)| left.cmp(right));
+        assert!(
+            !selected.is_empty(),
+            "case {path:?}: the catalog must carry at least one policy under this path"
+        );
+
+        for member in ["IsAttachable", "PolicyId", "DefaultVersionId"] {
+            let reported = walk_policies(
+                &router,
+                path,
+                &[("Scope", "AWS"), ("PathPrefix", path), ("MaxItems", "5")],
+                member,
+            )
+            .await;
+            let expected: Vec<String> = selected
+                .iter()
+                .map(|(_, entry)| match member {
+                    "IsAttachable" => entry.is_attachable.to_string(),
+                    "PolicyId" => entry.policy_id.to_string(),
+                    _ => entry.default_version_id.to_string(),
+                })
+                .collect();
+            assert_eq!(
+                reported, expected,
+                "case {path:?}: expected each policy's own <{member}>, got {reported:?}"
+            );
+        }
+
+        // A family is not one instant repeated: the dates a client sorts the catalog by
+        // are the policy's own, and a revised policy's UpdateDate is past its CreateDate.
+        let created = walk_policies(
             &router,
             path,
             &[("Scope", "AWS"), ("PathPrefix", path), ("MaxItems", "5")],
-            "IsAttachable",
+            "CreateDate",
         )
         .await;
-        assert!(
-            !reported.is_empty(),
-            "case {path:?}: the catalog must report at least one policy under this path"
-        );
-        // SOURCE: the path AWS reserves for service-linked roles, written out rather than
-        // read off the service, so the expectation is the published rule's — applied to the
-        // entries the prefix selects, in the ARN order the listing walks.
-        let mut selected: Vec<(String, bool)> = state::AWS_MANAGED_POLICIES
-            .iter()
-            .filter(|entry| entry.path.starts_with(path))
-            .map(|entry| (entry.arn(), !entry.path.starts_with("/aws-service-role/")))
-            .collect();
-        selected.sort();
-        let expected: Vec<String> = selected
-            .into_iter()
-            .map(|(_, attachable)| attachable.to_string())
-            .collect();
+        let updated = walk_policies(
+            &router,
+            path,
+            &[("Scope", "AWS"), ("PathPrefix", path), ("MaxItems", "5")],
+            "UpdateDate",
+        )
+        .await;
         assert_eq!(
-            reported, expected,
-            "case {path:?}: expected a policy under the service-linked-role path to report \
-             IsAttachable false and every other one true, got {reported:?}"
+            created.len(),
+            selected.len(),
+            "case {path:?}: every reported policy carries one CreateDate, got {created:?}"
         );
+        assert_eq!(
+            updated.len(),
+            selected.len(),
+            "case {path:?}: every reported policy carries one UpdateDate, got {updated:?}"
+        );
+        for (index, (arn, _)) in selected.iter().enumerate() {
+            assert!(
+                created[index] <= updated[index],
+                "case {arn:?}: a policy is revised no earlier than it is published, got \
+                 CreateDate {:?} and UpdateDate {:?}",
+                created[index],
+                updated[index]
+            );
+        }
+        if selected.len() > 1 {
+            let distinct: ::std::collections::BTreeSet<&String> = created.iter().collect();
+            assert!(
+                distinct.len() > 1,
+                "case {path:?}: two policies of a family are published at their own \
+                 instants, got {created:?}"
+            );
+        }
     }
 }
 
@@ -311,8 +366,9 @@ async fn report_page(
 /// RULE: a completed report enumerates, out of the published catalog of service namespaces,
 /// every service the resource's permissions policies allow an action of — ascending by
 /// namespace, each entry carrying the service's published name and the number of principals
-/// recorded as having attempted to reach it — and pages over that one enumeration with
-/// `MaxItems`, reporting `IsTruncated` with a resumable `Marker` exactly when more remain.
+/// recorded as having attempted to reach it — served WHOLE to a read that asks for no page
+/// size, and paged over that one enumeration when `MaxItems` names one, reporting
+/// `IsTruncated` with a resumable `Marker` exactly when more remain.
 #[tokio::test]
 async fn a_report_enumerates_the_published_service_catalog_and_pages_over_it() {
     let router = router();
@@ -408,8 +464,8 @@ async fn a_report_enumerates_the_published_service_catalog_and_pages_over_it() {
 
     tokio::time::sleep(generation_span()).await;
 
-    // The published catalog is wide enough that a report of it does not fit the page size an
-    // omitted `MaxItems` asks for, which is what makes the paging observable.
+    // The published catalog is wide enough that a report of it runs well past any page size
+    // a caller is likely to ask for, which is what makes the paging observable.
     assert!(
         state::REPORTED_SERVICES.len() > state::DEFAULT_MAX_ITEMS as usize,
         "the services a report covers must be the published catalog, not a shortlist, got {}",
@@ -417,11 +473,11 @@ async fn a_report_enumerates_the_published_service_catalog_and_pages_over_it() {
     );
 
     for (case, job_id, expected) in &jobs {
-        // Page sizes below, around and above the length of the enumeration, plus the size an
-        // omitted `MaxItems` asks for.
+        // Page sizes below, around and above the length of the enumeration, plus the read
+        // that asks for no size at all — which is served the report whole.
         for max_items in [Some(3_usize), Some(128), Some(1_000), None] {
             let case = format!("{case} at {max_items:?} per page");
-            let size = max_items.unwrap_or(state::DEFAULT_MAX_ITEMS as usize);
+            let size = max_items.unwrap_or(usize::MAX);
             let mut walked: Vec<String> = Vec::new();
             let mut marker: Option<String> = None;
             for page in 0..1_000 {

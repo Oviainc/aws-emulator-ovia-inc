@@ -297,14 +297,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Amazon Web Services service role policies can only be attached to the
         // service-linked role for that service" (`PolicyNotAttachableException`): a
-        // policy that is published but NOT attachable is refused, and the flag a
-        // reader of that policy reports (`Policy$IsAttachable`) is the one decision
-        // behind it (`crate::state::policy_is_attachable`), so a client that
-        // pre-screens a boundary ARN on that flag and IAM agree. Such a policy is one
-        // AWS RESERVES, which is what the refusal states, in the one sentence this
-        // service words that reservation with
-        // (`crate::state::aws_reserved_policy_refusal`), naming the kind of identity this
-        // call addressed. The boundary is left exactly as it was.
+        // policy AWS RESERVES for the service-linked role it was written for is
+        // refused, through the one decision every attach and permissions-boundary put
+        // consults (`crate::state::policy_is_attachable`): the policy's own
+        // `Policy$IsAttachable` for one this account created, and AWS's reservation for
+        // one AWS owns — which AWS publishes as attachable all the same, so the
+        // reservation is what the refusal states, in the one sentence this service
+        // words it with (`crate::state::aws_reserved_policy_refusal`), naming the kind
+        // of identity this call addressed. The boundary is left exactly as it was.
         if !store.policy_is_attachable(&input.permissions_boundary) {
             return Err(
                 PutRolePermissionsBoundaryErrorModeled::PolicyNotAttachableException(

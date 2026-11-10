@@ -3,8 +3,8 @@
 //! @op GetServiceLastAccessedDetails
 //! Serves the service-last-accessed report the request's `JobId` names: the status of its
 //! generation, and — once that generation is due — one entry per service the report's
-//! resource can reach through its permissions policies, sorted by service namespace and
-//! paged like every other IAM listing.
+//! resource can reach through its permissions policies, sorted by service namespace,
+//! whole unless the caller asks for a page size.
 //!
 //! ## Shape of an operation
 //!
@@ -251,14 +251,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             None => None,
         };
-        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
-        // anything outside it, so the only choice left here is the default for an absent
-        // `MaxItems` ("if you do not include this parameter, the number of items defaults
-        // to 100"). `.max(1)` is what makes the cast lossless.
-        let page_size = input
-            .max_items
-            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
-            .max(1) as usize;
+        // "Use this only when paginating results to indicate the maximum number of items
+        // you want in the response": the cap is one the CALLER asks for. A read that asks
+        // for no size is served the report WHOLE — recorded AWS answers it with every
+        // service the report covers in one response, which is what a least-privilege pass
+        // reads the report for — so the enumeration below is capped only when `MaxItems`
+        // names a size. `maxItemsType` is range 1..1000 and the boundary validator has
+        // already refused anything outside it, so a named size is in range; `.max(1)` is
+        // what makes the cast lossless.
+        let page_size = input.max_items.map(|size| size.max(1) as usize);
 
         // The status follows the CLOCK the generate set running, read through the one
         // definition of that rule (`crate::state::report_job_status`).
@@ -314,7 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         })
                     })
             }) {
-                if page.len() == page_size {
+                if page_size.is_some_and(|size| page.len() == size) {
                     is_truncated = true;
                     break;
                 }

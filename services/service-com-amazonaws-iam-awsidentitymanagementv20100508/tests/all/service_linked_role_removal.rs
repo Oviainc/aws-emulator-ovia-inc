@@ -525,9 +525,11 @@ async fn a_service_linked_role_carries_the_policy_its_service_controls_it_throug
             elements(&listed, "PolicyArn")
         );
 
-        // The attachment names a policy a reader of it can report, and one no identity
-        // may attach for itself: a service-role policy "can only be attached to the
-        // service-linked role for that service".
+        // The attachment names a policy a reader of it can report, and one AWS publishes
+        // as attachable while reserving it for this role: a service-role policy "can only
+        // be attached to the service-linked role for that service", which is the refusal
+        // `tests/all/aws_managed_policy_attachability.rs` asserts of every identity's
+        // attempt to take one.
         for policy_arn in &expected_arns {
             let (status, read) = call(&router, "GetPolicy", &[("PolicyArn", policy_arn)]).await;
             assert_eq!(
@@ -536,8 +538,9 @@ async fn a_service_linked_role_carries_the_policy_its_service_controls_it_throug
             );
             assert_eq!(
                 element(&read, "IsAttachable"),
-                "false",
-                "case {case:?}: expected a service-role policy to be unattachable, got {:?}",
+                "true",
+                "case {case:?}: expected the attachability AWS publishes for a service-role \
+                 policy, got {:?}",
                 element(&read, "IsAttachable")
             );
             assert_eq!(

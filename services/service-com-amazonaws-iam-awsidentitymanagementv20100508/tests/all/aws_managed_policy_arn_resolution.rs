@@ -197,14 +197,15 @@ async fn attaching_a_carried_policy_under_another_path_is_refused() {
 
 /// RULE (the other half): the ARN AWS publishes the policy at DOES resolve, so the same
 /// name at its own path attaches and is reported back — once, under the ARN it was
-/// attached with. Asserted over every attachable catalog entry, so the refusal above is
-/// the path's doing and not a blanket refusal of the namespace.
+/// attached with. Asserted over every catalog entry AWS does not reserve for a
+/// service-linked role, so the refusal above is the path's doing and not a blanket refusal
+/// of the namespace.
 #[tokio::test]
 async fn attaching_a_carried_policy_at_its_published_path_is_served() {
     let router = router();
 
     for (index, entry) in state::AWS_MANAGED_POLICIES.iter().enumerate() {
-        if !entry.is_attachable() {
+        if entry.is_reserved_for_service_linked_role() {
             continue;
         }
         // A role of its own per row, so one row's attachment is never read as another's.

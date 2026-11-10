@@ -43,6 +43,8 @@ mod aws_managed_policy_arn_resolution;
 mod aws_managed_policy_attachability;
 #[path = "all/aws_managed_policy_catalog.rs"]
 mod aws_managed_policy_catalog;
+#[path = "all/aws_reference_catalog_metadata.rs"]
+mod aws_reference_catalog_metadata;
 #[path = "all/boundary_and_provider_writes.rs"]
 mod boundary_and_provider_writes;
 #[path = "all/boundary_refusal_message_wording.rs"]
