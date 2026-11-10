@@ -65,6 +65,11 @@ const RETENTION_INTERVAL_UNITS: [&str; 4] = ["DAYS", "WEEKS", "MONTHS", "YEARS"]
 /// (`smithy_query(query="shape", shape="IntervalUnitValues")`).
 const CREATE_INTERVAL_UNIT: &str = "HOURS";
 
+/// A creation rule that creates one snapshot a month, the frequency a schedule
+/// carrying an `ArchiveRule` must run at least as rarely as (see
+/// [`create_rule_for`]).
+const MONTHLY_CRON_EXPRESSION: &str = "cron(0 0 1 * ? *)";
+
 /// The documented floor, and the value one below it — the only value of either
 /// member that falls short of a floor stated in days, since every retention unit
 /// is at least a day long.
@@ -255,12 +260,30 @@ fn snapshot_details(schedules: Vec<Value>) -> Value {
     })
 }
 
+/// The creation rule a schedule carrying `members` states.
+///
+/// The second bullet of `CreateRule`'s note — "If you need to specify an
+/// ArchiveRule for the schedule, then you must specify a creation frequency of
+/// at least 28 days" (`smithy_query(query="doc", shape="CreateRule")`) — cannot
+/// be met by the interval form, whose only unit is `HOURS` and whose largest
+/// supported interval is 24, so a schedule carrying an `ArchiveRule` states its
+/// creation rule as a monthly cron expression instead. This file is about the
+/// standard-tier retention floor; that creation floor is
+/// `tests/all/archive_creation_frequency.rs`'s.
+fn create_rule_for(members: &Value) -> Value {
+    if members.get("ArchiveRule").is_some() {
+        json!({"CronExpression": MONTHLY_CRON_EXPRESSION})
+    } else {
+        json!({"Interval": 24, "IntervalUnit": CREATE_INTERVAL_UNIT})
+    }
+}
+
 /// A schedule carrying `retain_rule` and the members of `rule` that specify a
 /// rule acting on the snapshots it retains.
 fn schedule_with(name: &str, rule: &Value, retain_rule: &Value) -> Value {
     let mut schedule = json!({
         "Name": name,
-        "CreateRule": {"Interval": 24, "IntervalUnit": CREATE_INTERVAL_UNIT},
+        "CreateRule": create_rule_for(rule),
         "RetainRule": retain_rule.clone(),
     });
     for (member, value) in rule.as_object().expect("a rule is a JSON object") {

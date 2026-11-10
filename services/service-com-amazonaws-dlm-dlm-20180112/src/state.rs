@@ -21,6 +21,15 @@ use crate::ops::types::{
     RetentionArchiveTier, Schedule, Tag,
 };
 
+/// The documented floor on the creation frequency of a schedule that archives
+/// the snapshots it creates — the second bullet of `CreateRule`'s note — which
+/// [`schedule_rule_violation`] judges beside the form rules.
+mod archive_creation_frequency;
+
+pub use archive_creation_frequency::{
+    archive_creation_frequency_violation, ARCHIVE_CREATION_FREQUENCY_MIN_DAYS,
+};
+
 /// The region a request belongs to — the policies it reaches, and the region a
 /// policy ARN it mints names — when it carries no SigV4 credential scope to read
 /// one from.
@@ -2019,7 +2028,7 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 
 /// Why Amazon Data Lifecycle Manager refuses one of the schedules `details`
 /// carries, or `None` when every one of them states each of its nested rules in
-/// a form the documentation admits.
+/// a form the documentation admits, at a magnitude the rules beside it admit.
 ///
 /// The documented cross-member rules a schedule's nested rules obey, none of
 /// them expressible in the model, judged on EVERY element of `Schedules`
@@ -2059,6 +2068,12 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 ///   `ArchiveRule` (`ArchiveRule$RetainRule` and
 ///   `ArchiveRetainRule$RetentionArchiveTier` are both `@required`, so a
 ///   schedule carrying an `ArchiveRule` carries the tier).
+/// * `CreateRule` again, for the SECOND bullet of its note — "If you need to
+///   specify an ArchiveRule for the schedule, then you must specify a creation
+///   frequency of at least 28 days." A schedule carrying an `ArchiveRule` states
+///   a creation frequency of at least that, whichever of the two forms states it
+///   — see [`archive_creation_frequency_violation`]. It is judged after the
+///   forms, since the frequency is read from the form the rule stated.
 ///
 /// Every one of them is the one rule — state exactly one of the two documented
 /// forms, and state it completely. The three whose two forms are a COUNT and a
@@ -2081,6 +2096,7 @@ pub fn schedule_rule_violation(details: Option<&PolicyDetails>) -> Option<Invali
                 .or_else(|| fast_restore_rule_violation(&label, &path, schedule))
                 .or_else(|| deprecate_rule_violation(&label, &path, schedule))
                 .or_else(|| archive_tier_violation(&label, &path, schedule))
+                .or_else(|| archive_creation_frequency_violation(&label, schedule))
         })
 }
 

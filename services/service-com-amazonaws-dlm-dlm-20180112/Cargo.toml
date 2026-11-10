@@ -21,6 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The `cron(...)` form of a schedule's creation rule is read by this maintained
+# parser rather than a hand-written grammar, so the creation frequency the
+# expression states can be judged against the floor a schedule that archives its
+# snapshots runs at, and `chrono` (which the parser is written in) is what the
+# instants it yields are computed in
+# (`state::archive_creation_frequency`).
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

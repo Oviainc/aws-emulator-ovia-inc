@@ -335,11 +335,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documentation gives two alternative forms — the `CreateRule`, the
         // `RetainRule`, the `FastRestoreRule`, the `DeprecateRule` and the
         // `ArchiveRule`'s archive-tier retention — states exactly one of them
-        // and states it completely, and a schedule that specifies a rule acting
+        // and states it completely, a schedule that specifies a rule acting
         // on the snapshots it retains (a `FastRestoreRule`, a `ShareRule`, a
-        // `CrossRegionCopyRule`) retains at least one of them. Refused before
-        // anything is stored, so a request AWS would never have accepted leaves
-        // no policy behind.
+        // `CrossRegionCopyRule`) retains at least one of them, and a schedule
+        // that archives the snapshots it creates creates them at least as
+        // rarely as the `ArchiveRule` requires. Refused before anything is
+        // stored, so a request AWS would never have accepted leaves no policy
+        // behind.
         if let Some(refusal) =
             crate::state::schedule_rule_violation(input.policy_details.as_ref())
         {

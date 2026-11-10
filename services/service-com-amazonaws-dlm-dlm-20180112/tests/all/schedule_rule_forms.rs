@@ -72,6 +72,11 @@ const RETENTION_INTERVAL_UNITS: [&str; 4] = ["DAYS", "WEEKS", "MONTHS", "YEARS"]
 /// (`smithy_query(query="shape", shape="IntervalUnitValues")`).
 const CREATE_INTERVAL_UNIT: &str = "HOURS";
 
+/// A creation rule that creates one snapshot a month, the frequency a schedule
+/// carrying an `ArchiveRule` must run at least as rarely as (see
+/// [`create_rule_for`]).
+const MONTHLY_CRON_EXPRESSION: &str = "cron(0 0 1 * ? *)";
+
 /// The bounds of `Count` (`@range(min: 1, max: 1000)`), which is what
 /// `FastRestoreRule$Count`, `DeprecateRule$Count` and
 /// `RetentionArchiveTier$Count` target
@@ -425,12 +430,30 @@ fn assert_owed(case: &str, answer: &Answer, owed: &Owed, shape: &str, position: 
     }
 }
 
+/// The creation rule a schedule carrying `members` states.
+///
+/// The second bullet of `CreateRule`'s note — "If you need to specify an
+/// ArchiveRule for the schedule, then you must specify a creation frequency of
+/// at least 28 days" (`smithy_query(query="doc", shape="CreateRule")`) — cannot
+/// be met by the interval form, whose only unit is `HOURS` and whose largest
+/// supported interval is 24, so a schedule carrying an `ArchiveRule` states its
+/// creation rule as a monthly cron expression instead. This file is about the
+/// FORM each nested rule is stated in; that creation floor is
+/// `tests/all/archive_creation_frequency.rs`'s.
+fn create_rule_for(members: &Value) -> Value {
+    if members.get("ArchiveRule").is_some() {
+        json!({"CronExpression": MONTHLY_CRON_EXPRESSION})
+    } else {
+        json!({"Interval": 24, "IntervalUnit": CREATE_INTERVAL_UNIT})
+    }
+}
+
 /// The schedule a row drives: the creation rule every accepted schedule states,
 /// the retention its mode states, and the members carrying the rule under test.
 fn schedule_for(row: &FormCase) -> Value {
     let mut schedule = json!({
         "Name": SUBJECT_SCHEDULE,
-        "CreateRule": {"Interval": 24, "IntervalUnit": CREATE_INTERVAL_UNIT},
+        "CreateRule": create_rule_for(&row.members),
     });
     if let Some(retain_rule) = row.mode.retain_rule() {
         schedule["RetainRule"] = retain_rule;

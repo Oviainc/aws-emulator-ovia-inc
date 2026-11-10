@@ -58,6 +58,11 @@ const INVALID_PARAMETER_CODE: &str = "InvalidParameter";
 /// (`smithy_query(query="shape", shape="IntervalUnitValues")`).
 const CREATE_INTERVAL_UNIT: &str = "HOURS";
 
+/// A creation rule that creates one snapshot a month, the frequency a schedule
+/// carrying an `ArchiveRule` must run at least as rarely as (see
+/// [`create_rule_for`]).
+const MONTHLY_CRON_EXPRESSION: &str = "cron(0 0 1 * ? *)";
+
 /// The documented floor on a retention stated beside one of those rules, and the
 /// retention that falls short of it.
 const RETENTION_FLOOR: i64 = 1;
@@ -249,12 +254,30 @@ fn snapshot_details(schedules: Vec<Value>) -> Value {
     })
 }
 
+/// The creation rule a schedule carrying `members` states.
+///
+/// The second bullet of `CreateRule`'s note — "If you need to specify an
+/// ArchiveRule for the schedule, then you must specify a creation frequency of
+/// at least 28 days" (`smithy_query(query="doc", shape="CreateRule")`) — cannot
+/// be met by the interval form, whose only unit is `HOURS` and whose largest
+/// supported interval is 24, so a schedule carrying an `ArchiveRule` states its
+/// creation rule as a monthly cron expression instead. This file is about when a
+/// retention is mandatory; that creation floor is
+/// `tests/all/archive_creation_frequency.rs`'s.
+fn create_rule_for(members: &Value) -> Value {
+    if members.get("ArchiveRule").is_some() {
+        json!({"CronExpression": MONTHLY_CRON_EXPRESSION})
+    } else {
+        json!({"Interval": 24, "IntervalUnit": CREATE_INTERVAL_UNIT})
+    }
+}
+
 /// A schedule named `name` carrying the members of `rule`, plus `retain_rule`
 /// when there is one to state.
 fn schedule_with(name: &str, rule: &Value, retain_rule: Option<&Value>) -> Value {
     let mut schedule = json!({
         "Name": name,
-        "CreateRule": {"Interval": 24, "IntervalUnit": CREATE_INTERVAL_UNIT},
+        "CreateRule": create_rule_for(rule),
     });
     if let Some(retain_rule) = retain_rule {
         schedule["RetainRule"] = retain_rule.clone();
