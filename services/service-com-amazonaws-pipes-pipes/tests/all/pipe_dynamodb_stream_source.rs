@@ -453,17 +453,33 @@ async fn source_parameters_the_source_kind_requires_cannot_be_omitted() {
                 "case {:?}: the accepted pipe must read its Source back, got {described:?}",
                 row.case
             );
-            assert_eq!(
-                described.member("SourceParameters"),
-                if row.parameters.is_null() {
-                    &Value::Null
-                } else {
-                    &row.parameters
-                },
-                "case {:?}: the accepted pipe must read its SourceParameters back, got {:?}",
-                row.case,
-                described.member("SourceParameters")
-            );
+            // What the read reports is the pipe's configuration: the members the request
+            // carried, plus the `BatchSize` the pipe polls its source with where the
+            // request named none. That rule and its table live in
+            // `tests/all/pipe_reported_configuration.rs`; here it is enough that every
+            // member the create stored still reads back.
+            let reported = described.member("SourceParameters").clone();
+            for (member, expected) in row
+                .parameters
+                .as_object()
+                .into_iter()
+                .flat_map(|members| members.iter())
+            {
+                let actual = reported.get(member).unwrap_or(&Value::Null);
+                for (field, value) in expected
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|fields| fields.iter())
+                {
+                    assert_eq!(
+                        actual.get(field),
+                        Some(value),
+                        "case {:?}: the accepted pipe must read {member}.{field} back as \
+                         {value}, got {actual:?}",
+                        row.case
+                    );
+                }
+            }
             continue;
         }
 

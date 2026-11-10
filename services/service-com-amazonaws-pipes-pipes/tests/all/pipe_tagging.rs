@@ -187,12 +187,13 @@ pub(crate) async fn assert_tags_agree(
             "case {case:?}: an untagged pipe must report an empty tags map, got {:?}",
             listed.member("tags")
         );
-        // `DescribePipe` reports the pipe RECORD, whose `Tags` member is absent when the
-        // pipe carries none.
+        // `DescribePipe` reports the pipe RECORD, whose `Tags` member is reported the same
+        // way the tagging layer reports its own: an EMPTY map for a pipe with no tags. See
+        // `tests/all/pipe_reported_configuration.rs`.
         assert_eq!(
             describe(router, name).await.member("Tags"),
-            &Value::Null,
-            "case {case:?}: an untagged pipe's record must carry no Tags member"
+            &json!({}),
+            "case {case:?}: an untagged pipe's record must carry an empty Tags map"
         );
     }
 

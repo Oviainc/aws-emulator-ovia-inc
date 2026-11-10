@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePipe
-//! IMPLEMENTED: reads the persisted pipe record back and reports every stored member.
-//! An unknown name is `NotFoundException` (404). This is the ONLY file to touch for this
-//! operation.
+//! IMPLEMENTED: reads the persisted pipe record back and reports the pipe's configuration —
+//! every stored member, each configuration container present (empty where the pipe carries
+//! nothing under it) and the source's parameters carrying the batch size the pipe polls
+//! with. An unknown name is `NotFoundException` (404). This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -204,13 +206,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             current_state: Some(pipe.current_state.clone()),
             state_reason: pipe.state_reason.clone(),
             source: Some(pipe.source.clone()),
-            source_parameters: pipe.source_parameters.clone(),
+            // The configuration containers a pipe read reports ARE the pipe's
+            // configuration, not a record of which members its create request mentioned,
+            // and the source's carries the batch size the pipe polls with. See
+            // `crate::state::PipeRecord::reported_source_parameters`.
+            source_parameters: Some(pipe.reported_source_parameters()),
             enrichment: pipe.enrichment.clone(),
-            enrichment_parameters: pipe.enrichment_parameters.clone(),
+            enrichment_parameters: Some(pipe.reported_enrichment_parameters()),
             target: Some(pipe.target.clone()),
-            target_parameters: pipe.target_parameters.clone(),
+            target_parameters: Some(pipe.reported_target_parameters()),
             role_arn: Some(pipe.role_arn.clone()),
-            tags: pipe.tag_map(),
+            tags: Some(pipe.tags_reported()),
             creation_time: Some(crate::state::timestamp(pipe.creation_time)),
             last_modified_time: Some(crate::state::timestamp(pipe.last_modified_time)),
             log_configuration: pipe.log_configuration.clone(),

@@ -25,16 +25,18 @@ pub(crate) const REGION: &str = "us-west-2";
 /// Long enough after a lifecycle call that the state move it owes is certainly due.
 pub(crate) const PAST_SETTLE: Duration = STATE_SETTLE_DELAY.saturating_add(Duration::from_millis(400));
 
-/// Every `CreatePipe` input member that is optional and carries NO declared default.
-/// Source: the `CreatePipe` input in `OPERATIONS.md` (`DesiredState` is excluded because
-/// an absent `DesiredState` defaults to `RUNNING`, so it is reported either way).
+/// Every `CreatePipe` input member that is optional, carries NO declared default, and is
+/// reported only when the pipe carries one. Source: the `CreatePipe` input in
+/// `OPERATIONS.md` (`DesiredState` is excluded because an absent `DesiredState` defaults to
+/// `RUNNING`, so it is reported either way).
+///
+/// The CONFIGURATION CONTAINERS — `SourceParameters`, `EnrichmentParameters`,
+/// `TargetParameters` — and `Tags` are excluded too: a read reports those whether the
+/// create request mentioned them or not, which is the rule and the table of
+/// `tests/all/pipe_reported_configuration.rs`.
 const OPTIONAL_CREATE_MEMBERS: &[&str] = &[
     "Description",
-    "SourceParameters",
     "Enrichment",
-    "EnrichmentParameters",
-    "TargetParameters",
-    "Tags",
     "LogConfiguration",
     "KmsKeyIdentifier",
 ];
@@ -732,8 +734,8 @@ async fn delete_pipe_removes_the_pipe_from_every_reader() {
     );
     assert_eq!(
         deleted.string("DesiredState"),
-        "DELETED",
-        "DeletePipe must report DesiredState DELETED, got {deleted:?}"
+        "STOPPED",
+        "DeletePipe must report the run state the pipe is wound down to, got {deleted:?}"
     );
     assert_eq!(
         deleted.string("CurrentState"),

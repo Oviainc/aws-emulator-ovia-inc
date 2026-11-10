@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePipe
-//! IMPLEMENTED: removes the stored pipe and reports its final record — `DesiredState`
-//! `DELETED`, `CurrentState` `DELETING`. An unknown name is `NotFoundException` (404),
-//! so a repeated delete is refused. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the stored pipe and reports its final record — `DesiredState` the
+//! run state the pipe is wound down to (`STOPPED`), `CurrentState` `DELETING`. An unknown
+//! name is `NotFoundException` (404), so a repeated delete is refused. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,7 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DeletePipeErrorModeled::NotFoundException(crate::state::pipe_not_found(&input.name))
         })?;
 
-        pipe.desired_state = crate::state::requested_state::DELETED.to_string();
+        // Recorded behaviour: the delete answers with the RUN state the pipe is being
+        // wound down to — `STOPPED`, a pipe that polls nothing — while `CurrentState`
+        // moves to the tear-down state. `DELETED` is a state a pipe is reported IN, not a
+        // run state a caller asks a pipe to be in.
+        pipe.desired_state = crate::state::requested_state::STOPPED.to_string();
         pipe.current_state = crate::state::pipe_state::DELETING.to_string();
         // The deletion this call applied is the reason the pipe is `DELETING`, the same
         // user-initiated reason every other caller-driven move reports.

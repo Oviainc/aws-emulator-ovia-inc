@@ -292,14 +292,40 @@ async fn source_parameters_of_another_source_type_are_refused_naming_the_member_
             row.case
         );
 
-        // The refusal changed nothing: what the pipe was created with is what it still has.
+        // The refusal changed nothing: what the pipe was created with is what it still has,
+        // and the member the update supplied is not there. The reported `SourceParameters`
+        // also carry the batch size the pipe polls its source with, whose rule and table
+        // live in `tests/all/pipe_reported_configuration.rs`, so what is asserted here is
+        // every member and value the create stored.
         let described = describe(&router, row.case).await;
+        let reported = described.member("SourceParameters").clone();
+        assert_stored(row.case, &reported, &row.created);
         assert_eq!(
-            described.member("SourceParameters"),
-            &row.created,
-            "case {:?}: a refused update must leave the stored SourceParameters as they \
-             were, got {described:?}",
-            row.case
+            reported.get(row.member),
+            None,
+            "case {:?}: a refused update must not have stored {}, got {described:?}",
+            row.case,
+            row.member
+        );
+    }
+}
+
+/// Assert that `reported` carries every member and value of `created`, which is `Null` for
+/// a pipe created with no source parameters at all.
+fn assert_stored(case: &str, reported: &Value, created: &Value) {
+    let Some(members) = created.as_object() else {
+        return;
+    };
+    for (member, expected) in members {
+        let actual = reported.get(member).unwrap_or(&Value::Null);
+        if expected.is_object() {
+            assert_stored(case, actual, expected);
+            continue;
+        }
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: the stored {member} must still read back as {expected}, \
+             got {actual:?}"
         );
     }
 }

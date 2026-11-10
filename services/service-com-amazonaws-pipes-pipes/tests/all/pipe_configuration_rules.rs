@@ -39,6 +39,17 @@ const TARGET_SQS: &str = "arn:aws:sqs:us-west-2:000000000000:results";
 const TARGET_EVENT_BUS: &str = "arn:aws:events:us-west-2:000000000000:event-bus/default";
 const TARGET_KINESIS: &str = "arn:aws:kinesis:us-west-2:000000000000:stream/results";
 
+/// The `FilterCriteria` a read reports, which is what the pattern rule below is about: the
+/// reported `SourceParameters` also carry the batch size the pipe polls its source with,
+/// whose own rule and table live in `tests/all/pipe_reported_configuration.rs`.
+pub(crate) fn reported_filter_criteria(described: &Reply) -> Value {
+    described
+        .member("SourceParameters")
+        .get("FilterCriteria")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 /// Assert that `reply` is the modelled refusal naming `name` with `message`, in the
 /// exception's `ValidationErrorFields` document AND in the modelled `fieldList` — the two
 /// renderings a client may read, built from the one list. The document itself is spelled out
@@ -401,8 +412,8 @@ async fn a_filter_pattern_that_is_not_an_event_pattern_is_refused() {
             );
             let described = describe(&router, case).await;
             assert_eq!(
-                described.member("SourceParameters"),
-                &source_parameters,
+                reported_filter_criteria(&described),
+                criteria,
                 "case {case:?}: the accepted criteria must read back verbatim, \
                  got {described:?}"
             );
@@ -464,8 +475,8 @@ async fn an_update_carrying_a_malformed_filter_pattern_changes_nothing() {
     );
     let described = describe(&router, "filterupdate").await;
     assert_eq!(
-        described.member("SourceParameters"),
-        &stored,
+        reported_filter_criteria(&described),
+        stored["FilterCriteria"],
         "a refused update must leave the stored criteria as they were, got {described:?}"
     );
 
@@ -483,8 +494,8 @@ async fn an_update_carrying_a_malformed_filter_pattern_changes_nothing() {
     tokio::time::sleep(PAST_SETTLE).await;
     let described = describe(&router, "filterupdate").await;
     assert_eq!(
-        described.member("SourceParameters"),
-        &replacement,
+        reported_filter_criteria(&described),
+        replacement["FilterCriteria"],
         "the accepted criteria must read back, got {described:?}"
     );
 }
@@ -507,10 +518,10 @@ async fn a_pipe_with_no_source_or_target_parameters_is_accepted() {
     let described = describe(&router, "barepipe").await;
     assert_eq!(
         (
-            described.member("SourceParameters"),
-            described.member("TargetParameters")
+            reported_filter_criteria(&described),
+            described.member("TargetParameters").clone()
         ),
-        (&Value::Null, &Value::Null),
-        "the pipe must report no parameters, got {described:?}"
+        (Value::Null, json!({})),
+        "the pipe must report no filter criteria and no target parameters, got {described:?}"
     );
 }

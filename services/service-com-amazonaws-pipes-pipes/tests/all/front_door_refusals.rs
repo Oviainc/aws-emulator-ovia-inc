@@ -242,7 +242,7 @@ async fn a_body_map_past_its_entry_maximum_states_the_property_counts() {
         let described = describe(&router, live).await;
         assert_eq!(
             described.member("Tags"),
-            &Value::Null,
+            &json!({}),
             "case {case:?}: a refused TagResource must have stored no tag, got {described:?}"
         );
     }

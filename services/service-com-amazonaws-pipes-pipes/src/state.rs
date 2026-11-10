@@ -63,6 +63,10 @@ pub const TRANSIENT_PIPE_STATES: &[&str] = &[
 /// The states a caller may ask a pipe to be in (`RequestedPipeState`), plus the
 /// `DELETED` that only a response reports (`RequestedPipeStateDescribeResponse`).
 /// Source: those two enums in `smithy-model/com-amazonaws-pipes-pipes.json`.
+///
+/// `DELETED` is the one no write installs: a delete answers with the run state the pipe is
+/// wound down to (see `ops/delete_pipe.rs`), and the token stays here because it is the
+/// modelled value of the member either way.
 pub mod requested_state {
     pub const RUNNING: &str = "RUNNING";
     pub const STOPPED: &str = "STOPPED";
@@ -566,6 +570,24 @@ pub fn target_batch_size_cap(target: &str) -> Option<(&str, i32)> {
         .map(|(_, cap)| (vendor, *cap))
 }
 
+/// The `BatchSize` an Amazon SQS queue source polls with when its parameters name none, as
+/// a read of the pipe reports it.
+///
+/// The model declares no `@default` on the member (only its `@range`), so this is the
+/// default EventBridge Pipes documents for an Amazon SQS source — ten records per batch,
+/// the same default the Amazon SQS event-source polling of a Lambda function has, and the
+/// same default the poller in [`data_plane`] reads a queue source with.
+pub const DEFAULT_SQS_BATCH_SIZE: i32 = 10;
+
+/// The `BatchSize` a stream source polls with when its parameters name none, as a read of
+/// the pipe reports it.
+///
+/// The model declares no `@default` here either, so this is the default EventBridge Pipes
+/// documents for a stream source — 100 records per batch, the same default the DynamoDB
+/// Streams event-source polling of a Lambda function has, and the same default the poller
+/// in [`data_plane`] reads a stream source with.
+pub const DEFAULT_STREAM_BATCH_SIZE: i32 = 100;
+
 /// The batch size a pipe's source parameters configure, whichever source type they are
 /// for: every `PipeSource*Parameters` shape that can batch carries the same `BatchSize`
 /// member, and a pipe reads from exactly one source.
@@ -704,6 +726,18 @@ pub struct SourceTypeMember {
     /// name and the field that holds it are paired, so a rule about the member reads it
     /// off the table rather than naming the field again.
     pub carried: fn(&PipeSourceParameters) -> bool,
+    /// Report the `BatchSize` a source of this type POLLS WITH onto this member of a
+    /// configuration a read is about to report, so a reader sees the value in force rather
+    /// than nothing where the request named none ([`PipeRecord::reported_source_parameters`]).
+    ///
+    /// A no-op where the configuration already names one, and where this emulator polls no
+    /// source of that type: there is no value in force to report then, so the stored
+    /// configuration is reported exactly as it was written. The two that do poll report the
+    /// default their poller uses ([`DEFAULT_SQS_BATCH_SIZE`],
+    /// [`DEFAULT_STREAM_BATCH_SIZE`]), and only the one member whose shape can be
+    /// synthesized (`omittable`) is added to a configuration that lacks it — the others
+    /// declare a `@required` member this has no value for.
+    pub report_effective_batch_size: fn(&mut PipeSourceParameters),
 }
 
 /// Every `SourceParameters` member that belongs to a source type.
@@ -731,42 +765,59 @@ pub const SOURCE_TYPE_MEMBERS: &[SourceTypeMember] = &[
         source_type: "kinesis",
         omittable: false,
         carried: |parameters| parameters.kinesis_stream_parameters.is_some(),
+        report_effective_batch_size: |_| {},
     },
     SourceTypeMember {
         member: "DynamoDBStreamParameters",
         source_type: "dynamodb",
         omittable: false,
         carried: |parameters| parameters.dynamo_db_stream_parameters.is_some(),
+        report_effective_batch_size: |parameters| {
+            if let Some(stream) = parameters.dynamo_db_stream_parameters.as_mut() {
+                stream.batch_size.get_or_insert(DEFAULT_STREAM_BATCH_SIZE);
+            }
+        },
     },
     SourceTypeMember {
         member: "SqsQueueParameters",
         source_type: PIPES_SERVICE_SQS,
         omittable: true,
         carried: |parameters| parameters.sqs_queue_parameters.is_some(),
+        report_effective_batch_size: |parameters| {
+            parameters
+                .sqs_queue_parameters
+                .get_or_insert_with(Default::default)
+                .batch_size
+                .get_or_insert(DEFAULT_SQS_BATCH_SIZE);
+        },
     },
     SourceTypeMember {
         member: "ActiveMQBrokerParameters",
         source_type: "mq",
         omittable: false,
         carried: |parameters| parameters.active_mq_broker_parameters.is_some(),
+        report_effective_batch_size: |_| {},
     },
     SourceTypeMember {
         member: "RabbitMQBrokerParameters",
         source_type: "mq",
         omittable: false,
         carried: |parameters| parameters.rabbit_mq_broker_parameters.is_some(),
+        report_effective_batch_size: |_| {},
     },
     SourceTypeMember {
         member: "ManagedStreamingKafkaParameters",
         source_type: "kafka",
         omittable: false,
         carried: |parameters| parameters.managed_streaming_kafka_parameters.is_some(),
+        report_effective_batch_size: |_| {},
     },
     SourceTypeMember {
         member: "SelfManagedKafkaParameters",
         source_type: SELF_MANAGED_KAFKA,
         omittable: false,
         carried: |parameters| parameters.self_managed_kafka_parameters.is_some(),
+        report_effective_batch_size: |_| {},
     },
 ];
 
@@ -1107,23 +1158,50 @@ impl PipeRecord {
         }
     }
 
-    /// The stored tags as the modelled `TagMap`, or `None` when the pipe carries none:
-    /// `TagMap` is `@length(min: 1)`, so an empty map is not a legal value for one SENT
-    /// to this service, and `DescribePipe` reports the member only when the pipe has tags.
-    pub fn tag_map(&self) -> Option<std::collections::HashMap<String, String>> {
-        if self.tags.is_empty() {
-            return None;
+    /// The pipe's SOURCE configuration as a read of the pipe reports it: what the pipe
+    /// actually polls its source with.
+    ///
+    /// Two things make the reported configuration more than the stored one. The container
+    /// is always there — a read reports the pipe's configuration, not a record of which
+    /// members its create request happened to mention, and `PipeSourceParameters` holds
+    /// only optional members, so the empty one is a legal value of the shape. And where the
+    /// service supplies a value the request left out, the read reports the value IN FORCE:
+    /// the `BatchSize` the pipe's source type polls with when its parameters name none
+    /// ([`SOURCE_TYPE_MEMBERS`]).
+    pub fn reported_source_parameters(&self) -> PipeSourceParameters {
+        let mut reported = self.source_parameters.clone().unwrap_or_default();
+        let source_type = self.source_type();
+        for entry in SOURCE_TYPE_MEMBERS
+            .iter()
+            .filter(|entry| entry.source_type == source_type)
+        {
+            (entry.report_effective_batch_size)(&mut reported);
         }
-        Some(self.tags_reported())
+        reported
     }
 
-    /// The stored tags as the map the tagging layer ALWAYS reports, empty when the pipe
-    /// carries no tag.
+    /// The pipe's ENRICHMENT configuration as a read reports it: the stored one, or the
+    /// empty shape for a pipe configured without enrichment parameters. The container rule
+    /// of [`Self::reported_source_parameters`].
+    pub fn reported_enrichment_parameters(&self) -> PipeEnrichmentParameters {
+        self.enrichment_parameters.clone().unwrap_or_default()
+    }
+
+    /// The pipe's TARGET configuration as a read reports it: the stored one, or the empty
+    /// shape for a pipe configured without target parameters. The container rule of
+    /// [`Self::reported_source_parameters`].
+    pub fn reported_target_parameters(&self) -> PipeTargetParameters {
+        self.target_parameters.clone().unwrap_or_default()
+    }
+
+    /// The stored tags as the map every read ALWAYS reports, empty when the pipe carries no
+    /// tag.
     ///
-    /// Recorded behaviour: `ListTagsForResource` answers with its `tags` member present
-    /// for a pipe with no tags, so a caller can read it without first asking whether it
-    /// is there. `TagMap`'s `@length(min: 1)` bounds what a request may SEND, which is
-    /// what the boundary validator enforces it on.
+    /// The container rule of [`Self::reported_source_parameters`] again:
+    /// `ListTagsForResource` and `DescribePipe` answer with their tag member present for a
+    /// pipe with no tags, so a caller can read it without first asking whether it is there.
+    /// `TagMap`'s `@length(min: 1)` bounds what a request may SEND, which is what the
+    /// boundary validator enforces it on.
     pub fn tags_reported(&self) -> std::collections::HashMap<String, String> {
         self.tags
             .iter()

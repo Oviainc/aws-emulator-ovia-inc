@@ -19,7 +19,7 @@
 
 use serde_json::json;
 
-use crate::pipe_configuration_rules::assert_refused;
+use crate::pipe_configuration_rules::{assert_refused, reported_filter_criteria};
 use crate::pipe_lifecycle::{create, describe, router, PAST_SETTLE};
 use crate::pipe_update::{create_body, update};
 
@@ -137,8 +137,8 @@ async fn a_filter_pattern_clause_that_is_a_bare_value_is_refused() {
             );
             let described = describe(&router, row.case).await;
             assert_eq!(
-                described.member("SourceParameters"),
-                &source_parameters,
+                reported_filter_criteria(&described),
+                source_parameters["FilterCriteria"],
                 "case {:?}: the accepted criteria must read back verbatim, got {described:?}",
                 row.case
             );
@@ -191,8 +191,8 @@ async fn an_update_whose_pattern_clause_is_a_bare_value_changes_nothing() {
     assert_refused("clause-form-update", &refused, "Pattern", &reason("tag"));
     let described = describe(&router, "clauseformupdate").await;
     assert_eq!(
-        described.member("SourceParameters"),
-        &stored,
+        reported_filter_criteria(&described),
+        stored["FilterCriteria"],
         "a refused update must leave the stored criteria as they were, got {described:?}"
     );
 
@@ -211,8 +211,8 @@ async fn an_update_whose_pattern_clause_is_a_bare_value_changes_nothing() {
     tokio::time::sleep(PAST_SETTLE).await;
     let described = describe(&router, "clauseformupdate").await;
     assert_eq!(
-        described.member("SourceParameters"),
-        &replacement,
+        reported_filter_criteria(&described),
+        replacement["FilterCriteria"],
         "the accepted criteria must read back, got {described:?}"
     );
 }

@@ -49,6 +49,8 @@ mod pipe_partial_batch_failure;
 mod pipe_record_envelope;
 #[path = "all/pipe_refusal_bodies.rs"]
 mod pipe_refusal_bodies;
+#[path = "all/pipe_reported_configuration.rs"]
+mod pipe_reported_configuration;
 #[path = "all/pipe_source_checkout.rs"]
 mod pipe_source_checkout;
 #[path = "all/pipe_state_reason.rs"]

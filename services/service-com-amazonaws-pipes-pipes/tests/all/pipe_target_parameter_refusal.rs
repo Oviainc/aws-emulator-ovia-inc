@@ -191,7 +191,7 @@ async fn a_missing_required_target_parameter_is_refused_naming_the_member_that_h
             );
             assert_eq!(
                 described.member("TargetParameters"),
-                &row.target_parameters,
+                &reported_target_parameters(&row.target_parameters),
                 "case {:?}: the accepted pipe must read back its target parameters, \
                  got {described:?}",
                 row.case
@@ -292,10 +292,21 @@ async fn an_update_that_would_leave_a_required_target_parameter_missing_is_refus
         );
         assert_eq!(
             described.member("TargetParameters"),
-            &row.created_parameters,
+            &reported_target_parameters(&row.created_parameters),
             "case {:?}: a refused update must leave the stored TargetParameters as they \
              were, got {described:?}",
             row.case
         );
     }
+}
+
+/// What a read reports for the `TargetParameters` a pipe was configured with: the
+/// configuration itself, and the EMPTY object for a pipe configured with none — a read
+/// reports the container whether the request mentioned it or not, which is the rule and the
+/// table of `tests/all/pipe_reported_configuration.rs`.
+fn reported_target_parameters(configured: &Value) -> Value {
+    if configured.is_null() {
+        return json!({});
+    }
+    configured.clone()
 }
