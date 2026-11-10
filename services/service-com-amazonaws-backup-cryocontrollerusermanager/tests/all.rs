@@ -27,6 +27,8 @@ mod error_bodies;
 mod framework;
 #[path = "all/framework_listing.rs"]
 mod framework_listing;
+#[path = "all/framework_refusals.rs"]
+mod framework_refusals;
 #[path = "all/framework_update.rs"]
 mod framework_update;
 #[path = "all/framework_update_idempotency.rs"]

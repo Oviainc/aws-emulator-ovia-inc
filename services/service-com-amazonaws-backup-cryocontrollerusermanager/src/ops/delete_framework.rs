@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFramework
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFramework`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFramework::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the audit framework `CreateFramework` stored under the name asked
+//! about, so every later read of that name is refused as a name this account
+//! holds no framework under, and the name is free for a later create to take.
+//!
+//! AWS Backup performs one action on a framework at a time, so a delete that
+//! arrives while that framework's deployment is still in flight is refused
+//! `ConflictException` and the framework is left intact; a name this account
+//! holds no framework under is `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +168,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFramework` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFrameworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFramework"))
+        let _ = ctx;
+        // `FrameworkName` is `@required` and targets a patterned, length-bound
+        // shape, so an absent or malformed one is refused before this handler
+        // runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteFrameworkErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // ONE lock for the whole read-modify-write: resolving the framework,
+        // deciding whether a previous action on it is still running and removing
+        // it are a single critical section, so two deletes of one name cannot
+        // both report success.
+        let mut store = state.lock();
+        // The deployments the clock has already made due, materialised first, so
+        // a delete is refused only while an action is REALLY still running.
+        store.settle_frameworks(now);
+
+        // Resolved exactly as a read resolves it, so the delete and the read
+        // cannot disagree about which names this account holds.
+        let framework = store
+            .framework(&input.framework_name)
+            .map_err(DeleteFrameworkErrorModeled::ResourceNotFoundException)?;
+
+        // A framework whose create or update has not finished deploying: AWS
+        // Backup performs one action on a framework at a time, so this delete is
+        // refused and the framework is left exactly as it was.
+        if framework.deployment_in_flight() {
+            return Err(DeleteFrameworkErrorModeled::ConflictException(
+                crate::state::framework_action_in_progress(&input.framework_name),
+            )
+            .into());
+        }
+
+        // The record is REMOVED, so the name becomes one this account holds no
+        // framework under: every later read of it is refused, and a later create
+        // may take the name again.
+        store.frameworks.remove(&input.framework_name);
+        Ok(DeleteFrameworkOutput)
     }
 }

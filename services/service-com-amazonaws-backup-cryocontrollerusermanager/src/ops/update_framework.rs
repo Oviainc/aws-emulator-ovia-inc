@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // action on a framework at a time.
         if framework.deployment_in_flight() {
             return Err(UpdateFrameworkErrorModeled::ConflictException(
-                crate::state::previous_action_in_progress(),
+                crate::state::framework_action_in_progress(&input.framework_name),
             )
             .into());
         }

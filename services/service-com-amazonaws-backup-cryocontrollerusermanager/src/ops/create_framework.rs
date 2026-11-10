@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // about the stored framework.
         if store.frameworks.contains_key(&input.framework_name) {
             return Err(CreateFrameworkErrorModeled::AlreadyExistsException(
-                crate::state::framework_already_exists(),
+                crate::state::framework_already_exists(&input.framework_name),
             )
             .into());
         }

@@ -935,23 +935,50 @@ pub const MESSAGE_SELECTION_ALREADY_EXISTS: &str =
     "Backup selection with the same name already exists";
 
 /// The sentence AWS states for "the framework asked about is not one this
-/// account holds" — fixed, and worded as this service words the same condition
-/// for a backup plan ([`MESSAGE_BACKUP_PLAN_NOT_FOUND`]): it names no part of
-/// the request. No `Code`: this condition has no observed token.
-pub const MESSAGE_FRAMEWORK_NOT_FOUND: &str = "Cannot find Framework";
-
-/// The sentence AWS states for "a framework of this name already exists",
-/// worded as this service words the same condition for a vault
-/// ([`MESSAGE_VAULT_ALREADY_EXISTS`]) — fixed, and with no observed `Code`.
-pub const MESSAGE_FRAMEWORK_ALREADY_EXISTS: &str = "Framework with the same name already exists";
-
-/// The sentence AWS states for "a previous action on this resource is still
-/// running, so the one just requested cannot be performed" — the documented
-/// text of `ConflictException` itself, which names no part of the request. No
+/// account holds": fixed text around the framework the call addressed and the
+/// account it was made in, so a client that surfaces or matches the refusal can
+/// tell WHICH framework and WHICH account was missing. The variable parts are
+/// the name the request carried and the account this emulator presents. No
 /// `Code`: this condition has no observed token.
-pub const MESSAGE_PREVIOUS_ACTION_IN_PROGRESS: &str =
-    "Backup can't perform the action that you requested until it finishes performing a \
-     previous action. Try again later.";
+pub fn framework_not_found_message(name: &str) -> String {
+    format!(
+        "Framework {name} not found in account {}.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The sentences AWS states for "this account already holds a framework the one
+/// being created would duplicate": fixed text that attributes the conflict to
+/// the controls and configuration and tells the caller what to change for the
+/// name the create asked for. The variable parts are the account this emulator
+/// presents and the name the request carried; no observed `Code`.
+pub fn framework_already_exists_message(name: &str) -> String {
+    format!(
+        "A framework with these controls and configurations already exists in this account {}. \
+         To create new framework {name}, change the number or scope of the controls.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The sentence AWS states for "a previous action on this framework is still
+/// running, so the one just requested cannot be performed": fixed text naming
+/// the framework the call addressed and the account it was made in, as the two
+/// framework refusals above do. No `Code`: this condition has no observed
+/// token.
+pub fn framework_action_in_progress_message(name: &str) -> String {
+    format!(
+        "Operation failed because of a concurrent update for the framework {name} in account \
+         {}. Try again later.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The sentence AWS states for "a control the request names is not one Backup
+/// Audit Manager supports": fixed text around the control name, taken verbatim
+/// from the request's `FrameworkControls` entry.
+pub fn unsupported_framework_control_message(control_name: &str) -> String {
+    format!("You can't create the framework control {control_name} because it is unsupported.")
+}
 
 /// `Code` for "`MaxResults` is outside the range the model declares".
 pub const ERROR_CODE_MAX_RESULTS_INVALID: &str = "ERROR_3607";
@@ -1485,34 +1512,70 @@ pub fn selection_already_exists() -> AlreadyExistsException {
     }
 }
 
-/// The modelled refusal for a framework name this account does not hold.
-pub fn framework_not_found() -> ResourceNotFoundException {
+/// The modelled refusal for a framework name this account does not hold, worded
+/// by [`framework_not_found_message`] from the name the call addressed.
+pub fn framework_not_found(name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(MESSAGE_FRAMEWORK_NOT_FOUND.to_string()),
+        message: Some(framework_not_found_message(name)),
         ..Default::default()
     }
 }
 
-/// The modelled refusal for a create naming a framework that already exists.
+/// The modelled refusal for a create this account already holds the framework
+/// for, worded by [`framework_already_exists_message`] from the name the
+/// request carried.
 ///
 /// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
 /// [`vault_already_exists`].
-pub fn framework_already_exists() -> AlreadyExistsException {
+pub fn framework_already_exists(name: &str) -> AlreadyExistsException {
     AlreadyExistsException {
-        message: Some(MESSAGE_FRAMEWORK_ALREADY_EXISTS.to_string()),
+        message: Some(framework_already_exists_message(name)),
         ..Default::default()
     }
 }
 
-/// The modelled refusal for an action on a resource whose previous action has
-/// not finished — see [`MESSAGE_PREVIOUS_ACTION_IN_PROGRESS`]. AWS Backup
-/// serializes the deployment of one resource, so the action that loses the race
+/// The modelled refusal for an action on a framework whose previous action has
+/// not finished — see [`framework_action_in_progress_message`]. AWS Backup
+/// serializes the deployment of one framework, so the action that loses the race
 /// is refused rather than blended into the one already running.
-pub fn previous_action_in_progress() -> ConflictException {
+pub fn framework_action_in_progress(name: &str) -> ConflictException {
     ConflictException {
-        message: Some(MESSAGE_PREVIOUS_ACTION_IN_PROGRESS.to_string()),
+        message: Some(framework_action_in_progress_message(name)),
         ..Default::default()
     }
+}
+
+/// The control names AWS Backup Audit Manager supports — the `ControlName`
+/// identifiers its published control catalog names, which are the only values
+/// `FrameworkControls` may carry. The model types `ControlName` as a plain
+/// string ("The name of a control. This name is between 1 and 256 characters",
+/// `smithy_query` shape `FrameworkControl`, member `ControlName`), so the
+/// catalog is listed here: AWS refuses any other value rather than storing a
+/// framework that evaluates a control which does not exist.
+///
+/// Source: the AWS Backup Developer Guide's "Choosing controls" page of the
+/// Backup Audit Manager chapter, which lists each control and its identifier.
+/// AWS adds controls over time, so re-read that page against this list when a
+/// control it names is refused here.
+pub const SUPPORTED_FRAMEWORK_CONTROL_NAMES: [&str; 10] = [
+    "BACKUP_RESOURCES_PROTECTED_BY_BACKUP_PLAN",
+    "BACKUP_PLAN_MIN_FREQUENCY_AND_MIN_RETENTION_CHECK",
+    "BACKUP_RECOVERY_POINT_MINIMUM_RETENTION_CHECK",
+    "BACKUP_RECOVERY_POINT_ENCRYPTED",
+    "BACKUP_RECOVERY_POINT_MANUAL_DELETION_DISABLED",
+    "BACKUP_RESOURCES_PROTECTED_BY_BACKUP_VAULT_LOCK",
+    "BACKUP_LAST_RECOVERY_POINT_CREATED",
+    "BACKUP_RESOURCES_PROTECTED_BY_CROSS_REGION_COPY",
+    "BACKUP_RESOURCES_PROTECTED_BY_CROSS_ACCOUNT_COPY",
+    "RESTORE_TIME_FOR_RESOURCES_MEET_TARGET",
+];
+
+/// Whether `name` is one of the controls Backup Audit Manager supports
+/// ([`SUPPORTED_FRAMEWORK_CONTROL_NAMES`]). The comparison is exact: a control
+/// is addressed by its identifier, so a differently-spelled one names no
+/// control at all.
+pub fn is_supported_framework_control(name: &str) -> bool {
+    SUPPORTED_FRAMEWORK_CONTROL_NAMES.contains(&name)
 }
 
 /// The modelled refusal for a `FrameworkControls` list carrying a value AWS does
@@ -1520,8 +1583,10 @@ pub fn previous_action_in_progress() -> ConflictException {
 ///
 /// ONE check for every operation that takes a framework's controls — the create
 /// and the update carry the same shape — so the two cannot drift in rules or in
-/// wording. Each rule is the model's own: "Each framework must contain at least
-/// one control" (`FrameworkControl` doc), a control is named by its
+/// wording. Each rule is the model's own or the service's published catalog: a
+/// control must be one Backup Audit Manager supports
+/// ([`SUPPORTED_FRAMEWORK_CONTROL_NAMES`]), "Each framework must contain at
+/// least one control" (`FrameworkControl` doc), a control is named by its
 /// `ControlName` so no two controls of one framework may share one, and a
 /// control scope's tag selector takes "a maximum of one key-value pair"
 /// ([`MAX_CONTROL_SCOPE_TAGS`], `ControlScope$Tags` doc).
@@ -1545,6 +1610,12 @@ fn framework_controls_refusal(controls: &[FrameworkControl]) -> Option<String> {
         return Some("FrameworkControls must contain at least one control".to_string());
     }
     for (index, control) in controls.iter().enumerate() {
+        // The control the entry names before anything else about the entry: a
+        // name no control in the catalog carries cannot be stored, whatever
+        // parameters or scope accompany it.
+        if !is_supported_framework_control(&control.control_name) {
+            return Some(unsupported_framework_control_message(&control.control_name));
+        }
         if controls[..index]
             .iter()
             .any(|earlier| earlier.control_name == control.control_name)
@@ -2488,7 +2559,7 @@ impl FrameworkRecord {
     /// `DeploymentStatus` is one of the model's non-terminal `*_IN_PROGRESS`
     /// values. AWS Backup deploys a framework's controls one action at a time,
     /// so another action on it is refused while this one runs
-    /// ([`previous_action_in_progress`]).
+    /// ([`framework_action_in_progress`]).
     ///
     /// Read AFTER [`ComAmazonawsBackupCryocontrollerusermanagerState::settle_frameworks`],
     /// so a deployment the clock has already made due is terminal here.
@@ -2868,7 +2939,9 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
 
     /// Resolve a framework for a read, by the name it is stored under.
     pub fn framework(&self, name: &str) -> Result<&FrameworkRecord, ResourceNotFoundException> {
-        self.frameworks.get(name).ok_or_else(framework_not_found)
+        self.frameworks
+            .get(name)
+            .ok_or_else(|| framework_not_found(name))
     }
 
     /// The same resolution for a call that WRITES the framework it names, so a
@@ -2878,7 +2951,9 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         &mut self,
         name: &str,
     ) -> Result<&mut FrameworkRecord, ResourceNotFoundException> {
-        self.frameworks.get_mut(name).ok_or_else(framework_not_found)
+        self.frameworks
+            .get_mut(name)
+            .ok_or_else(|| framework_not_found(name))
     }
 
     /// The framework an `IdempotencyToken` created, if this account still holds
