@@ -1864,8 +1864,11 @@ pub enum NotFoundResource {
     /// words the two refusals differently, so the resource carries both sentences
     /// ([`NotFoundResource::message`]).
     EventDelete,
-    /// An evaluator, addressed by `evaluatorId`.
-    Evaluator,
+    /// A CUSTOM evaluator, addressed by `evaluatorId`: the only evaluator family a lookup
+    /// reports missing, since a built-in or partner evaluator is one the service itself
+    /// provides and an id of neither family names a custom evaluator the control plane
+    /// created.
+    CustomEvaluator,
     /// A browser, addressed by `browserIdentifier`: the tool the service provides or a
     /// browser the control plane created.
     Browser,
@@ -1882,7 +1885,7 @@ impl NotFoundResource {
             Self::CodeInterpreter => "Code Interpreter",
             Self::Session => "Session",
             Self::EventRead | Self::EventDelete => "Event",
-            Self::Evaluator => "Evaluator",
+            Self::CustomEvaluator => "Custom evaluator",
             Self::Browser => "Browser",
             Self::BatchEvaluation => "Batch Evaluation",
         }

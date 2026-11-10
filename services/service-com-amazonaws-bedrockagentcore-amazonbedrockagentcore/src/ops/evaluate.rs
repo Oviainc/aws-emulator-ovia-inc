@@ -30,18 +30,28 @@
 //! statistics for the evaluation process" — and no judge model runs in this emulator,
 //! so no result carries one: `value`, `label`, `explanation` and `tokenUsage` are all
 //! left out rather than filled with a number or a sentence nothing produced. What each
-//! result does carry is the evaluator it was asked for, the `spanContext` it is about,
-//! and an `errorCode` saying why it is unscored — the context's log events were not
-//! among the submitted spans, or they were and no judge model ran. The ground truth a
+//! result does carry is the evaluator it was asked for, the `spanContext` of the span
+//! data it was computed from, and an `errorCode` saying why it is unscored — the
+//! context's log events were not among the submitted spans, or they were and no judge
+//! model ran. The ground truth a
 //! request supplies is read for the contexts it addresses and for the uniqueness rule
 //! above, and nothing is compared against it.
 //!
 //! The span members read here are the OpenTelemetry ones, in both the spelling the
 //! OTLP/JSON encoding uses and the snake_case several exporters write
-//! ([`SPAN_ID_MEMBERS`], [`TRACE_ID_MEMBERS`], [`START_TIME_MEMBERS`]), and the
+//! ([`SPAN_ID_MEMBERS`], [`TRACE_ID_MEMBERS`], [`NAME_MEMBERS`],
+//! [`START_TIME_MEMBERS`]), and the
 //! attributes are those of the OpenTelemetry and OpenInference conventions the
 //! instrumentations named in this operation's `evaluationInput` documentation emit
 //! ([`SESSION_ID_ATTRIBUTE`], [`TOOL_NAME_ATTRIBUTES`], [`RESPONSE_ATTRIBUTES`]).
+//!
+//! ## Which evaluator can be asked for
+//!
+//! The evaluator the URI names has to EXIST before anything is evaluated with it: a
+//! `Builtin.` id names one of the built-in evaluators this service provides
+//! ([`BUILTIN_EVALUATORS`]) and any other `Builtin.` name is refused as the bad value it
+//! is, while an id of the customer-evaluator family names a custom evaluator, which only
+//! the control plane creates, so one that was never created is reported missing.
 //!
 //! ## Shape of an operation
 //!
@@ -229,13 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Repeating a call therefore answers exactly the same results.
         let _ = (ctx, &self.engine);
 
+        // The evaluator the URI names is resolved BEFORE the body is read: asking for an
+        // evaluator that does not exist is refused on that pre-condition alone, whatever
+        // the request asked to have evaluated with it.
+        let evaluator = resolve_evaluator(&input.evaluator_id)?;
         let spans = read_spans(&input.evaluation_input)?;
         let references = read_references(input.evaluation_reference_inputs.as_deref())?;
         let units = target_units(input.evaluation_target.as_ref(), &spans, &references)?;
-        // The body is read before the evaluator the URI names is resolved, so a request
-        // that is not evaluable at all is refused as the bad request it is rather than
-        // reported as a missing resource.
-        let evaluator = resolve_evaluator(&input.evaluator_id)?;
 
         Ok(EvaluateOutput {
             evaluation_results: units
@@ -253,6 +263,10 @@ const SPAN_ID_MEMBERS: [&str; 2] = ["spanId", "span_id"];
 
 /// The members a span states the trace it belongs to under, in the same two spellings.
 const TRACE_ID_MEMBERS: [&str; 2] = ["traceId", "trace_id"];
+
+/// The members a span states its own name under: OpenTelemetry's `name`, and the two
+/// span-prefixed spellings an exporter that flattens a span into a record writes instead.
+const NAME_MEMBERS: [&str; 3] = ["name", "spanName", "span_name"];
 
 /// The members a span states its start instant under, in the same two spellings. It is
 /// what puts the submitted spans in trace order, which is the order the trace is read
@@ -316,6 +330,42 @@ const THIRD_PARTY_PREFIX: &str = "ThirdParty.";
 /// code of its own.
 const LOG_EVENT_MISSING_CODE: &str = "LogEventMissingException";
 
+/// The built-in evaluators this service provides, which are the only names a `Builtin.`
+/// `evaluatorId` can carry: the `Builtin.<name>` family the AgentCore models document as
+/// evaluators the service itself ships (source: smithy_query query="shape"
+/// shape="EvaluatorId" and query="doc" shape="EvaluationResultContent"
+/// member="evaluatorName", which name `Helpfulness` and `Correctness`), together with the
+/// rest of the published family this emulator provides beside them. Each entry is the
+/// name AFTER the [`BUILTIN_PREFIX`], and the comparison is exact: `EvaluatorId`'s
+/// pattern fixes the prefix's spelling, so a built-in evaluator has one id.
+///
+/// A CUSTOM evaluator is not here — it exists only once the control plane created it —
+/// and neither is a partner evaluator, of whose family no model of this service publishes
+/// a catalogue.
+const BUILTIN_EVALUATORS: [&str; 9] = [
+    "Coherence",
+    "Completeness",
+    "Correctness",
+    "Faithfulness",
+    "Goal.Accuracy",
+    "Groundedness",
+    "Helpfulness",
+    "Relevance",
+    "ToolUse",
+];
+
+/// The longest `errorMessage` a result may carry (`EvaluationErrorMessage`
+/// `@length(max 2048)`, source: smithy_query query="shape"
+/// shape="EvaluationResultContent"). A span's own name is the one part of such a message
+/// whose length a request chooses, so the message is held to this bound rather than
+/// reported past it.
+const MAX_ERROR_MESSAGE: usize = 2048;
+
+/// How a message spells the name of a span that states none: the same way this service
+/// spells a value a context does not carry when it refuses a repeated context, so one
+/// absent value reads the same wherever it is reported.
+const UNNAMED_SPAN: &str = "None";
+
 /// The `errorCode` a result carries when the context's log events ARE there and no
 /// judge model ran over them. It is the EMULATOR's own code — a rating comes from an
 /// evaluator, no evaluator runs here, and reporting that is the honest answer where a
@@ -355,6 +405,9 @@ struct TraceSpan {
     span_id: String,
     /// The trace it belongs to, when it states one.
     trace_id: Option<String>,
+    /// Its own name, when it states one ([`NAME_MEMBERS`]): what a result reporting this
+    /// span calls it.
+    name: Option<String>,
     /// The session it belongs to, from [`SESSION_ID_ATTRIBUTE`].
     session_id: Option<String>,
     /// Whether the span records an interaction of the agent — a tool call
@@ -586,6 +639,7 @@ fn read_spans(input: &EvaluationInput) -> Result<Vec<TraceSpan>, EvaluateError> 
         spans.push(TraceSpan {
             span_id,
             trace_id: text_member(members, &TRACE_ID_MEMBERS),
+            name: text_member(members, &NAME_MEMBERS),
             session_id: attributes.get(SESSION_ID_ATTRIBUTE).cloned(),
             records_interaction: states_any(&attributes, &TOOL_NAME_ATTRIBUTES)
                 || states_any(&attributes, &RESPONSE_ATTRIBUTES),
@@ -813,13 +867,11 @@ fn target_units<'a>(
                 }
             })
             .collect();
-        // A span targeted on its OWN reports the trace it belongs to; a session-level
-        // unit reports no trace, because it is not about one.
-        let trace_id = if span_id.is_some() {
-            trace_id.or_else(|| held.first().and_then(|span| span.trace_id.clone()))
-        } else {
-            trace_id
-        };
+        // The trace a result reports is the one its unit NAMES, and otherwise the one
+        // the span data it was computed from belongs to: a unit whose spans all belong to
+        // one trace is about that trace, and one whose spans belong to several is about
+        // none of them on its own, so it reports no trace rather than one of them.
+        let trace_id = trace_id.or_else(|| single_trace(&held));
         units.push(Unit {
             session_id,
             trace_id,
@@ -830,25 +882,65 @@ fn target_units<'a>(
     Ok(units)
 }
 
+/// The one trace every span of `spans` belongs to, or nothing where they belong to
+/// several or state no trace at all. A span that states no trace of its own is no
+/// evidence of a second one, so it does not make the answer ambiguous.
+fn single_trace(spans: &[&TraceSpan]) -> Option<String> {
+    let mut stated = spans.iter().filter_map(|span| span.trace_id.as_deref());
+    let first = stated.next()?;
+    stated
+        .all(|trace_id| trace_id.eq_ignore_ascii_case(first))
+        .then(|| first.to_string())
+}
+
 /// The evaluator the request named.
 ///
-/// A built-in or partner evaluator is one the service itself provides, so its id names
-/// it and its ARN is the account-free form `EvaluatorArn`'s second pattern alternative
-/// states (`^arn:aws[a-zA-Z-]*:bedrock-agentcore:::evaluator/(Builtin|ThirdParty)\.…$`,
-/// source: smithy_query query="shape" shape="EvaluatorArn"). Any other id is a CUSTOM
-/// evaluator, which exists only once the control plane has created it — no operation of
-/// this emulator does, so no such evaluator can be found.
+/// The id's family decides what has to hold for it, and an id that names no evaluator is
+/// refused HERE, before anything is evaluated:
+///
+/// * a BUILT-IN evaluator is one of the ones this service provides
+///   ([`BUILTIN_EVALUATORS`]); a `Builtin.` id naming any other is a bad value, so it is
+///   refused as a `ValidationException` that says which name was not one;
+/// * a PARTNER evaluator belongs to a family no model of this service publishes a
+///   catalogue of, so an id of that family names one;
+/// * any other id is a CUSTOM evaluator, which exists only once the control plane has
+///   created it — no operation of this emulator does — so it resolves to nothing and is
+///   reported missing.
+///
+/// A provided evaluator's ARN is the account-free form `EvaluatorArn`'s second pattern
+/// alternative states
+/// (`^arn:aws[a-zA-Z-]*:bedrock-agentcore:::evaluator/(Builtin|ThirdParty)\.…$`, source:
+/// smithy_query query="shape" shape="EvaluatorArn").
 fn resolve_evaluator(evaluator_id: &str) -> Result<ResolvedEvaluator, EvaluateError> {
-    if !(evaluator_id.starts_with(BUILTIN_PREFIX) || evaluator_id.starts_with(THIRD_PARTY_PREFIX)) {
-        return Err(EvaluateErrorModeled::ResourceNotFoundException(
-            ResourceNotFoundException {
-                message: Some(crate::state::resource_not_found_message(
-                    crate::state::NotFoundResource::Evaluator,
-                    evaluator_id,
-                )),
-            },
-        )
-        .into());
+    match evaluator_id.strip_prefix(BUILTIN_PREFIX) {
+        Some(name) if !BUILTIN_EVALUATORS.contains(&name) => {
+            // The wording AWS refuses an unknown built-in evaluator with, which names the
+            // id the request spelled and says what to send instead. `ValidationException`
+            // requires a `reason`, and a value that is not one the service offers is a
+            // field that failed validation.
+            return Err(EvaluateErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Builtin evaluator {evaluator_id} does not exist. Please provide valid \
+                     Builtin evaluator name and retry."
+                ),
+                reason: FIELD_VALIDATION_FAILED.to_string(),
+                field_list: None,
+            })
+            .into());
+        }
+        Some(_) => {}
+        None if !evaluator_id.starts_with(THIRD_PARTY_PREFIX) => {
+            return Err(EvaluateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::NotFoundResource::CustomEvaluator,
+                        evaluator_id,
+                    )),
+                },
+            )
+            .into());
+        }
+        None => {}
     }
     Ok(ResolvedEvaluator {
         id: evaluator_id.to_string(),
@@ -871,8 +963,50 @@ fn resolve_evaluator(evaluator_id: &str) -> Result<ResolvedEvaluator, EvaluateEr
     })
 }
 
-/// One unit's result: the evaluator it was asked for, the context it is about, and why
-/// it carries no rating.
+/// The span of this unit whose log event is missing: the first one, in trace order, that
+/// records nothing the agent did. A span belonging to the context records a log event of
+/// it only when it records a tool call or an answer, so one that records neither is a
+/// span whose log event did not arrive with it.
+fn incomplete_span<'a>(unit: &Unit<'a>) -> Option<&'a TraceSpan> {
+    unit.spans
+        .iter()
+        .copied()
+        .find(|span| !span.records_interaction)
+}
+
+/// The message a result carries for a span with no corresponding log event: AWS's
+/// incomplete-span-data text, templated on the span this result is about — its own id and
+/// the name it states ([`UNNAMED_SPAN`] where it states none).
+///
+/// A caller chooses how long a span's name is, and the fixed text carries the remediation,
+/// so where the name would push the message past what `errorMessage` admits the NAME is
+/// what gives way ([`MAX_ERROR_MESSAGE`]) rather than the end of the sentence.
+fn incomplete_span_message(span_id: &str, span_name: Option<&str>) -> String {
+    let stated = span_name.unwrap_or(UNNAMED_SPAN);
+    let room = MAX_ERROR_MESSAGE.saturating_sub(incomplete_span_text(span_id, "").chars().count());
+    let name: String = stated.chars().take(room).collect();
+    within_error_message_limit(incomplete_span_text(span_id, &name))
+}
+
+/// The incomplete-span-data sentence itself: fixed text, with the span's id and name
+/// substituted into it.
+fn incomplete_span_text(span_id: &str, span_name: &str) -> String {
+    format!(
+        "Session span data is incomplete. Span with ID: {span_id} and name: {span_name} is \
+         missing a corresponding log event. Please retry the request with the complete span data"
+    )
+}
+
+/// `message` held to what `errorMessage` admits ([`MAX_ERROR_MESSAGE`]).
+fn within_error_message_limit(message: String) -> String {
+    match message.chars().count() <= MAX_ERROR_MESSAGE {
+        true => message,
+        false => message.chars().take(MAX_ERROR_MESSAGE).collect(),
+    }
+}
+
+/// One unit's result: the evaluator it was asked for, the context of the span data it was
+/// computed from, and why it carries no rating.
 ///
 /// A rating is an evaluator's output, and no judge model runs in this emulator, so
 /// `value`, `label`, `explanation` and `tokenUsage` are left out of every result rather
@@ -880,31 +1014,39 @@ fn resolve_evaluator(evaluator_id: &str) -> Result<ResolvedEvaluator, EvaluateEr
 /// the two reasons applies: the context's log events were not among the submitted spans,
 /// or they were and nothing judged them.
 fn reported(unit: &Unit<'_>, evaluator: &ResolvedEvaluator) -> EvaluationResultContent {
-    // A span belonging to the context records a log event of it only when it records
-    // what the agent did — a tool call or an answer.
-    let missing_log_events = !unit.spans.iter().any(|span| span.records_interaction);
-    let (error_code, error_message) = if missing_log_events {
-        (
+    let incomplete = incomplete_span(unit);
+    let (error_code, error_message) = match (incomplete, unit.spans.is_empty()) {
+        // One span of the context arrived without its log event: the result says which
+        // span it was and what to resubmit.
+        (Some(span), _) => (
             LOG_EVENT_MISSING_CODE,
-            format!(
-                "No log events found for context: session_id={} parent_span_id={} trace_id={} \
-                 span_id={}",
-                context_member(Some(unit.session_id.as_str())),
-                context_member(None),
-                context_member(unit.trace_id.as_deref()),
-                context_member(unit.span_id.as_deref()),
-            ),
-        )
-    } else {
-        (
+            incomplete_span_message(&span.span_id, span.name.as_deref()),
+        ),
+        // No span of the context arrived at all. A unit that targets ONE span still names
+        // it, so the span it was about is reported the same way, with no name to state;
+        // a trace- or session-level unit names no span, so the message states the fact
+        // instead — the recordings this wording follows cover the span case only.
+        (None, true) => (
+            LOG_EVENT_MISSING_CODE,
+            match unit.span_id.as_deref() {
+                Some(span_id) => incomplete_span_message(span_id, None),
+                None => within_error_message_limit(
+                    "Session span data is incomplete. No span of the evaluated context is \
+                     among the submitted session spans. Please retry the request with the \
+                     complete span data"
+                        .to_string(),
+                ),
+            },
+        ),
+        (None, false) => (
             NO_JUDGE_MODEL_CODE,
-            format!(
+            within_error_message_limit(format!(
                 "No judge model runs in this emulator, so evaluator {} rated nothing for this \
                  {} context.",
                 evaluator.id,
                 unit.level()
-            ),
-        )
+            )),
+        ),
     };
 
     EvaluationResultContent {

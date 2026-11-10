@@ -10,7 +10,8 @@
 //! step of the path that does not exist. Each resource has ONE fixed sentence per
 //! operation that refuses: a missing EVENT is `Unable to find event with id <eventId>` on
 //! a READ and `Event not found with id: <eventId>` on a DELETE, and every other resource is
-//! its capitalised label, `": "`, then its identifier.
+//! its capitalised label, `": "`, then its identifier — the label being the resource's own
+//! name, which for the evaluator family a lookup can miss is the CUSTOM evaluator.
 //!
 //! The rows span what the rule generalises over:
 //!
@@ -136,7 +137,8 @@ enum Resource {
     EventRead,
     /// An event as a DELETE of it reports it missing.
     EventDelete,
-    Evaluator,
+    /// A custom evaluator as `Evaluate` reports one missing.
+    CustomEvaluator,
 }
 
 impl Resource {
@@ -145,7 +147,7 @@ impl Resource {
             Self::Memory => "Memory",
             Self::Session => "Session",
             Self::EventRead | Self::EventDelete => "Event",
-            Self::Evaluator => "Evaluator",
+            Self::CustomEvaluator => "Custom evaluator",
         }
     }
 
@@ -588,7 +590,7 @@ async fn a_lookup_that_misses_is_refused_with_the_resources_own_label_and_identi
             Call::Evaluate {
                 evaluator: GHOST_EVALUATOR.to_string(),
             },
-            Resource::Evaluator,
+            Resource::CustomEvaluator,
             GHOST_EVALUATOR.to_string(),
         ),
     ];

@@ -804,7 +804,7 @@ async fn a_provided_evaluator_is_reported_by_its_own_id() {
     for (evaluator_id, expected_name) in [
         ("Builtin.Correctness", "Builtin.Correctness"),
         ("Builtin.Helpfulness", "Builtin.Helpfulness"),
-        ("Builtin.Goal-Accuracy", "Builtin.Goal-Accuracy"),
+        ("Builtin.Goal.Accuracy", "Builtin.Goal.Accuracy"),
         (
             "ThirdParty.acme_labs.Faithfulness",
             "ThirdParty.acme_labs.Faithfulness",

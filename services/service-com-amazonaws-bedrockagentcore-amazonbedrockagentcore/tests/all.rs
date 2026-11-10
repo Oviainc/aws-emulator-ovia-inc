@@ -25,6 +25,8 @@ mod browser_sessions;
 mod code_interpreter_sessions;
 #[path = "all/code_interpreter_tools.rs"]
 mod code_interpreter_tools;
+#[path = "all/evaluation_result_context.rs"]
+mod evaluation_result_context;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/memory_actors.rs"]
