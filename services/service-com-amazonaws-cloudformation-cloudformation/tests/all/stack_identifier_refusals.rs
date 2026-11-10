@@ -19,10 +19,12 @@
 //!    resource to its stack resolves only while that stack lives: once the stack is gone the
 //!    request is refused, even though the stack itself stays readable by its own id.
 //!
-//! The tables span each class rather than one recorded request: the malformed-identifier side
-//! over six values differing along what the rule generalises over (an empty value, and
-//! characters the expression does not admit in the positions it does not admit them) crossed
-//! with every operation whose identifier member this service checks itself; the
+//! The tables span the class rather than one recorded request: the malformed-identifier side
+//! over ELEVEN values differing along what the rule generalises over (an empty value,
+//! characters the expression does not admit in the positions it does not admit them, and
+//! values that are NEARLY a stack's unique id — the one other form a stack is addressed by,
+//! whose admitted side `stack_unique_id_identifiers.rs` pins) crossed with every operation
+//! whose identifier member this service checks itself; the
 //! absent-member side over four operations and three different required members; and the
 //! physical-id side over a live stack, the same stack once deleted, and an id nothing ever
 //! created.
@@ -182,8 +184,12 @@ const IDENTIFIER_ROWS: &[IdentifierRow] = &[
     },
 ];
 
-/// The identifiers no stack could ever carry: an empty value, and values whose characters —
-/// or the position of them — the expression does not admit.
+/// The identifiers no stack could ever carry: an empty value, values whose characters — or the
+/// position of them — the expression does not admit, and values that are NEARLY a stack's
+/// unique id, the one other form a stack is addressed by (`stack_unique_id_identifiers.rs`
+/// pins the admitted side of that form): its five '-'-separated groups, their 8-4-4-4-12
+/// lengths and their hexadecimal digits are what the form IS, so a value missing any of them
+/// is in no addressable form at all.
 const MALFORMED: &[(&str, &str)] = &[
     ("an empty identifier", ""),
     ("a name with an underscore", "identifier_stack"),
@@ -191,6 +197,23 @@ const MALFORMED: &[(&str, &str)] = &[
     ("a name starting with a digit", "9identifier"),
     ("a name starting with a hyphen", "-identifier"),
     ("a name with a space", "identifier stack"),
+    ("a unique id a group short", "0e81d159-090a-7b61-04d0999cb465"),
+    (
+        "a unique id with a short last group",
+        "0e81d159-090a-7b61-9856-04d0999cb46",
+    ),
+    (
+        "a unique id with a group too many",
+        "0e81d159-090a-7b61-9856-04d0999cb465-9856",
+    ),
+    (
+        "a unique id with a non-hexadecimal digit",
+        "0g81d159-090a-7b61-9856-04d0999cb465",
+    ),
+    (
+        "a unique id with no groups at all",
+        "0e81d159090a7b61985604d0999cb465",
+    ),
 ];
 
 fn members_of(row: &IdentifierRow, identifier: &str) -> Vec<(String, String)> {

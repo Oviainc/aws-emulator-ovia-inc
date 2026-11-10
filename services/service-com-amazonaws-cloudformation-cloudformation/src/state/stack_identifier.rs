@@ -11,6 +11,15 @@
 //! that its request is malformed rather than that the stack is missing, and EVERY constraint
 //! the value breaks is reported in one envelope, the expression first.
 //!
+//! What "no stack could ever carry" means is every FORM CloudFormation addresses a stack by,
+//! not the name expression alone: a stack is addressed by its name, by its stack id
+//! (`arn:…:stack/<name>/<unique-id>`) and by the UNIQUE ID that stack id ends in — which is
+//! hexadecimal and so starts with a digit as often as not. An identifier in one of those
+//! forms is RESOLVED, and a request carrying one that names no stack is answered as the
+//! missing stack it is ([`super::stack_does_not_exist`] and the forms beside it), because a
+//! caller holding a unique id out of an event or a split stack id has to be able to tell "the
+//! stack is gone" from "your parameter is malformed".
+//!
 //! ## Why the check lives here and not at the boundary
 //!
 //! Most of this service's identifier members target a model shape that declares NEITHER
@@ -70,6 +79,36 @@ fn whole_identifier() -> Option<&'static ::regex::Regex> {
         .as_ref()
 }
 
+/// The group lengths a stack's UNIQUE ID is written in: the 8-4-4-4-12 hexadecimal form every
+/// identifier this service mints carries (`super::new_stack_id`, which ends a stack id in
+/// one), and the form CloudFormation's own stack ids end in.
+const UNIQUE_ID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `identifier` is written as a stack's UNIQUE ID — the last segment of a stack id,
+/// `arn:…:stack/<name>/<unique-id>`.
+///
+/// A form CloudFormation ADMITS as an identifier of a stack, which is why it is asked here:
+/// the value is hexadecimal, so it is outside the name expression whenever it starts with a
+/// digit, and a request carrying one has to reach the lookup rather than be refused as
+/// malformed. Hexadecimal of EITHER case, since the case of a hexadecimal digit is not what
+/// makes a value this form; whether a stack answers to it is then the store's to say.
+fn is_stack_unique_id(identifier: &str) -> bool {
+    let mut groups = identifier.split('-');
+    UNIQUE_ID_GROUPS.iter().all(|length| {
+        groups.next().is_some_and(|group| {
+            group.len() == *length && group.chars().all(|digit| digit.is_ascii_hexdigit())
+        })
+    }) && groups.next().is_none()
+}
+
+/// Whether CloudFormation admits `identifier` as naming a stack at all: a value in one of the
+/// forms a stack is addressed by — a stack NAME or a stack ARN ([`STACK_IDENTIFIER_PATTERN`]),
+/// or the UNIQUE ID a stack id ends in ([`is_stack_unique_id`]).
+fn is_an_addressable_form(identifier: &str) -> bool {
+    whole_identifier().is_none_or(|expression| expression.is_match(identifier))
+        || is_stack_unique_id(identifier)
+}
+
 /// The message CloudFormation answers for an identifier that breaks its constraints, stated
 /// at `member_path`, or `None` for one it admits.
 ///
@@ -86,7 +125,11 @@ pub fn malformed_identifier(member_path: &str, identifier: &str) -> Option<Strin
         sensitive: false,
     };
     let mut violations: Vec<Violation> = Vec::new();
-    if whole_identifier().is_some_and(|expression| !expression.is_match(identifier)) {
+    if !is_an_addressable_form(identifier) {
+        // The expression the clause STATES is the service's own, whichever addressable form
+        // admitted the values it does admit: a requirement reaches a message as the layer
+        // that refuses states it, and what CloudFormation states for an identifier it will
+        // not take is the name-or-ARN expression.
         violations.push(clause(ViolationKind::Pattern(
             STACK_IDENTIFIER_PATTERN.to_string(),
         )));
@@ -126,9 +169,10 @@ pub fn refuse_malformed_identifier<E>(
 mod tests {
     use super::*;
 
-    /// RULE: the identifiers CloudFormation admits are a stack name and a stack ARN; every
-    /// other value is refused, and a value breaking BOTH constraints is reported with both
-    /// clauses, the expression first.
+    /// RULE: the identifiers CloudFormation admits are the forms a stack is addressed by — a
+    /// stack name, a stack ARN, and the unique id a stack ARN ends in; every other value is
+    /// refused, and a value breaking BOTH constraints is reported with both clauses, the
+    /// expression first.
     #[test]
     fn an_identifier_is_admitted_by_the_services_own_expression() {
         for admitted in [
@@ -137,6 +181,11 @@ mod tests {
             "Stack9",
             "arn:aws:cloudformation:us-east-1:123456789012:stack/a/0",
             "arn:aws-cn:cloudformation:cn-north-1:123456789012:stack/a/0",
+            // A stack's unique id, which is hexadecimal and so starts with a digit as often
+            // as not, in either case of hexadecimal.
+            "0e81d159-090a-7b61-9856-04d0999cb465",
+            "ae81d159-090a-7b61-9856-04d0999cb465",
+            "0E81D159-090A-7B61-9856-04D0999CB465",
         ] {
             assert_eq!(
                 malformed_identifier(STACK_NAME_PATH, admitted),
@@ -149,6 +198,25 @@ mod tests {
             ("a name with a dot", "a.stack"),
             ("a name starting with a digit", "9stack"),
             ("a name starting with a hyphen", "-stack"),
+            // A value that is nearly a unique id is not one: the groups and their lengths
+            // are what the form IS.
+            ("a unique id a group short", "0e81d159-090a-7b61-04d0999cb465"),
+            (
+                "a unique id with a short last group",
+                "0e81d159-090a-7b61-9856-04d0999cb46",
+            ),
+            (
+                "a unique id with a group too many",
+                "0e81d159-090a-7b61-9856-04d0999cb465-9856",
+            ),
+            (
+                "a unique id with a non-hexadecimal digit",
+                "0g81d159-090a-7b61-9856-04d0999cb465",
+            ),
+            (
+                "a unique id with no groups at all",
+                "0e81d159090a7b61985604d0999cb465",
+            ),
         ] {
             let expected = Some(format!(
                 "1 validation error detected: Value '{refused}' at 'stackName' failed to \

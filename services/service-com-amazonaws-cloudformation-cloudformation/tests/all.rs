@@ -429,6 +429,8 @@ mod stack_tag_ascii_text;
 mod stack_tag_propagation;
 #[path = "all/stack_teardown_events.rs"]
 mod stack_teardown_events;
+#[path = "all/stack_unique_id_identifiers.rs"]
+mod stack_unique_id_identifiers;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/step_functions_state_machine_replacement.rs"]
