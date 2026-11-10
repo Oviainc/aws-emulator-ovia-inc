@@ -254,14 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| stored.allowed_columns.clone());
         if let Some(rule) = store.analysis_rule_of_configured_table(&table_id) {
-            let rule_type = rule.r#type.clone();
             let outside = st::analysis_rule_columns_outside_allowed(&rule.policy, &allowed_columns);
             if !outside.is_empty() {
-                let listed = outside.join(", ");
-                let detail = format!(
-                    "Cannot remove columns from allowedColumns while the {rule_type} analysis \
-                     rule of configured table {table_id} references them: {listed}"
-                );
+                // The refusal states the unsatisfied column-reference constraint and names
+                // only the referenced-but-omitted columns — the same sentence every
+                // operation that can reach this state answers with.
+                let detail = st::analysis_rule_columns_outside_allowed_message(&outside);
                 return Err(UpdateConfiguredTableErrorModeled::ValidationException(
                     ValidationException {
                         message: Some(detail.clone()),

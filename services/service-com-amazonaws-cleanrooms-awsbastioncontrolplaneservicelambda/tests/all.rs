@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/addressed_resource_refusals.rs"]
 mod addressed_resource_refusals;
+#[path = "all/analysis_rule_column_reference_refusals.rs"]
+mod analysis_rule_column_reference_refusals;
 #[path = "all/analysis_template_deletion.rs"]
 mod analysis_template_deletion;
 #[path = "all/authorization_failure_messages.rs"]

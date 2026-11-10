@@ -249,12 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &table_allowed_columns,
         );
         if !outside.is_empty() {
-            let listed = outside.join(", ");
-            let detail = format!(
-                "Cannot create a {} analysis rule that references columns outside the configured \
-                 table's allowedColumns: {listed}",
-                input.analysis_rule_type
-            );
+            // The refusal states the unsatisfied column-reference constraint and names only
+            // the columns the policy references and the list does not carry — the same
+            // sentence every operation that can reach this state answers with.
+            let detail = st::analysis_rule_columns_outside_allowed_message(&outside);
             return Err(
                 CreateConfiguredTableAnalysisRuleErrorModeled::ValidationException(
                     ValidationException {

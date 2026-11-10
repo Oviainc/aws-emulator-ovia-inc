@@ -2516,6 +2516,26 @@ pub fn analysis_rule_columns_outside_allowed(
     outside
 }
 
+/// What the service says when a configured table's analysis rule would reference columns
+/// the table's `allowedColumns` do not carry — the refusal every operation that can
+/// reach that state shares, whether it is the POLICY that names a column the table does
+/// not expose or the COLUMN LIST that stops exposing one the stored policy names.
+///
+/// The sentence states the unsatisfied constraint and the remedy, and its single variable
+/// part is the list of referenced-but-not-allowed column names
+/// ([`analysis_rule_columns_outside_allowed`]), rendered bracketed and comma separated.
+/// Nothing else is interpolated: neither the configured table addressed nor the analysis
+/// rule type is part of the diagnosis, because the constraint is between a rule's columns
+/// and a column list, not about one resource.
+pub fn analysis_rule_columns_outside_allowed_message(columns: &[String]) -> String {
+    format!(
+        "The following columns in the analysis rule aren't present in the allowed columns \
+         list: [{}]. To be used in the analysis rule, columns must be specified as allowed \
+         columns.",
+        columns.join(", ")
+    )
+}
+
 /// Every column name a configured table's analysis rule policy references, member by
 /// member of the policy union the rule carries.
 ///
