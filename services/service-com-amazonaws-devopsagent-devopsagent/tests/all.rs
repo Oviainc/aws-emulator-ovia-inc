@@ -41,5 +41,7 @@ mod recommendation_reads;
 mod state_roundtrip;
 #[path = "all/trigger_refusal_arms.rs"]
 mod trigger_refusal_arms;
+#[path = "all/trigger_refusal_wire_envelope.rs"]
+mod trigger_refusal_wire_envelope;
 #[path = "all/triggers.rs"]
 mod triggers;

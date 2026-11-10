@@ -37,18 +37,23 @@ use smithy_server_runtime::MultiServiceRouter;
 /// A SigV4 credential scope naming this service's signing name (`aidevops`), which is
 /// how the router resolves which service claims a request. Signature verification is
 /// switched off for these tests, so the signature is a placeholder.
-const AUTHORIZATION: &str = concat!(
+///
+/// `pub(crate)` here and below: this suite is the one home of the Trigger plane's
+/// fixtures, which the wire-envelope suite beside it
+/// (`tests/all/trigger_refusal_wire_envelope.rs`) reads rather than restates, so neither
+/// the pinned texts nor the tables can drift between the two.
+pub(crate) const AUTHORIZATION: &str = concat!(
     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-west-2/aidevops/aws4_request, ",
     "SignedHeaders=host, Signature=0123456789abcdef"
 );
 
 /// The form a goal identifier takes, as the refusal states it. Written out here
 /// rather than read from the service so the test pins the text itself.
-const GOAL_ID_PATTERN: &str =
+pub(crate) const GOAL_ID_PATTERN: &str =
     "^goal-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
 
 /// The JSON pointer the refusal names the validated member by.
-const GOAL_ID_PATH: &str = "/goalId";
+pub(crate) const GOAL_ID_PATH: &str = "/goalId";
 
 /// The hexadecimal digits each dash-separated group of a UUID carries, which is what
 /// [`GOAL_ID_PATTERN`] states after the prefix.
@@ -60,7 +65,10 @@ const AGENT_SPACE_ID_MIN_LEN: usize = 1;
 const AGENT_SPACE_ID_MAX_LEN: usize = 64;
 
 /// One emulator: a single shared engine behind the production router.
-fn new_router() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the wire-envelope suite beside this one
+/// (`tests/all/trigger_refusal_wire_envelope.rs`) stands the emulator up exactly one way.
+pub(crate) fn new_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -148,8 +156,9 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
     }
 }
 
-/// Create an agent space and return its minted id.
-async fn create_space(router: &MultiServiceRouter, name: &str) -> String {
+/// Create an agent space and return its minted id. Shared with the wire-envelope suite, so
+/// a fixture space is created exactly one way across this crate.
+pub(crate) async fn create_space(router: &MultiServiceRouter, name: &str) -> String {
     let answer = call(router, "POST", "/v1/agentspaces", Some(json!({"name": name}))).await;
     assert_eq!(
         answer.status, 201,
@@ -193,8 +202,9 @@ async fn get_trigger(router: &MultiServiceRouter, space: &str, trigger_id: &str)
     .await
 }
 
-/// Create one Trigger in `space` and return its minted identifier.
-async fn minted_trigger_id(router: &MultiServiceRouter, space: &str) -> String {
+/// Create one Trigger in `space` and return its minted identifier. Shared with the
+/// wire-envelope suite, so a fixture Trigger is created exactly one way across this crate.
+pub(crate) async fn minted_trigger_id(router: &MultiServiceRouter, space: &str) -> String {
     let answer = create_trigger(router, space).await;
     assert_eq!(
         answer.status, 201,
@@ -225,7 +235,7 @@ fn is_goal_shaped(value: &str) -> bool {
 
 /// The refusal a value that is not a goal identifier gets: one sentence, the validated
 /// member as a JSON pointer, and the pattern it must satisfy.
-fn identifier_refusal() -> String {
+pub(crate) fn identifier_refusal() -> String {
     format!(
         "1 validation error detected. Value at '{GOAL_ID_PATH}' failed to satisfy constraint: \
          Member must satisfy regular expression pattern: {GOAL_ID_PATTERN}"
@@ -236,10 +246,11 @@ fn identifier_refusal() -> String {
 /// validator passes them and this service's own guard is what refuses them — and are
 /// not goal identifiers. The rows differ in prefix, separator, character class, group
 /// count and group length, including each UUID group one digit short and one long.
-fn malformed_identifiers() -> Vec<String> {
+pub(crate) fn malformed_identifiers() -> Vec<String> {
     let mut rows = vec![
         // No prefix, a wrong prefix, the prefix alone, the prefix in the wrong case and
         // joined by the wrong separator, and the prefix not at the start.
+        "not-a-trigger".to_string(),
         "00000000-0000-0000-0000-000000000000".to_string(),
         "trigger-00000000-0000-0000-0000-000000000000".to_string(),
         "goal".to_string(),
@@ -252,6 +263,7 @@ fn malformed_identifiers() -> Vec<String> {
         // its separators dropped, by a non-hexadecimal digit, and by too few or too
         // many groups.
         "goal-anything".to_string(),
+        "goal-not-a-uuid".to_string(),
         "goal-0000000000009999".to_string(),
         "goal-000000000000000000000000000000000000".to_string(),
         "goal-0000000z-0000-0000-0000-000000000000".to_string(),
@@ -277,7 +289,7 @@ fn malformed_identifiers() -> Vec<String> {
 
 /// Goal identifiers that name no stored Trigger: the all-zero and all-`f` UUIDs, a
 /// mixed-case one, and an upper-case one — the pattern admits either case.
-fn absent_goal_identifiers() -> Vec<String> {
+pub(crate) fn absent_goal_identifiers() -> Vec<String> {
     vec![
         "goal-00000000-0000-0000-0000-000000000000".to_string(),
         "goal-ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
@@ -290,7 +302,7 @@ fn absent_goal_identifiers() -> Vec<String> {
 /// AgentSpace: the shortest admissible one, a digit-only one, one in the form this
 /// service mints, a mixed-case hyphenated one, an all-hyphen one, and one at the
 /// pattern's maximum length.
-fn absent_agent_space_ids() -> Vec<String> {
+pub(crate) fn absent_agent_space_ids() -> Vec<String> {
     vec![
         "a".repeat(AGENT_SPACE_ID_MIN_LEN),
         "7".to_string(),
