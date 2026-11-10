@@ -47,8 +47,12 @@ mod delete_experiment_definition;
 mod delete_extension_association;
 #[path = "all/delete_hosted_configuration_version.rs"]
 mod delete_hosted_configuration_version;
+#[path = "all/deployment_event_notifications_to_sqs.rs"]
+mod deployment_event_notifications_to_sqs;
 #[path = "all/deployment_not_found_message.rs"]
 mod deployment_not_found_message;
+#[path = "all/deployment_settles_on_its_own.rs"]
+mod deployment_settles_on_its_own;
 #[path = "all/deployment_strategy_patch_paces_deployments.rs"]
 mod deployment_strategy_patch_paces_deployments;
 #[path = "all/deployment_wire_fidelity.rs"]

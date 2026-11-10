@@ -250,6 +250,52 @@ pub(crate) fn lambda_request_id_clause(request_id: &str) -> String {
     format!(", Lambda Request ID: {request_id}")
 }
 
+/// Where an action of an AWS-authored extension delivers the event it produces.
+///
+/// An extension an account creates names its own target on the action (`Uri`), but an
+/// AWS-authored extension publishes no URI: AppConfig itself knows what its own extensions
+/// do, and where a deployment-event notification extension sends one is the ARN the
+/// ASSOCIATION that bound it supplies for that extension's published parameter. This is
+/// that reading, one variant per published behaviour, carried on each row of the catalogue
+/// (`super::AWS_AUTHORED_EXTENSIONS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthoredDestination {
+    /// Nothing is delivered anywhere: the extension's published work happens inside
+    /// AppConfig, on the configuration document a call is writing or serving.
+    Internal,
+    /// The ARN the association supplies for this parameter of the extension — the queue or
+    /// the topic a deployment-event notification is sent to. An association that supplied
+    /// no value for it names no destination, and nothing is sent.
+    Parameter(&'static str),
+    /// The account's default Amazon EventBridge event bus, which the EventBridge
+    /// notification extension publishes to: its published sentence names that bus, so an
+    /// association supplies no parameter for it.
+    DefaultEventBus,
+}
+
+/// The name of the event bus every account has without creating one, which
+/// [`AuthoredDestination::DefaultEventBus`] addresses.
+const DEFAULT_EVENT_BUS_NAME: &str = "default";
+
+impl AuthoredDestination {
+    /// The ARN this destination names for an association supplying `parameters`, in
+    /// `region`; `None` when it names none, in which case the action delivers nothing.
+    pub fn target(self, parameters: &HashMap<String, String>, region: &str) -> Option<String> {
+        match self {
+            Self::Internal => None,
+            Self::Parameter(name) => parameters
+                .get(name)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            Self::DefaultEventBus => Some(::engine::emulator_arn(
+                EVENTS_ARN_NAMESPACE,
+                region,
+                &format!("{EVENT_BUS_RESOURCE_TYPE}/{DEFAULT_EVENT_BUS_NAME}"),
+            )),
+        }
+    }
+}
+
 /// The actions bound at `action_point` by the extensions associated to `scope`, in
 /// association-id order so two calls invoke them in the same order.
 ///
@@ -295,12 +341,21 @@ pub fn targets_at(
             continue;
         };
         for action in actions {
-            // An action with no `Uri` names no target: AppConfig's own AWS-authored
-            // extensions are published without one, and there is nothing to invoke.
+            // An action an account created names its own target. An AWS-authored
+            // extension publishes no `Uri`, and what stands in its place is the
+            // destination the catalogue publishes for that extension, resolved against
+            // the values THIS association supplied: an association of the queue or topic
+            // notification extension names the queue or the topic its parameter carries.
+            // An action that resolves to no destination at all reaches nothing and is not
+            // invoked.
             let Some(uri) = action
                 .uri
                 .clone()
                 .filter(|uri| !uri.trim().is_empty())
+                .or_else(|| {
+                    super::aws_authored_extension_named(&extension_id)
+                        .and_then(|authored| authored.destination.target(&parameters, region))
+                })
             else {
                 continue;
             };
@@ -1022,6 +1077,14 @@ fn deployment_event(
             "DeploymentNumber",
             Value::from(deployment.deployment_number),
         )
+        // The configuration version this deployment is rolling out, as the string the
+        // `ConfigurationVersion` member of the deployment carries: a notification of a
+        // deployment's lifecycle names the version the deployment is about, whether or not
+        // this service holds the bytes of it.
+        .member(
+            "ConfigurationVersion",
+            Value::from(deployment.configuration_version.as_str()),
+        )
         .member(
             "PreviousDeploymentNumber",
             Value::from(previous_deployment_number(
@@ -1441,7 +1504,7 @@ mod tests {
                 10,
                 0,
                 Some("the canary alarm fired".to_string()),
-                Duration::from_secs(60),
+                Duration::from_secs(1),
                 true,
                 super::super::DEPLOYMENT_ROLLING_BACK,
             ),
@@ -1450,7 +1513,7 @@ mod tests {
                 10,
                 0,
                 None,
-                Duration::from_secs(60),
+                Duration::from_secs(1),
                 true,
                 super::super::DEPLOYMENT_ROLLING_BACK,
             ),
@@ -1459,7 +1522,7 @@ mod tests {
                 1,
                 10,
                 None,
-                Duration::from_secs(90),
+                super::super::STAGE_DURATION + Duration::from_secs(1),
                 true,
                 super::super::DEPLOYMENT_ROLLING_BACK,
             ),
@@ -1551,5 +1614,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An AWS-authored extension's action delivers to the destination the catalogue
+    /// publishes for it, resolved against the values the association supplied — and to
+    /// nowhere at all for an extension whose work happens inside AppConfig or an
+    /// association that named no destination.
+    ///
+    /// The rows span every row of the catalogue (`super::super::AWS_AUTHORED_EXTENSIONS`)
+    /// rather than the one the report cited, and, for a row whose destination is a
+    /// parameter, every shape of value an association can have supplied for it.
+    #[test]
+    fn an_authored_extensions_destination_is_the_one_its_association_names() {
+        let region = "eu-west-2";
+        let queue = "arn:aws:sqs:eu-west-2:123456789012:lifecycle-events";
+        let topic = "arn:aws:sns:eu-west-2:123456789012:lifecycle-events";
+        let default_bus = ::engine::emulator_arn(EVENTS_ARN_NAMESPACE, region, "event-bus/default");
+        // Every published parameter value an association could carry, so one row can be
+        // resolved against values meant for another extension as well as its own.
+        let supplied: HashMap<String, String> = HashMap::from([
+            ("queueArn".to_string(), queue.to_string()),
+            ("topicArn".to_string(), topic.to_string()),
+        ]);
+        // The destination each catalogue row publishes, keyed by the published id: the
+        // queue or the topic the association named, the default bus for the extension
+        // whose own sentence names it, and nowhere for a row that delivers nothing.
+        let published = |id: &str| -> Option<String> {
+            match id {
+                "AWS.AppConfig.DeploymentEventsToSqs" => Some(queue.to_string()),
+                "AWS.AppConfig.DeploymentEventsToSns" => Some(topic.to_string()),
+                "AWS.AppConfig.DeploymentNotificationsToEventBridge" => Some(default_bus.clone()),
+                _ => None,
+            }
+        };
+        for authored in super::super::AWS_AUTHORED_EXTENSIONS {
+            let actual = authored.destination.target(&supplied, region);
+            let wanted = published(authored.id);
+            assert_eq!(
+                actual, wanted,
+                "case {:?}: expected the destination {wanted:?}, got {actual:?}",
+                authored.id
+            );
+        }
+
+        // An association that supplied nothing usable for the parameter its extension
+        // publishes names no destination, so the action delivers nothing. The rows differ
+        // along the shape of what was supplied.
+        let unusable: Vec<(&str, HashMap<String, String>)> = vec![
+            ("no parameter at all", HashMap::new()),
+            (
+                "another extension's parameter",
+                HashMap::from([("topicArn".to_string(), topic.to_string())]),
+            ),
+            (
+                "an empty value",
+                HashMap::from([("queueArn".to_string(), String::new())]),
+            ),
+            (
+                "a value that is only whitespace",
+                HashMap::from([("queueArn".to_string(), "  ".to_string())]),
+            ),
+        ];
+        let sqs_extension = super::super::aws_authored_extension_named(
+            "AWS.AppConfig.DeploymentEventsToSqs",
+        )
+        .unwrap_or_else(|| panic!("the catalogue publishes the Amazon SQS notification extension"));
+        for (case, parameters) in &unusable {
+            let actual = sqs_extension.destination.target(parameters, region);
+            assert_eq!(
+                actual, None,
+                "case {case:?}: expected no destination, got {actual:?}"
+            );
+        }
+        // A value a caller DID supply is the destination, whatever ARN it names: the
+        // parameter is read, never matched against a shape of its own.
+        let elsewhere = HashMap::from([(
+            "queueArn".to_string(),
+            "arn:aws:sqs:us-west-2:210987654321:other".to_string(),
+        )]);
+        let actual = sqs_extension.destination.target(&elsewhere, region);
+        assert_eq!(
+            actual.as_deref(),
+            Some("arn:aws:sqs:us-west-2:210987654321:other"),
+            "case \"a queue in another Region\": expected the supplied ARN, got {actual:?}"
+        );
     }
 }

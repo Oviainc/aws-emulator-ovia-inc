@@ -639,13 +639,15 @@ fn a_deployment_without_its_environment_is_owed_nothing_by_the_clock_and_rolls_b
 
     // Rows differ along the pacing of the deployment the delete arrives in the middle of —
     // both published bounds of `MinutesBetween0And24Hours` and both `GrowthType` values —
-    // and along how far into the deployment the environment is deleted.
+    // and along how far into the deployment the environment is deleted. Each row's instant
+    // is inside the stage its strategy declares, which this service paces as one short span
+    // per declared stage (`state::stage_duration`).
     let rows: [(&str, i32, &str, f32, i32, u64); 5] = [
-        ("deleted a minute into the longest rollout", 1440, state::GROWTH_LINEAR, 100.0, 0, 60),
+        ("deleted a second into the longest rollout", 1440, state::GROWTH_LINEAR, 100.0, 0, 1),
         ("deleted at the instant it started", 60, state::GROWTH_EXPONENTIAL, 1.0, 10, 0),
-        ("deleted while baking", 0, state::GROWTH_LINEAR, 100.0, 1440, 60),
-        ("deleted mid-rollout with the longest bake", 1440, state::GROWTH_LINEAR, 50.0, 1440, 3600),
-        ("deleted a second before a short rollout ends", 5, state::GROWTH_LINEAR, 10.0, 0, 299),
+        ("deleted while baking", 0, state::GROWTH_LINEAR, 100.0, 1440, 1),
+        ("deleted mid-rollout with the longest bake", 1440, state::GROWTH_LINEAR, 50.0, 1440, 2),
+        ("deleted a second before a short rollout ends", 5, state::GROWTH_LINEAR, 10.0, 0, 2),
     ];
 
     for (case, duration, growth_type, growth_factor, bake, elapsed_secs) in rows {

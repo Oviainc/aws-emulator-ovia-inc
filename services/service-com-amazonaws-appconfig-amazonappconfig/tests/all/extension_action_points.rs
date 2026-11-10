@@ -41,7 +41,7 @@ const REGION: &str = "us-east-1";
 
 /// AppConfig, SQS and Lambda on ONE engine: an extension action's target lives in another
 /// service, and the invocation is asserted there.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -59,7 +59,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// One `awsJson1_0` RPC against the Amazon SQS emulator; the credential scope is what
 /// routes it.
-async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let credential = format!(
         "AKIDTESTTESTTEST/20260101/{REGION}/sqs/aws4_request, SignedHeaders=host, Signature=0000"
     );
@@ -96,7 +96,7 @@ async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Valu
 }
 
 /// A queue to observe invocations on; answers `(url, arn)`.
-async fn given_queue(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let created = sqs(router, "CreateQueue", &json!({ "QueueName": name })).await;
     let url = created["QueueUrl"]
         .as_str()
@@ -116,7 +116,7 @@ async fn given_queue(router: &MultiServiceRouter, name: &str) -> (String, String
 }
 
 /// Every event waiting on the queue, parsed, oldest first.
-async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
+pub(crate) async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
     let received = sqs(
         router,
         "ReceiveMessage",
@@ -186,7 +186,7 @@ async fn given_extension(
 
 /// Associate `extension` to `resource_arn`, supplying `parameters`. Answers the
 /// association's id.
-async fn associate(
+pub(crate) async fn associate(
     router: &MultiServiceRouter,
     case: &str,
     extension: &str,
@@ -214,7 +214,7 @@ async fn associate(
 }
 
 /// Write a hosted configuration version holding `content` of `content_type`.
-async fn create_version(
+pub(crate) async fn create_version(
     router: &MultiServiceRouter,
     application: &str,
     profile: &str,
@@ -262,7 +262,7 @@ async fn stored_bytes(
 
 /// A deployment strategy of this account's own, so a suite can pick the pacing it needs
 /// rather than the bake time a predefined strategy carries. Answers its id.
-async fn given_strategy(
+pub(crate) async fn given_strategy(
     router: &MultiServiceRouter,
     name: &str,
     duration_in_minutes: i32,
@@ -295,7 +295,7 @@ async fn given_strategy(
 }
 
 /// `StartDeployment`.
-async fn start_deployment(
+pub(crate) async fn start_deployment(
     router: &MultiServiceRouter,
     application: &str,
     environment: &str,
@@ -311,7 +311,7 @@ async fn start_deployment(
 }
 
 /// `GetDeployment`.
-async fn get_deployment(
+pub(crate) async fn get_deployment(
     router: &MultiServiceRouter,
     application: &str,
     environment: &str,

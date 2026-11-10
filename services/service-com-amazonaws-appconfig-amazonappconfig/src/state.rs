@@ -1004,6 +1004,37 @@ pub const REVERT_WINDOW: Duration = Duration::from_secs(REVERT_WINDOW_HOURS * 60
 /// ([`Deployment::stop`]).
 const ROLLBACK_DURATION: Duration = Duration::from_millis(500);
 
+/// How long one stage of a deployment takes here, when the strategy pacing it declares a
+/// non-zero window for that stage.
+///
+/// The EMULATOR's span, not a documented one. AppConfig paces a real rollout over the
+/// strategy's `DeploymentDurationInMinutes` and then monitors the result for its
+/// `FinalBakeTimeInMinutes`, which are minutes to hours of wall clock; the progression
+/// through them is owed by the CLOCK rather than by anybody calling, so each stage a
+/// strategy declares a non-zero window for falls due this one short span after the stage
+/// began instead. A caller reading the deployment straight after starting it still sees it
+/// rolling out — and, where the strategy bakes, baking — and the deployment reaches
+/// `COMPLETE` on its own without a caller waiting out the declared minutes. The declared
+/// minutes are a property of the strategy and are reported back unchanged: they pace a
+/// stage, they are not a value this record derives anything it reports from.
+///
+/// A stage the strategy declares NO window for is not paced by this and takes no time at
+/// all: see [`stage_duration`].
+pub const STAGE_DURATION: Duration = Duration::from_secs(3);
+
+/// The span a deployment stage whose strategy declares `minutes` for it takes.
+///
+/// Zero for a stage the strategy skips — a rollout window of 0 minutes reaches every
+/// target at the instant the deployment starts, and a final bake time of 0 minutes
+/// monitors nothing — and [`STAGE_DURATION`] for one it declares any window at all for.
+pub fn stage_duration(minutes: i32) -> Duration {
+    if minutes > 0 {
+        STAGE_DURATION
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// The percentage of targets a finished rollout has reached, and the ceiling every growth
 /// step is capped at: the maximum of the model's `Percentage` shape (`range 1..100`).
 const FULL_PERCENTAGE: f32 = 100.0;
@@ -2061,6 +2092,12 @@ pub struct AwsAuthoredExtension {
     /// The parameters the extension declares, which the `CreateExtensionAssociation`
     /// call that associates it supplies values for.
     pub parameters: &'static [AwsAuthoredParameter],
+    /// Where an action of this extension delivers the event it produces. An authored
+    /// extension publishes no `Uri` of its own, so this is what stands in its place:
+    /// AppConfig itself knows what each of its extensions does, and for a notification
+    /// extension the destination is the one the association that bound it names. See
+    /// [`extension_actions::AuthoredDestination`].
+    pub destination: extension_actions::AuthoredDestination,
 }
 
 /// One parameter an [`AwsAuthoredExtension`] declares: the published name a caller fills
@@ -2121,7 +2158,9 @@ const DEPLOYMENT_EVENT_ACTION_POINTS: &[&str] = &[
 /// row's `action_points`, which are read off what the extension's own description says it
 /// does (see each row's comment) because the catalogue listing does not report an
 /// extension's actions at all. Each is a value a reader of this catalogue should treat as
-/// this emulator's best reading, not as a recorded fact.
+/// this emulator's best reading, not as a recorded fact. Each row's `destination` is read
+/// off the same description: it is where that extension's own published sentence says it
+/// sends what it produces.
 pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
     AwsAuthoredExtension {
         id: FEATURE_FLAGS_EXTENSION_ID,
@@ -2137,6 +2176,9 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
         // point of its own: it is how a flag document is SERVED.
         action_points: &["PRE_CREATE_HOSTED_CONFIGURATION_VERSION"],
         parameters: &[],
+        // The helper checks and transforms the document in place: nothing is delivered
+        // outside AppConfig.
+        destination: extension_actions::AuthoredDestination::Internal,
     },
     AwsAuthoredExtension {
         id: "AWS.AppConfig.JiraIntegration",
@@ -2147,6 +2189,9 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
         // workflow a configuration document passes through before it is deployed.
         action_points: &["PRE_CREATE_HOSTED_CONFIGURATION_VERSION"],
         parameters: &[],
+        // Jira is not a resource this emulator serves and the association names no
+        // destination for it, so there is nowhere an invocation could be sent.
+        destination: extension_actions::AuthoredDestination::Internal,
     },
     AwsAuthoredExtension {
         id: "AWS.Evidently.ProjectImporter",
@@ -2156,6 +2201,8 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
         // point carries its work.
         action_points: &["PRE_CREATE_HOSTED_CONFIGURATION_VERSION"],
         parameters: &[],
+        // The import writes a configuration version; it delivers nothing anywhere.
+        destination: extension_actions::AuthoredDestination::Internal,
     },
     AwsAuthoredExtension {
         id: "AWS.AppConfig.DeploymentNotificationsToEventBridge",
@@ -2165,6 +2212,7 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
         ),
         action_points: DEPLOYMENT_EVENT_ACTION_POINTS,
         parameters: &[],
+        destination: extension_actions::AuthoredDestination::DefaultEventBus,
     },
     AwsAuthoredExtension {
         id: "AWS.AppConfig.DeploymentEventsToSns",
@@ -2176,6 +2224,7 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
             description: "The ARN of the Amazon SNS topic deployment events are published to",
             required: true,
         }],
+        destination: extension_actions::AuthoredDestination::Parameter("topicArn"),
     },
     AwsAuthoredExtension {
         id: "AWS.AppConfig.DeploymentEventsToSqs",
@@ -2187,6 +2236,7 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
             description: "The ARN of the Amazon SQS queue deployment events are sent to",
             required: true,
         }],
+        destination: extension_actions::AuthoredDestination::Parameter("queueArn"),
     },
 ];
 
@@ -2691,20 +2741,22 @@ impl Deployment {
         }
     }
 
-    /// How long the rollout itself lasts: the strategy's deployment duration.
+    /// How long the rollout itself lasts: one stage span for a strategy that declares a
+    /// rollout window ([`stage_duration`]).
     ///
     /// Not floored: a strategy declaring a duration of 0 minutes (`AppConfig.AllAtOnce`,
     /// or any created strategy with `DeploymentDurationInMinutes` 0) reaches every target
     /// at the instant the deployment starts, which is what AppConfig answers for one —
     /// with no bake time to follow, `StartDeployment` reports it `COMPLETE`.
     fn rollout_duration(&self) -> Duration {
-        Duration::from_secs(60 * self.deployment_duration_in_minutes.max(0) as u64)
+        stage_duration(self.deployment_duration_in_minutes)
     }
 
     /// How long AppConfig monitors the deployment after the rollout before completing
-    /// it: the strategy's final bake time.
+    /// it: one stage span for a strategy that declares a final bake time
+    /// ([`stage_duration`]), and no time at all for one that declares none.
     fn bake_duration(&self) -> Duration {
-        Duration::from_secs(60 * self.final_bake_time_in_minutes.max(0) as u64)
+        stage_duration(self.final_bake_time_in_minutes)
     }
 
     /// The instant the rollout finishes and the final bake begins.

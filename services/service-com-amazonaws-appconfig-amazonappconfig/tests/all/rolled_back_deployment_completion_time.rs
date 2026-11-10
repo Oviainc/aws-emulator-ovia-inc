@@ -207,12 +207,14 @@ fn neither_rollback_path_records_a_completion() {
     let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
     // Rows differ along the pacing of the deployment being aborted and along how far into
-    // it the abort arrives, including at the instant it started.
+    // it the abort arrives, including at the instant it started. Each row's instant is
+    // inside the stage its strategy declares, which this service paces as one short span
+    // per declared stage (`state::stage_duration`).
     let rows: [(&str, i32, &str, f32, i32, u64); 4] = [
-        ("a minute into the longest rollout", 1440, state::GROWTH_LINEAR, 100.0, 0, 60),
+        ("a second into the longest rollout", 1440, state::GROWTH_LINEAR, 100.0, 0, 1),
         ("at the instant it started", 60, state::GROWTH_EXPONENTIAL, 1.0, 10, 0),
-        ("while baking", 0, state::GROWTH_LINEAR, 100.0, 1440, 60),
-        ("a second before a short rollout ends", 5, state::GROWTH_LINEAR, 10.0, 0, 299),
+        ("while baking", 0, state::GROWTH_LINEAR, 100.0, 1440, 1),
+        ("a second before a short rollout ends", 5, state::GROWTH_LINEAR, 10.0, 0, 2),
     ];
 
     for (case, duration, growth_type, growth_factor, bake, elapsed_secs) in rows {

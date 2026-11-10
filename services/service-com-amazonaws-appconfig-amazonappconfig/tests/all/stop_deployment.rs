@@ -617,12 +617,14 @@ fn a_stop_settles_the_rollback_it_performs() {
     // Rows differ along the pacing of the deployment stopped — both published bounds of
     // `MinutesBetween0And24Hours` (range 0..1440) and both `GrowthType` values — and along
     // how far into the deployment the stop arrives, including at the instant it started.
+    // Each row's instant is inside the stage its strategy declares, which this service
+    // paces as one short span per declared stage (`state::stage_duration`).
     let rows: [(&str, i32, &str, f32, i32, u64); 5] = [
-        ("stopped a minute into the longest rollout", 1440, state::GROWTH_LINEAR, 100.0, 0, 60),
+        ("stopped a second into the longest rollout", 1440, state::GROWTH_LINEAR, 100.0, 0, 1),
         ("stopped at the instant it started", 60, state::GROWTH_EXPONENTIAL, 1.0, 10, 0),
-        ("stopped while baking", 0, state::GROWTH_LINEAR, 100.0, 1440, 60),
-        ("stopped mid-rollout with the longest bake", 1440, state::GROWTH_LINEAR, 50.0, 1440, 3600),
-        ("stopped a second before a short rollout ends", 5, state::GROWTH_LINEAR, 10.0, 0, 299),
+        ("stopped while baking", 0, state::GROWTH_LINEAR, 100.0, 1440, 1),
+        ("stopped mid-rollout with the longest bake", 1440, state::GROWTH_LINEAR, 50.0, 1440, 2),
+        ("stopped a second before a short rollout ends", 5, state::GROWTH_LINEAR, 10.0, 0, 2),
     ];
 
     for (case, duration, growth_type, growth_factor, bake, elapsed_secs) in rows {
@@ -737,11 +739,11 @@ fn the_clock_finishes_the_rollback_appconfig_starts() {
     // The same span of pacings and stop instants as the suite above: what differs is WHO
     // started the rollback, not the deployment it aborts.
     let rows: [(&str, i32, &str, f32, i32, u64); 5] = [
-        ("aborted a minute into the longest rollout", 1440, state::GROWTH_LINEAR, 100.0, 0, 60),
+        ("aborted a second into the longest rollout", 1440, state::GROWTH_LINEAR, 100.0, 0, 1),
         ("aborted at the instant it started", 60, state::GROWTH_EXPONENTIAL, 1.0, 10, 0),
-        ("aborted while baking", 0, state::GROWTH_LINEAR, 100.0, 1440, 60),
-        ("aborted mid-rollout with the longest bake", 1440, state::GROWTH_LINEAR, 50.0, 1440, 3600),
-        ("aborted a second before a short rollout ends", 5, state::GROWTH_LINEAR, 10.0, 0, 299),
+        ("aborted while baking", 0, state::GROWTH_LINEAR, 100.0, 1440, 1),
+        ("aborted mid-rollout with the longest bake", 1440, state::GROWTH_LINEAR, 50.0, 1440, 2),
+        ("aborted a second before a short rollout ends", 5, state::GROWTH_LINEAR, 10.0, 0, 2),
     ];
 
     for (case, duration, growth_type, growth_factor, bake, elapsed_secs) in rows {
