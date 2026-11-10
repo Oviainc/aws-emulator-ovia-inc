@@ -40,31 +40,31 @@ const REGION: &str = "us-east-1";
 /// The access-key id standing for the account's own published credential: neither STS nor
 /// IAM holds a record for it, so it resolves to the account's ambient identity, which holds
 /// no IAM policies and is allowed — the position AWS account root credentials are in.
-const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
+pub(crate) const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
 
 /// One response, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_code: Option<String>,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 /// A principal a call is signed as: the access key id it presents, and the ARN a refusal
 /// must blame it by — what `sts:GetCallerIdentity` reports for that key.
-struct Principal {
-    access_key_id: String,
-    arn: String,
+pub(crate) struct Principal {
+    pub(crate) access_key_id: String,
+    pub(crate) arn: String,
 }
 
 /// The emulator these tests drive: one shared engine carrying this service beside the IAM
 /// and STS services the principals and their policies are made with.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -85,7 +85,7 @@ impl Emulator {
     }
 
     /// One call to this service, with `access_key_id` in the SigV4 credential scope.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         access_key_id: &str,
         method: &str,
@@ -170,7 +170,7 @@ impl Emulator {
 
     /// Create an IAM user carrying `policy` as its inline policy (when one is given), mint a
     /// long-term access key for it, and answer that key id with the user's own ARN.
-    async fn user(&self, user_name: &str, policy: Option<&str>) -> Principal {
+    pub(crate) async fn user(&self, user_name: &str, policy: Option<&str>) -> Principal {
         let created = self
             .query(
                 "iam",
@@ -211,7 +211,7 @@ impl Emulator {
 
     /// Create an IAM role carrying `policy` as its inline policy (when one is given), assume
     /// it through STS, and answer the session's access key id with the session ARN.
-    async fn assumed_role(&self, role_name: &str, policy: Option<&str>) -> Principal {
+    pub(crate) async fn assumed_role(&self, role_name: &str, policy: Option<&str>) -> Principal {
         let trust = format!(
             "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
              \"Principal\":{{\"AWS\":\"arn:aws:iam::{}:root\"}},\
@@ -267,7 +267,12 @@ impl Emulator {
     }
 
     /// Attach a customer-managed policy carrying `document` to the role `role_name`.
-    async fn attach_role_policy(&self, role_name: &str, policy_name: &str, document: &str) {
+    pub(crate) async fn attach_role_policy(
+        &self,
+        role_name: &str,
+        policy_name: &str,
+        document: &str,
+    ) {
         let created = self
             .query(
                 "iam",
@@ -379,7 +384,7 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 }
 
 /// A policy document allowing `action` on `resource`.
-fn allow(action: &str, resource: &str) -> String {
+pub(crate) fn allow(action: &str, resource: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}]}}"
@@ -388,7 +393,7 @@ fn allow(action: &str, resource: &str) -> String {
 
 /// A policy document allowing every action of this service on everything, and explicitly
 /// denying `denied`.
-fn allow_all_but(denied: &str) -> String {
+pub(crate) fn allow_all_but(denied: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[\
          {{\"Effect\":\"Allow\",\"Action\":\"entityresolution:*\",\"Resource\":\"*\"}},\
@@ -397,12 +402,12 @@ fn allow_all_but(denied: &str) -> String {
 }
 
 /// The IAM action an operation of this service is performed under.
-fn action_of(operation: &str) -> String {
+pub(crate) fn action_of(operation: &str) -> String {
     format!("entityresolution:{operation}")
 }
 
 /// The ARN of one resource of this service, as its create mints it.
-fn resource_arn(resource_type: &str, name: &str) -> String {
+pub(crate) fn resource_arn(resource_type: &str, name: &str) -> String {
     format!(
         "arn:aws:entityresolution:{REGION}:{}:{resource_type}/{name}",
         ::engine::emulator_account_id()
@@ -410,7 +415,7 @@ fn resource_arn(resource_type: &str, name: &str) -> String {
 }
 
 /// The refusal AWS words an identity-based decision with when no policy allows the action.
-fn no_policy_allows(principal: &str, action: &str, resource: &str) -> String {
+pub(crate) fn no_policy_allows(principal: &str, action: &str, resource: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
          because no identity-based policy allows the {action} action"
@@ -418,7 +423,7 @@ fn no_policy_allows(principal: &str, action: &str, resource: &str) -> String {
 }
 
 /// The refusal AWS words an identity-based decision with when a policy explicitly denies it.
-fn explicit_deny(principal: &str, action: &str, resource: &str) -> String {
+pub(crate) fn explicit_deny(principal: &str, action: &str, resource: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
          with an explicit deny in an identity-based policy"
@@ -532,7 +537,7 @@ fn operation_cases() -> Vec<OperationCase> {
 }
 
 /// Assert `reply` is the modelled authorization refusal carrying `message`.
-fn assert_denied(case: &str, reply: &Reply, message: &str) {
+pub(crate) fn assert_denied(case: &str, reply: &Reply, message: &str) {
     assert_eq!(
         reply.status, 403,
         "case {case:?}: expected HTTP 403, got {reply:?}"

@@ -974,7 +974,10 @@ fn probe_the_engine_starts(view: &Arc<Mutex<ServerView>>) -> Result<(), EngineEr
 /// The ONE reading of a statement's budget: a statement the engine runs, the row query that
 /// identifies the rows it locks and the wait for a row another transaction holds are bounded
 /// by the same instant, so nothing a session asks for outlives the budget that session's
-/// statement has.
+/// statement has. It is also the one place the session's own number is read, so the instant
+/// is computed with a CHECKED addition: a timeout no clock can represent leaves this
+/// endpoint's own budget in force instead of failing the thread that is running the
+/// statement.
 pub fn statement_deadline(view: &ServerView) -> (Instant, bool) {
     let endpoint_deadline = Instant::now() + STATEMENT_DEADLINE;
     // `statement_timeout` is a value the SESSION sets over the wire, and
@@ -1504,5 +1507,71 @@ fn confine_to_the_instance(context: AuthContext<'_>) -> Authorization {
         // Everything that could reach outside this instance's own database, and everything
         // this emulator has not considered.
         _ => Authorization::Deny,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session view asking for `statement_timeout_ms` and nothing else.
+    fn asking_for(statement_timeout_ms: u64) -> ServerView {
+        ServerView {
+            statement_timeout_ms,
+            ..ServerView::default()
+        }
+    }
+
+    /// RULE: the statement's deadline is the session's `statement_timeout` where that is
+    /// shorter than this endpoint's own budget, and the endpoint's budget otherwise — for
+    /// EVERY number a session can put on the wire, the ones no clock can represent included.
+    #[test]
+    fn a_statement_deadline_is_never_past_the_endpoint_budget_whatever_the_session_asks() {
+        // (case, the session's statement_timeout_ms, whether the session's own value decides)
+        let rows: &[(&str, u64, bool)] = &[
+            ("no timeout at all, so the endpoint's budget decides", 0, false),
+            ("one millisecond, far inside the endpoint's budget", 1, true),
+            (
+                "a value comfortably inside the endpoint's budget",
+                STATEMENT_DEADLINE.as_millis() as u64 / 2,
+                true,
+            ),
+            (
+                "a value past the endpoint's budget",
+                STATEMENT_DEADLINE.as_millis() as u64 * 10,
+                false,
+            ),
+            (
+                // PostgreSQL's own ceiling for this parameter: `statement_timeout` is an
+                // integer number of milliseconds, so this is the largest value a session
+                // can set ("statement_timeout (integer)", client-connection defaults).
+                "the largest value the parameter admits",
+                2_147_483_647,
+                false,
+            ),
+            (
+                "a value past what the parameter admits",
+                2_147_483_648,
+                false,
+            ),
+            ("the largest number the wire can carry", u64::MAX, false),
+        ];
+        for (case, asked, session_decides) in rows {
+            let (deadline, timeout_first) = statement_deadline(&asking_for(*asked));
+            // Read AFTER the call, so the comparison needs no slack: the deadline was
+            // computed from an earlier instant than this one.
+            let ceiling = Instant::now() + STATEMENT_DEADLINE;
+            assert_eq!(
+                timeout_first, *session_decides,
+                "case {case:?}: expected the session's timeout to decide == {session_decides}, \
+                 got {timeout_first}"
+            );
+            assert!(
+                deadline <= ceiling,
+                "case {case:?}: expected a deadline inside the endpoint's budget of \
+                 {STATEMENT_DEADLINE:?}, got one {:?} past it",
+                deadline.saturating_duration_since(ceiling)
+            );
+        }
     }
 }

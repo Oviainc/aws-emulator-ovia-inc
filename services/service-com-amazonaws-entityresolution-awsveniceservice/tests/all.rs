@@ -27,6 +27,8 @@ mod id_namespace_delete;
 mod id_namespace_lifecycle;
 #[path = "all/id_namespace_update.rs"]
 mod id_namespace_update;
+#[path = "all/id_namespace_write_authorization.rs"]
+mod id_namespace_write_authorization;
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
 #[path = "all/match_id_generation.rs"]
