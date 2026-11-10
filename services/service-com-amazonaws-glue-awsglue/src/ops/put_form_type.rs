@@ -9,6 +9,13 @@
 //! put reports is the form type's name ([`crate::state::FormTypeEntry::id`]), so it is the
 //! same across every put under that name. `GetFormType` reads the record back by that id.
 //!
+//! A `Name` outside what `FormTypeName` admits — one not opening with an upper-case letter,
+//! or carrying a character the member's expression does not — is refused with this
+//! operation's own `InvalidInputException` and this surface's sentence for that check
+//! ([`crate::state::malformed_form_type_name_message`]), never with the cross-service
+//! `ValidationException`: the member is judged here rather than at the framework boundary
+//! (`skip_validation` on `PutFormTypeRequest` in `src/ops/types/`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -156,6 +163,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // type's whole definition, so a retried put stores the same record and answers
         // with the same id, name and schema as the put it retries.
         let _ = (ctx, &input.client_token);
+        // A `Name` outside what `FormTypeName` admits is refused BEFORE anything is read or
+        // written, with this operation's own modelled client-input error: Glue judges this
+        // member itself, so a name it will not take never earns the cross-service
+        // `ValidationException` (`skip_validation` on `PutFormTypeRequest`).
+        if let Some(message) = crate::state::malformed_form_type_name_message(&input.name) {
+            return Err(PutFormTypeErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models a server fault, so an unreachable store is reported
             // as that rather than as a client error the caller could act on.

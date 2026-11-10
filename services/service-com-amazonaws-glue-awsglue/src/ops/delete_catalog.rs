@@ -179,6 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id names the catalog, and may name the account whose Data Catalog holds it;
         // a bare name is a catalog of the account this endpoint serves.
         let reference = crate::state::parse_catalog_reference(&input.catalog_id);
+        // An id whose catalog name is one the catalog grammar cannot spell is a MALFORMED
+        // REQUEST rather than a miss, exactly as it is on the read path: no catalog could
+        // ever be stored under it, so it is refused in the constraint envelope before
+        // anything is read or written.
+        if !crate::state::is_catalog_name(&reference.name) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::messages::malformed_catalog_id(&input.catalog_id),
+            ));
+        }
         // Authorization comes BEFORE the entity lookup, exactly as it does on the read
         // path: a catalog in another account's Data Catalog is reachable on the real
         // service only through that catalog's own resource-based policy, and this store

@@ -27,6 +27,8 @@
 //! outside `GlueResourceArn`'s modelled `@pattern` or `@length` is no taggable Glue
 //! resource either, so it is answered by the one resolution above with this operation's
 //! own `InvalidInputException` and never with the cross-service `ValidationException`.
+//! That refusal carries NO prose at all, which is how the tagging surface words it
+//! ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]).
 //!
 //! ## Shape of an operation
 //!
@@ -172,9 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(resource) = crate::state::parse_tagged_resource(&input.resource_arn) else {
             return Err(UntagResourceErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::invalid_resource_arn_message(
-                        &input.resource_arn,
-                    )),
+                    message: crate::state::INVALID_RESOURCE_ARN_MESSAGE,
                     from_federation_source: None,
                 },
             )

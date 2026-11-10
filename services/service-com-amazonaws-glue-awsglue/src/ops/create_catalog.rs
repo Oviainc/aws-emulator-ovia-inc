@@ -178,11 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // regex engine cannot compile its negative look-ahead and treats a pattern it
         // cannot compile as matching every value — so the constraint is applied here
         // (`crate::state::is_catalog_name`) rather than letting a name the model forbids
-        // reach the store.
+        // reach the store. This operation owns the refusal, so it states the catalog's own
+        // sentence for the check: the character class a catalog name may be built from,
+        // not the member path and expression a constraint-violation report would quote.
         if !crate::state::is_catalog_name(&input.name) {
             return Err(CreateCatalogErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::messages::malformed_catalog_name(&input.name)),
+                    message: Some(crate::state::messages::CATALOG_NAME_NOT_ALLOWED.to_string()),
                     from_federation_source: None,
                 },
             )

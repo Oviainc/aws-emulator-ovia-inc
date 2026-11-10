@@ -222,13 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // two creates racing each other cannot both see an unconfigured account: exactly
         // one registers the configuration and the other is refused.
         let mut store = state.lock();
-        if store.identity_center_configuration.is_some() {
+        if let Some(existing) = store.identity_center_configuration.as_ref() {
             return Err(
                 CreateGlueIdentityCenterConfigurationErrorModeled::AlreadyExistsException(
                     AlreadyExistsException {
+                        // The refusal names the application that already owns the
+                        // singleton, read off the stored record, so the caller that lost
+                        // the race learns which `ApplicationArn` holds it.
                         message: Some(
-                            crate::state::messages::IDENTITY_CENTER_CONFIGURATION_ALREADY_EXISTS
-                                .to_string(),
+                            crate::state::messages::identity_center_configuration_already_exists(
+                                &existing.application_arn,
+                            ),
                         ),
                     },
                 )

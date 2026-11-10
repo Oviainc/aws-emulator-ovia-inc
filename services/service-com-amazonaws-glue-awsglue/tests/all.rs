@@ -255,6 +255,8 @@ mod owed_status_materialisation;
 mod partition_indexes;
 #[path = "all/partitions.rs"]
 mod partitions;
+#[path = "all/refusal_classification.rs"]
+mod refusal_classification;
 #[path = "all/registries.rs"]
 mod registries;
 #[path = "all/registry_listing.rs"]

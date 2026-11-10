@@ -127,6 +127,18 @@ fn absent(code: &str, message: String) -> Resolution {
     absent_with_status(400, code, message)
 }
 
+/// The same per-resource failure for an owning service that words this fault with NO
+/// message at all: `FailureInfo`'s `ErrorMessage` is "the error message that accompanies the
+/// failure", so a service whose refusal carries none leaves it unset rather than having
+/// this API invent prose the owning service never wrote.
+fn absent_stating(code: &str, message: Option<String>) -> Resolution {
+    Resolution::Absent(FailureInfo {
+        status_code: 400,
+        error_code: Some(code.to_string()),
+        error_message: message,
+    })
+}
+
 /// The same per-resource failure for an owning service whose error for this fault
 /// carries another HTTP status: `FailureInfo` reports "the HTTP status code of the
 /// common error" beside "any valid error code returned by the … service that hosts
@@ -703,12 +715,13 @@ fn glue<Eng: Send + Sync + 'static>(
     };
     // A `glue` ARN that resolver does not recognise as a taggable resource of that
     // service is NOT a missing resource: it is a request Glue refuses, so the
-    // per-resource failure carries that refusal — its own parameter wording under the
-    // code Glue's `TagResource` models for a bad input.
+    // per-resource failure carries that refusal — the code Glue's `TagResource` models
+    // for a bad input, and the prose Glue states with it, which for this refusal is none
+    // ([`owner_glue::state::INVALID_RESOURCE_ARN_MESSAGE`]).
     let Some(resource) = owner_glue::state::parse_tagged_resource(&arn.arn) else {
-        return absent(
+        return absent_stating(
             "InvalidInputException",
-            owner_glue::state::invalid_resource_arn_message(&arn.arn),
+            owner_glue::state::INVALID_RESOURCE_ARN_MESSAGE,
         );
     };
     let mut state = state.lock();

@@ -405,6 +405,11 @@ async fn a_removal_is_bounded_by_the_modelled_key_list() {
     }
 }
 
+/// What [`error_message`] answers for a refusal that carries NO prose at all, which is how
+/// the tagging surface refuses an ARN that is none of its resources: the code alone, with the
+/// modelled `Message` member absent from the body.
+const NO_PROSE: &str = "<no Message>";
+
 /// One refused removal: the Region the request is served in, the ARN it names, and the
 /// refusal it earns.
 struct RefusalRow {
@@ -463,10 +468,9 @@ fn refusal_rows() -> Vec<RefusalRow> {
         });
     }
 
-    // A Glue ARN whose resource portion names no kind that carries a tag set. The resource
-    // types are the ones a tagging call accepts; everything else is a bad parameter, and the
-    // refusal states which they are.
-    let kinds = "connection, crawler, database, job";
+    // A Glue ARN whose resource portion names no kind that carries a tag set. Everything
+    // outside the kinds a tagging call accepts is a bad parameter, and that refusal states
+    // NO prose at all — the code alone.
     for resource in [
         "table/untag_refusal_db/orders",
         "schema/registry-1/schema-1",
@@ -480,10 +484,7 @@ fn refusal_rows() -> Vec<RefusalRow> {
         rows.push(RefusalRow {
             case: format!("an ARN whose resource portion is {resource:?}"),
             region: REGION,
-            message: Some(format!(
-                "ResourceArn must be the ARN of a taggable Glue resource naming one of \
-                 {kinds}; got {arn:?}"
-            )),
+            message: Some(NO_PROSE.to_string()),
             arn,
             code: "InvalidInputException",
         });

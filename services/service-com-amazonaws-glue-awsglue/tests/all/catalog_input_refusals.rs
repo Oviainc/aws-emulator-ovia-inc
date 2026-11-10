@@ -279,19 +279,21 @@ async fn a_name_past_the_modelled_maximum_keeps_the_constraint_refusal() {
     let router = emulator();
     let long = "d".repeat(MAX_NAME_CHARS + 1);
 
-    // (case, operation, request, the member path the clause names).
+    // (case, operation, request, the member path the clause names). The path is the one
+    // GLUE's own API spells, which for the member carrying a resource definition is the
+    // resource it carries (`database`, `table`) and not the wire member name.
     let rows: Vec<(&str, &str, Value, &str)> = vec![
         (
             "CreateDatabase with a DatabaseInput.Name past the maximum",
             "CreateDatabase",
             json!({ "DatabaseInput": { "Name": long } }),
-            "databaseInput.name",
+            "database.name",
         ),
         (
             "CreateTable with a TableInput.Name past the maximum",
             "CreateTable",
             json!({ "DatabaseName": "any_db", "TableInput": { "Name": long } }),
-            "tableInput.name",
+            "table.name",
         ),
         (
             "GetTable with a Name past the maximum",
@@ -613,9 +615,10 @@ async fn an_attribute_outside_the_modelled_enum_is_the_catalogs_own_input_error(
 
 /// A `ResourceArn` that is no Glue resource ARN at all is the catalog's own input error on
 /// every tagging operation — not the framework's `ValidationException` for the member's
-/// `@pattern` — while a well-formed ARN reaches the lookup: one naming a resource this
-/// store holds none of is the modelled `EntityNotFoundException`, and one naming a stored
-/// resource is served.
+/// `@pattern` — and that refusal carries the code alone, with no prose at all, which is how
+/// the tagging surface words it. A well-formed ARN still reaches the lookup: one naming a
+/// resource this store holds none of is the modelled `EntityNotFoundException`, and one
+/// naming a stored resource is served.
 #[tokio::test]
 async fn a_resource_arn_that_is_no_glue_arn_is_the_catalogs_own_input_error() {
     let router = emulator();
@@ -662,7 +665,24 @@ async fn a_resource_arn_that_is_no_glue_arn_is_the_catalogs_own_input_error() {
                 _ => json!({ "ResourceArn": arn }),
             };
             let (status, body) = call(&router, operation, &request).await;
-            assert_catalog_input_refusal(&format!("{operation} with {case}"), status, &body, None);
+            let case = format!("{operation} with {case}");
+            assert_eq!(
+                status, 400,
+                "case {case}: an ARN that names no taggable Glue resource is refused with \
+                 400, got {status} with {body}"
+            );
+            assert!(
+                error_code(&body).ends_with("InvalidInputException"),
+                "case {case}: expected InvalidInputException, got {} in {body}",
+                error_code(&body)
+            );
+            // This refusal states NO prose: the tagging surface answers the code alone
+            // for an ARN that is none of its resources, so neither the modelled `Message`
+            // member nor the framework's lowercase `message` is on the wire.
+            assert!(
+                body.get("Message").is_none() && body.get("message").is_none(),
+                "case {case}: the refusal states no message, got {body}"
+            );
         }
     }
 

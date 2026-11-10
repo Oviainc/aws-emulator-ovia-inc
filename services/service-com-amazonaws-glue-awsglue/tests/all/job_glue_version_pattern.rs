@@ -9,7 +9,9 @@
 //! the `@pattern` of `GlueVersionString`, the shape `CreateJob$GlueVersion` and
 //! `JobUpdate$GlueVersion` target
 //! (`smithy_query(query="shape",shape="GlueVersionString")`): `^((\w+\.)+\w+|auto)$`, with
-//! `@length` 1..255.
+//! `@length` 1..255. The refusal quotes that expression WITHOUT the anchoring pair the model
+//! wraps it in, which is the rendering this service's constraint refusals are recorded
+//! stating and the one `service_common::validation::unanchored` owns.
 //!
 //! The rows differ along what the rule generalises over: how many dotted components a
 //! version has, whether it is the literal `auto`, and the ways a value can miss the form
@@ -26,9 +28,16 @@ use crate::wire::{call, emulator, error_code, ok};
 /// The role ARN every job definition below is created with.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-job-role";
 
-/// The form a `GlueVersion` has to satisfy, quoted exactly as the member's `@pattern`
-/// spells it — which is what the refusal of a value outside it states.
+/// The form a `GlueVersion` has to satisfy, as the member's `@pattern` spells it. A
+/// refusal quotes it without the anchoring pair ([`stated_glue_version_pattern`]), which is
+/// what the expectation below compares against.
 const GLUE_VERSION_PATTERN: &str = r"^((\w+\.)+\w+|auto)$";
+
+/// [`GLUE_VERSION_PATTERN`] as a refusal quotes it: the expression the service advertises,
+/// which is the model's text without the whole-value anchoring pair.
+fn stated_glue_version_pattern() -> String {
+    ::service_common::validation::unanchored(GLUE_VERSION_PATTERN)
+}
 
 /// A `CreateJob` body carrying `glue_version`.
 fn create_body(name: &str, glue_version: &str) -> Value {
@@ -127,9 +136,10 @@ async fn a_glue_version_outside_the_admitted_form_is_refused() {
                 error_code(&answer)
             );
             assert!(
-                message.contains(GLUE_VERSION_PATTERN),
+                message.contains(&stated_glue_version_pattern()),
                 "case {version:?} / {operation}: the refusal must quote the form the value had \
-                 to satisfy, {GLUE_VERSION_PATTERN}, got {message:?}"
+                 to satisfy, {}, got {message:?}",
+                stated_glue_version_pattern()
             );
         }
 

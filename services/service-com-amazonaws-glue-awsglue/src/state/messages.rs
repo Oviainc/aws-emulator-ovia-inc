@@ -451,12 +451,16 @@ pub fn session_id_not_found(session_id: &str) -> String {
 pub const IDENTITY_CENTER_CONFIGURATION_NOT_FOUND: &str =
     "Idc application not found. Need to create glue application first.";
 
-/// `CreateGlueIdentityCenterConfiguration` for an account that already has one. NOT
-/// recorded: inferred from the recorded `CreateDatabase` duplicate, like
-/// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and a sentence naming
-/// the resource kind alone, which here is the whole address of the singleton.
-pub const IDENTITY_CENTER_CONFIGURATION_ALREADY_EXISTS: &str =
-    "Glue Identity Center configuration already exists.";
+/// `CreateGlueIdentityCenterConfiguration` for an account that already has one.
+///
+/// RECORDED template: fixed text plus ONE variable part, the `ApplicationArn` of the
+/// configuration the account already holds, read off the stored record — so the caller
+/// losing the race for the singleton learns which application owns it. The service names
+/// the application the way it names it in this sentence (`Glue Idc Application`), as the
+/// miss of the same singleton does ([`IDENTITY_CENTER_CONFIGURATION_NOT_FOUND`]).
+pub fn identity_center_configuration_already_exists(application_arn: &str) -> String {
+    format!("Glue Idc Application already exists. ApplicationArn: {application_arn}")
+}
 
 /// `CreateGlueIdentityCenterConfiguration` whose `InstanceArn` is not the ARN of an
 /// Identity Center instance ([`super::identity_center_instance_id`]). NOT recorded:
@@ -757,23 +761,65 @@ pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
 pub const CATALOG_NAME_IS_ACCOUNT_ID: &str =
     "Catalog name cannot be the same as the account ID.";
 
-/// `CreateCatalog` whose `Name` is outside the `@pattern` its modelled type declares
+/// `CreateCatalog` whose `Name` carries a character the catalog surface forbids
 /// ([`super::is_catalog_name`]).
 ///
-/// A value outside a MODELLED constraint is refused at request validation, before the
-/// operation runs, in the clause shape that renderer uses (`N validation error(s)
-/// detected: Value '…' at '<path>' failed to satisfy constraint: <requirement>` —
-/// [`::aws_smithy_schema_server::Violation::message`]). This pattern reaches the
-/// handler only because the framework's regex engine cannot compile a negative
-/// look-ahead, so the refusal states the same two facts: the member path and the
-/// pattern the model declares.
-pub fn malformed_catalog_name(name: &str) -> String {
-    let path = ::aws_smithy_schema_server::constraints::path::member("Name");
-    format!(
-        "1 validation error detected: Value '{name}' at '{path}' failed to satisfy \
-             constraint: Member must satisfy regular expression pattern: {}",
-        super::CATALOG_NAME_PATTERN
+/// RECORDED constant, and the whole message: the catalog states the character class a
+/// name may be built from and nothing of the value it was handed, so one wording answers
+/// every name outside it. It is NOT a constraint-violation report — the member path and
+/// the expression the model declares are the boundary validator's words for a value
+/// outside a `@pattern`, and this surface answers its own sentence instead.
+pub const CATALOG_NAME_NOT_ALLOWED: &str =
+    "Only lowercase letters, numbers, underscores and hyphens are allowed for catalog name";
+
+/// A READ or a WRITE that ADDRESSES one catalog by a `CatalogId` whose catalog name is one
+/// the catalog grammar cannot spell ([`super::is_catalog_name`]): a name carrying a path
+/// separator, or opening with the prefix AWS reserves.
+///
+/// Such an id is a MALFORMED REQUEST and not a miss — no catalog could ever be stored
+/// under it — so it is refused the way a value outside a modelled constraint is refused,
+/// in AWS's own constraint envelope ([`stated_constraint_refusal`]) under the
+/// `ValidationException` that envelope travels with, before anything is looked up. The
+/// clause names the member the request carried the id at, the id itself, and the expression
+/// a catalog name has to satisfy.
+///
+/// The check cannot be left to the framework boundary: the expression is a negative
+/// look-ahead, which the framework's regex engine does not compile, and a `@pattern` it
+/// cannot compile is treated as matching every value.
+pub fn malformed_catalog_id(catalog_id: &str) -> String {
+    stated_constraint_refusal(
+        ::aws_smithy_schema_server::constraints::path::member("CatalogId"),
+        ::smithy_server_runtime::ViolationKind::Pattern(super::CATALOG_NAME_PATTERN.to_string()),
+        Some(catalog_id.to_string()),
     )
+}
+
+/// ONE constraint clause in AWS's own envelope, for a constraint this service checks itself
+/// rather than leaving to the framework boundary.
+///
+/// The envelope, the clause and the rendering of the requirement all come from the shared
+/// renderer (`service_common::validation_message::aws_validation_refusal`, which quotes a
+/// `@pattern` without the anchoring pair the model wraps it in), so a clause a handler
+/// states reads exactly like the one the boundary states for the same violation. Only the
+/// facts are this service's: the member path, what the value failed, and the value.
+fn stated_constraint_refusal(
+    path: String,
+    kind: ::smithy_server_runtime::ViolationKind,
+    value: Option<String>,
+) -> String {
+    let violation = ::smithy_server_runtime::Violation {
+        path,
+        kind,
+        value,
+        sensitive: false,
+    };
+    ::service_common::validation_message::aws_validation_refusal(
+        &::smithy_server_runtime::Refusal::Invalid(vec![violation.clone()]),
+    )
+    .map(|stated| stated.message)
+    // Unreachable for the one violation above; the framework's own clause for it rather
+    // than an empty message if it ever were.
+    .unwrap_or_else(|| violation.message())
 }
 
 /// A READ that addresses ONE connection definition by name (`GetConnection`) for a
@@ -1012,11 +1058,18 @@ pub const COLUMN_STATISTICS_TASK_SETTINGS_TABLE_NOT_FOUND: &str =
     "Table passed as input within input database not found.";
 
 /// `CreateColumnStatisticsTaskSettings` for a table whose settings a create already
-/// wrote. NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like
-/// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
-/// the addressed table.
-pub const COLUMN_STATISTICS_TASK_SETTINGS_ALREADY_EXIST: &str =
-    "Column statistics task settings already exist.";
+/// wrote.
+///
+/// RECORDED template: fixed text after the record the settings belong to, which the
+/// surface addresses as the catalog that holds them, then the database and the table the
+/// settings were written for — every part read off the request, nothing of this one run.
+pub fn column_statistics_task_settings_already_exist(
+    catalog_id: &str,
+    database_name: &str,
+    table_name: &str,
+) -> String {
+    format!("{catalog_id}:{database_name}-{table_name} already exists")
+}
 
 /// `StartColumnStatisticsTaskRun` for a table that already has a run in flight — the
 /// operation's modelled `ColumnStatisticsTaskRunningException`, "thrown when you try

@@ -299,6 +299,14 @@ async fn only_the_first_create_registers_the_configuration() {
                 "case {case}: expected AlreadyExistsException, got {} in {body}",
                 error_code(&body)
             );
+            // The refusal NAMES the application that already owns the singleton, which is
+            // the one the winning create minted, so a caller that lost learns which
+            // application holds it.
+            assert_eq!(
+                error_message(&body),
+                already_exists_message(&winner),
+                "case {case}: the refusal must name the application that owns the singleton"
+            );
         }
 
         let (status, after) = read(&router).await;
@@ -317,6 +325,90 @@ async fn only_the_first_create_registers_the_configuration() {
             "case {case}: the stored application must be the one the winning create minted, \
              got {after}"
         );
+    }
+}
+
+/// The sentence a create for an account that already has a configuration is refused with:
+/// fixed text naming the `ApplicationArn` of the configuration that already exists, which is
+/// the one the winning create reported. Written here independently of the handler, so the
+/// suite pins the wording and not the code.
+fn already_exists_message(winner: &Value) -> String {
+    format!(
+        "Glue Idc Application already exists. ApplicationArn: {}",
+        winner["ApplicationArn"]
+            .as_str()
+            .expect("the winning create reports an ApplicationArn")
+    )
+}
+
+/// Creates fired at one account AT THE SAME TIME leave exactly one configuration: one wins,
+/// every loser is refused with `AlreadyExistsException` naming the winner's
+/// `ApplicationArn`, and the read reports the winner's registration.
+///
+/// The rows differ along how many creates are in flight at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_configuration_creates_leave_one_application() {
+    for racers in [2usize, 8] {
+        let case = format!("{racers} creates at once");
+        let router = Arc::new(emulator_holding(&[INSTANCE_ID]));
+
+        let mut racing = Vec::new();
+        for _ in 0..racers {
+            let router = Arc::clone(&router);
+            racing.push(tokio::spawn(async move {
+                call(
+                    &router,
+                    "CreateGlueIdentityCenterConfiguration",
+                    &json!({ "InstanceArn": INSTANCE_ARN }),
+                )
+                .await
+            }));
+        }
+
+        let mut winners: Vec<Value> = Vec::new();
+        let mut losers: Vec<Value> = Vec::new();
+        for racer in racing {
+            let (status, body) = racer.await.expect("a racing create must not panic");
+            if status == 200 {
+                winners.push(body);
+            } else {
+                assert_eq!(
+                    status, 400,
+                    "case {case}: a refused create answers 400, got {status} with {body}"
+                );
+                losers.push(body);
+            }
+        }
+        assert_eq!(
+            winners.len(),
+            1,
+            "case {case}: exactly one create must win the race, got {winners:?}"
+        );
+
+        // The stored configuration is the winner's, and every loser was told which
+        // application owns it.
+        let (status, registered) = read(&router).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the winner's configuration must be readable, got {status} with \
+             {registered}"
+        );
+        assert_eq!(
+            registered["ApplicationArn"], winners[0]["ApplicationArn"],
+            "case {case}: the stored application must be the winner's, got {registered}"
+        );
+        for body in &losers {
+            assert!(
+                error_code(body).ends_with("AlreadyExistsException"),
+                "case {case}: expected AlreadyExistsException, got {} in {body}",
+                error_code(body)
+            );
+            assert_eq!(
+                error_message(body),
+                already_exists_message(&winners[0]),
+                "case {case}: a loser must be told which application owns the singleton"
+            );
+        }
     }
 }
 

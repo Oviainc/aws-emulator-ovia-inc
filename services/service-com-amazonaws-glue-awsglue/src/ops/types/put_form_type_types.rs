@@ -9,9 +9,18 @@
 
 use super::*;
 
+// `skip_validation = ["Name"]`: a `Name` outside what `FormTypeName` admits is THIS
+// operation's own `InvalidInputException` and not the cross-service `ValidationException`,
+// so the member is taken off the centralized boundary walk and judged by the handler that
+// reads it (`crate::state::is_form_type_name`). `Schema` keeps its modelled bounds at the
+// boundary.
+
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#PutFormTypeRequest")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#PutFormTypeRequest",
+    skip_validation = ["Name"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct PutFormTypeInput {
     pub name: String,

@@ -227,10 +227,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateGlossaryTermErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    // Wording for this slice is pinned by no recording or doc, so the
-                    // refusal states the resource kind and withholds the requested name,
-                    // as this service's other already-exists refusals do.
-                    message: Some("Glossary term already exists.".to_string()),
+                    // The ONE wording this surface words a name collision with: a JSON
+                    // document naming the resource kind and the name the write asked for,
+                    // exactly as the glossary's own collision one level up is worded.
+                    message: Some(crate::state::glossary_term_already_exists_message(
+                        &input.glossary_identifier,
+                        &input.name,
+                    )),
                 },
             )
             .into());

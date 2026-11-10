@@ -295,9 +295,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateColumnStatisticsTaskSettingsErrorModeled::AlreadyExistsException(
                     AlreadyExistsException {
+                        // The refusal names the record that already exists — the catalog
+                        // holding it, and the database and table the settings were written
+                        // for — so a client can tell this duplicate from any other.
                         message: Some(
-                            crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_ALREADY_EXIST
-                                .to_string(),
+                            crate::state::messages::column_statistics_task_settings_already_exist(
+                                &catalog_id,
+                                &input.database_name,
+                                &input.table_name,
+                            ),
                         ),
                     },
                 )

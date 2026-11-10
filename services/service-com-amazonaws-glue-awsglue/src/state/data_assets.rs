@@ -91,6 +91,22 @@ pub fn glossary_already_exists_message(name: &str) -> String {
     catalog_refusal_document(&format!("A glossary with name '{name}' already exists."))
 }
 
+/// The message every refusal of a glossary TERM name the addressed glossary already holds
+/// a term under carries: the value of that refusal's `AlreadyExistsException$Message`.
+///
+/// Worded the way this surface words a name collision one level up
+/// ([`glossary_already_exists_message`]): the refusal text is itself a JSON document
+/// carrying the sentence under a `Message` key, and the sentence names the resource kind the
+/// collision is about — a glossary term — the name the write asked for, and the GLOSSARY it
+/// asked for it in, because a term's name identifies it within one glossary and is free in
+/// every other. Both variable parts come from the request; `serde_json` renders the
+/// document, so a name carrying a quote or a backslash still yields a well-formed one.
+pub fn glossary_term_already_exists_message(glossary: &str, name: &str) -> String {
+    catalog_refusal_document(&format!(
+        "A glossary term with name '{name}' already exists in glossary '{glossary}'."
+    ))
+}
+
 /// A stored form type: the schema for structured metadata `PutFormType` registers in the
 /// Data Catalog.
 ///
@@ -128,6 +144,174 @@ impl FormTypeEntry {
             schema,
         }
     }
+}
+
+/// `FormTypeName`'s modelled `@pattern` and `@length` bounds, as the model writes them
+/// (`smithy_query(query="shape",shape="FormTypeName")`: pattern `^[A-Z]\w*$`,
+/// `length 1..128`) — held here exactly as declared, because a refusal of this member
+/// quotes the expression the way the model spells it.
+const FORM_TYPE_NAME_PATTERN: &str = r"^[A-Z]\w*$";
+
+/// See [`FORM_TYPE_NAME_PATTERN`].
+const FORM_TYPE_NAME_MAX_CHARS: i64 = 128;
+
+/// See [`FORM_TYPE_NAME_PATTERN`].
+const FORM_TYPE_NAME_MIN_CHARS: i64 = 1;
+
+/// Whether `name` satisfies the expression [`FORM_TYPE_NAME_PATTERN`] declares: it opens
+/// with an upper-case letter and carries nothing but letters, digits and underscores after
+/// it, which is what `[A-Z]\w*` admits over the whole value.
+fn matches_form_type_name_pattern(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_uppercase())
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Every requirement of `FormTypeName` the `Name` of a form type write breaks, in the order
+/// the member declares them — empty when the name is one this surface admits.
+///
+/// Checked HERE, and not at the framework boundary, because this surface answers a name it
+/// will not take with its OWN client-input error rather than with the cross-service
+/// `ValidationException` (`skip_validation` on `PutFormTypeRequest` in `src/ops/types/`),
+/// the same division every other member Glue judges itself follows. The requirements are
+/// the member's own, so the clauses a refusal states are the clauses the boundary would
+/// have stated for the same value.
+fn form_type_name_violations(name: &str) -> Vec<::smithy_server_runtime::Violation> {
+    let path = ::aws_smithy_schema_server::constraints::path::member("Name");
+    let characters = i64::try_from(name.chars().count()).unwrap_or(i64::MAX);
+    let mut broken = Vec::new();
+    if characters < FORM_TYPE_NAME_MIN_CHARS {
+        broken.push(::smithy_server_runtime::ViolationKind::MinLength(
+            FORM_TYPE_NAME_MIN_CHARS,
+        ));
+    }
+    if characters > FORM_TYPE_NAME_MAX_CHARS {
+        broken.push(::smithy_server_runtime::ViolationKind::MaxLength(
+            FORM_TYPE_NAME_MAX_CHARS,
+        ));
+    }
+    if !matches_form_type_name_pattern(name) {
+        broken.push(::smithy_server_runtime::ViolationKind::Pattern(
+            FORM_TYPE_NAME_PATTERN.to_string(),
+        ));
+    }
+    broken
+        .into_iter()
+        .map(|kind| ::smithy_server_runtime::Violation {
+            path: path.clone(),
+            kind,
+            value: None,
+            sensitive: false,
+        })
+        .collect()
+}
+
+/// The message the form type surface refuses a `Name` outside what `FormTypeName` admits
+/// with — the value of that refusal's `InvalidInputException$Message` — or `None` when the
+/// name is one it admits.
+///
+/// RECORDED shape, and it is the two renderings of this surface put together: the text is
+/// itself a JSON document carrying the refusal under a `Message` key
+/// ([`catalog_refusal_document`]), and the refusal inside it is AWS's own constraint report
+/// over the requirements the name broke ([`stated_business_metadata_constraint`]) — the
+/// member path, the requirement, the value WITHHELD and a `@pattern` quoted exactly as the
+/// model declares it, anchors included.
+pub fn malformed_form_type_name_message(name: &str) -> Option<String> {
+    stated_business_metadata_constraint(form_type_name_violations(name))
+}
+
+/// One constraint report as the business-metadata surface states it: the shared renderer's
+/// envelope and clauses, in THIS surface's dialect, wrapped in its JSON document.
+///
+/// The envelope, the clause and every requirement are the shared renderer's
+/// (`service_common::validation_message`), so a report this surface states reads like the
+/// one the boundary states for the same violation. The two choices are this surface's and
+/// are what its recordings show: the clause WITHHOLDS the value — it names the member and
+/// the requirement and quotes nothing of what was sent — and a `@pattern` is quoted as the
+/// model declares it, anchoring pair included, rather than in the unanchored rendering the
+/// catalog surface's refusals quote.
+///
+/// `None` for no violation at all, so a caller cannot state an empty report.
+fn stated_business_metadata_constraint(
+    violations: Vec<::smithy_server_runtime::Violation>,
+) -> Option<String> {
+    if violations.is_empty() {
+        return None;
+    }
+    let stated = ::service_common::validation_message::aws_validation_refusal_withholding_with(
+        &::smithy_server_runtime::Refusal::Invalid(violations),
+        |pattern| pattern.to_string(),
+        |_| true,
+    )?;
+    Some(catalog_refusal_document(&stated.message))
+}
+
+/// Which asset types still REFERENCE one form type, and the sentence a delete held up by
+/// such a reference is refused with.
+impl ComAmazonawsGlueAwsglueState {
+    /// Every asset type whose forms name the form type `identifier` addresses, by name, in
+    /// the order this namespace holds them — empty when no asset type references it, and
+    /// when `identifier` names no form type this store holds at all.
+    ///
+    /// A form type "cannot be deleted if it is still referenced by an asset type"
+    /// (`DeleteFormType`), so the delete asks this before removing anything, and the
+    /// refusal names every dependency that holds it up rather than one of them. An asset
+    /// type's forms carry the `FormTypeIdentifier` its own put wrote
+    /// ([`AssetTypeEntry::forms`]) and a form type's identifier is its name
+    /// ([`FormTypeEntry::id`]), so a reference names the record exactly as this namespace
+    /// keys it. The walk is bounded by [`MAX_ASSET_TYPES`] records of [`MAX_ASSET_FORMS`]
+    /// forms.
+    pub fn asset_types_referencing_form_type(&self, identifier: &str) -> Vec<String> {
+        let Some(form_type) = self.form_type_by_reference(identifier) else {
+            return Vec::new();
+        };
+        self.asset_types
+            .values()
+            .filter(|asset_type| {
+                asset_type
+                    .forms
+                    .values()
+                    .any(|reference| reference == &form_type.name)
+            })
+            .map(|asset_type| asset_type.name.clone())
+            .collect()
+    }
+}
+
+/// The message the form type surface refuses a DELETE held up by an asset type's reference
+/// with: the value of that refusal's `ConflictException$Message`.
+///
+/// RECORDED template, worded the way this surface words every refusal
+/// ([`form_type_not_found_message`]): the text is itself a JSON document carrying the
+/// sentence under a `Message` key. The sentence states the rule the operation documents
+/// ("A form type cannot be deleted if it is still referenced by an asset type",
+/// `DeleteFormType`) and then LISTS the dependencies that hold the delete up, each named the
+/// way this surface names an asset type as a dependency ([`asset_type_dependency`]). Both
+/// variable parts are read off the store: the form type the delete addressed, and every
+/// asset type still referencing it.
+pub fn form_type_referenced_message(form_type: &str, asset_types: &[String]) -> String {
+    let dependencies: Vec<String> = asset_types
+        .iter()
+        .map(|asset_type| asset_type_dependency(asset_type))
+        .collect();
+    catalog_refusal_document(&format!(
+        "Form type {form_type} cannot be deleted because of the following dependencies: {}",
+        dependencies.join(", ")
+    ))
+}
+
+/// How this surface names an ASSET TYPE as a DEPENDENCY of another record: the kind of
+/// dependency it is (`gluetype`, an asset type being a type of the business catalog), then
+/// the asset type's address — the entity kind, the catalog that holds it
+/// ([`CATALOG_QUALIFIER_PREFIX`] and the account, as every catalog-qualified identifier of
+/// this surface spells it) and the asset type's own name, joined by `#`.
+fn asset_type_dependency(asset_type: &str) -> String {
+    format!(
+        "gluetype glueAsset#{CATALOG_QUALIFIER_PREFIX}{}#{asset_type}",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// The prefix a catalog-qualified identifier opens with: the catalog the entity lives in

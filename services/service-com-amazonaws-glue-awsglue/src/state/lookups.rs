@@ -541,23 +541,16 @@ pub fn tagged_resource_not_found_message(resource: &TaggedResource, resource_arn
     }
 }
 
-/// The message a refusal carries for a `ResourceArn` that is not the ARN of a taggable
-/// Glue resource ([`parse_tagged_resource`] answers `None`).
+/// Whether the refusal of a `ResourceArn` that is not the ARN of a taggable Glue resource
+/// ([`parse_tagged_resource`] answers `None`) states any prose at all: it does NOT.
 ///
-/// Derived from the request, like this crate's other reference refusals: it names the
-/// member, the resource types the member accepts ([`TAGGED_RESOURCE_TYPES`]) and the
-/// value that is none of them.
-pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
-    let kinds: Vec<&str> = TAGGED_RESOURCE_TYPES
-        .iter()
-        .map(|(segment, _)| *segment)
-        .collect();
-    format!(
-        "ResourceArn must be the ARN of a taggable Glue resource naming one of {}; got \
-         {resource_arn:?}",
-        kinds.join(", ")
-    )
-}
+/// RECORDED behaviour of the tagging surface: such a request is answered with the
+/// operation's modelled `InvalidInputException` carrying its CODE and no message member at
+/// all — the refusal says that the ARN is not one of this service's, and states neither the
+/// value it was handed nor the resource types the member admits. One copy, shared by the
+/// three tagging operations that resolve a `ResourceArn` through [`parse_tagged_resource`],
+/// so none of them invents prose for a refusal the service words silently.
+pub const INVALID_RESOURCE_ARN_MESSAGE: Option<String> = None;
 
 /// The message a refusal carries for a tag write that would leave the resource holding
 /// more tags than one tag set may have ([`MAX_TAGS_PER_RESOURCE`]).

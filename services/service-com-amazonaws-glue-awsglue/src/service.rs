@@ -24,8 +24,8 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. Glue states it in AWS's own constraint envelope at the
+//!   member paths Glue's own API spells; see [`glue_constraint_refusal`].
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -44,7 +44,9 @@
 //! own refusal of a member value outside what the model admits ([`database_name_refusal`]
 //! and the functions beside it): those members are judged by the operation that reads
 //! them rather than by the framework boundary, and several operations declare the same
-//! member, so the sentences live here once instead of once per operation.
+//! member, so the sentences live here once instead of once per operation. The OTHER
+//! layer's refusal — the boundary's constraint envelope — is rendered here too
+//! ([`glue_constraint_refusal`]), once for both paths that answer one.
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused,
@@ -142,16 +144,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. Glue states such a refusal in AWS's own constraint envelope, which
+        // differs from the framework's default in two renderings this service does not
+        // choose for itself ([`glue_constraint_refusal`]): the member path is the one
+        // Glue's own API spells, and a `@pattern` is quoted without the anchoring pair
+        // the model wraps it in. Both the code and the message come from there, so a
+        // client never sees one layer's message under the other layer's code.
+        glue_constraint_refusal(refusal)
     }
 
     fn override_routing_error(
@@ -184,14 +184,91 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 }
 
 // ---------------------------------------------------------------------------
+// How Glue states the boundary's constraint refusal
+// ---------------------------------------------------------------------------
+
+/// State `refusal` the way Glue states a constraint refusal, or `None` to keep the
+/// framework's own wording.
+///
+/// The envelope is AWS's own and belongs to the shared renderer
+/// (`service_common::validation_message::aws_validation_refusal`): HTTP 400
+/// `ValidationException`, whose lowercase `message` carries
+/// `N validation error(s) detected: Value '<value>' at '<member path>' failed to satisfy
+/// constraint: <requirement>`, with a `@pattern` requirement quoted WITHOUT the anchoring
+/// pair the model wraps it in, which is the text AWS publishes for it. The one thing this
+/// service adds is the MEMBER PATH: Glue states the path of its own request model
+/// ([`api_request_path`]), which spells the member carrying a resource definition for the
+/// resource it carries. Everything else — which refusals are restated, the code, the
+/// envelope, the clause order and every other requirement — stays the shared renderer's
+/// and the framework's, so two Glue refusal paths cannot drift apart.
+///
+/// Both paths that answer a boundary refusal in this service go through here: this
+/// service's [`Service::override_refusal`], and the pre-handler wrapper at the end of this
+/// file, which additionally restores each clause's echoed value to the bytes the caller
+/// sent. Only the wrapper can do that — the refusal seam is handed the violations and not
+/// the request — so a clause stated through `override_refusal` carries the framework's own
+/// elision of a value past its echo ceiling.
+fn glue_constraint_refusal(refusal: &Refusal) -> Option<Refused> {
+    ::service_common::validation_message::aws_validation_refusal(&at_api_request_paths(refusal))
+}
+
+/// `refusal` with every violation's member path spelled the way Glue's own API spells it
+/// ([`api_request_path`]).
+fn at_api_request_paths(refusal: &Refusal) -> Refusal {
+    match refusal {
+        Refusal::Invalid(violations) => Refusal::Invalid(
+            violations
+                .iter()
+                .map(|violation| Violation {
+                    path: api_request_path(&violation.path),
+                    ..violation.clone()
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// The suffix the WIRE spells a member carrying a resource definition with
+/// (`CreateDatabaseRequest$DatabaseInput`, `CreateTableRequest$TableInput`), which Glue's
+/// own request path does not carry.
+const DEFINITION_MEMBER_SUFFIX: &str = "Input";
+
+/// `path` as Glue's own API spells the member it names: a member that carries a RESOURCE
+/// DEFINITION is named for the resource it carries, so `databaseInput.name` is stated as
+/// `database.name` and the member a request addresses a resource by (`name`,
+/// `databaseName`) is stated exactly as the framework's walk spells it.
+///
+/// A constraint message is the only place the server names the member a caller got wrong,
+/// so the path is part of the rule rather than prose: a client that reads it to find its
+/// own field has to be given a member its request model declares. Only the FIRST segment
+/// is rewritten, because that is the one naming a member of the request itself; every
+/// segment under it names a member of the definition, which both models spell the same
+/// way.
+fn api_request_path(path: &str) -> String {
+    let mut segments = path.splitn(2, '.');
+    let Some(member) = segments.next() else {
+        return path.to_string();
+    };
+    let stated = member
+        .strip_suffix(DEFINITION_MEMBER_SUFFIX)
+        .filter(|resource| !resource.is_empty())
+        .unwrap_or(member);
+    match segments.next() {
+        Some(under) => format!("{stated}.{under}"),
+        None => stated.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // How the Data Catalog refuses an input value its own validation rejects
 // ---------------------------------------------------------------------------
 //
 // Two layers refuse a Glue request, and the recordings say which one answers what. The
 // cross-service constraint validator answers a value past a `@length` MAXIMUM or outside
 // a `@range` — HTTP 400 `ValidationException`, whose lowercase `message` carries the
-// "N validation error(s) detected: …" envelope — and that is the framework boundary's
-// own answer here, left exactly as it is. Everything else below is GLUE's own input
+// "N validation error(s) detected: …" envelope — which this service states in AWS's own
+// rendering of it ([`glue_constraint_refusal`]). Everything else below is GLUE's own input
 // validation: a value outside an enum's value set, an ARN outside `GlueResourceArn`'s
 // pattern, and a required name member supplied as null or empty. Each of those is the
 // operation's own modelled `InvalidInputException` (HTTP 400, prose in the `Message`
@@ -292,10 +369,13 @@ fn catalog_name_validation_table<Eng: Send + Sync + 'static>(
     let mut refusals: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
     register_name_validation::<crate::ops::create_database::CreateDatabase<Eng>>(&mut refusals);
     register_name_validation::<crate::ops::update_database::UpdateDatabase<Eng>>(&mut refusals);
+    register_name_validation::<crate::ops::get_database::GetDatabase<Eng>>(&mut refusals);
+    register_name_validation::<crate::ops::delete_database::DeleteDatabase<Eng>>(&mut refusals);
     register_name_validation::<crate::ops::create_table::CreateTable<Eng>>(&mut refusals);
     register_name_validation::<crate::ops::update_table::UpdateTable<Eng>>(&mut refusals);
     register_name_validation::<crate::ops::get_table::GetTable<Eng>>(&mut refusals);
     register_name_validation::<crate::ops::get_tables::GetTables<Eng>>(&mut refusals);
+    register_name_validation::<crate::ops::delete_table::DeleteTable<Eng>>(&mut refusals);
     refusals
 }
 
@@ -369,19 +449,19 @@ impl<Op: Operation> ErasedOperation for CatalogNameValidation<Op> {
                     ),
                     // Every other violation is the constraint validator's, and is stated
                     // the way AWS states one: the envelope and clauses the shared renderer
-                    // owns, over the restored values above.
-                    None => ::service_common::validation_message::aws_validation_refusal(
-                        &Refusal::Invalid(violations),
-                    )
-                    .and_then(|stated| {
-                        serialized_refusal::<Op>(
-                            protocol,
-                            &crate::scaffolded::ValidationException::new(stated.message),
-                            &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
-                            &stated.code,
-                            VALIDATION_EXCEPTION_STATUS,
-                        )
-                    }),
+                    // owns, over the restored values above, at the member paths Glue's own
+                    // API spells ([`glue_constraint_refusal`]).
+                    None => glue_constraint_refusal(&Refusal::Invalid(violations)).and_then(
+                        |stated| {
+                            serialized_refusal::<Op>(
+                                protocol,
+                                &crate::scaffolded::ValidationException::new(stated.message),
+                                &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
+                                &stated.code,
+                                VALIDATION_EXCEPTION_STATUS,
+                            )
+                        },
+                    ),
                 }
             };
             if let Some(response) = refused {
