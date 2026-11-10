@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCampaignOutboundCallConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCampaignOutboundCallConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCampaignOutboundCallConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -171,23 +162,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = UPDATE_CAMPAIGN_OUTBOUND_CALL_CONFIG_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Give the campaign the request addresses the outbound-call-config members the
+    /// request carries.
+    ///
+    /// Each member the request carries replaces the stored one; a member it omits leaves
+    /// the stored value exactly as it was, so the config the campaign reads back under
+    /// `DescribeCampaign` is the one it was created with amended by this request alone.
+    /// The stored contact flow id is required of the config shape and the stored queue id
+    /// has no member in this request at all, so neither an omitted member nor this call
+    /// can clear them. Nothing else about the campaign moves: its id, ARN, name, Connect
+    /// instance, dialer config, tags, run state and place in the creation order are left
+    /// as they were.
+    ///
+    /// A request asking only for values the campaign already carries — including one
+    /// carrying no optional member at all — writes nothing and still succeeds, which is
+    /// the idempotence the model declares for this operation.
+    ///
+    /// An id naming no stored campaign writes nothing and is the modelled
+    /// `ResourceNotFoundException` (HTTP 404). The length bounds of `ContactFlowId` and
+    /// `SourcePhoneNumber` are the model's, so the boundary validator has already refused
+    /// a value outside them before this runs.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCampaignOutboundCallConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCampaignOutboundCallConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCampaignOutboundCallConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateCampaignOutboundCallConfigError::from(
+                UpdateCampaignOutboundCallConfigErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the campaign store is unavailable".to_string(),
+                        x_amz_error_type: None,
+                    },
+                ),
+            )
+        })?;
+
+        let amendment = crate::state::OutboundCallConfigAmendment {
+            connect_contact_flow_id: input.connect_contact_flow_id.as_deref(),
+            connect_source_phone_number: input.connect_source_phone_number.as_deref(),
+            answer_machine_detection_config: input.answer_machine_detection_config.as_ref(),
+        };
+        let applied = state.lock().amend_outbound_call_config(&input.id, amendment);
+
+        match applied {
+            // An amendment that wrote something is audited; one that wrote nothing —
+            // because the campaign already carried every value asked for — is not, since
+            // there is no change to record. The record names the campaign id only: a
+            // contact flow id, a phone number and a detection setting are all
+            // caller-supplied content and never go into an audit line.
+            Some(crate::state::AmendApplied::Amended) => {
+                crate::state::audit_campaign_change(
+                    ctx.parts(),
+                    "UpdateCampaignOutboundCallConfig",
+                    &input.id,
+                    "outbound call config amended",
+                );
+                Ok(UpdateCampaignOutboundCallConfigOutput)
+            }
+            Some(crate::state::AmendApplied::Unchanged) => {
+                Ok(UpdateCampaignOutboundCallConfigOutput)
+            }
+            None => Err(
+                UpdateCampaignOutboundCallConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::campaign_not_found_message(&input.id),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

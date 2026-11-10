@@ -29,6 +29,8 @@ mod input_constraint_refusals;
 mod instance_onboarding;
 #[path = "all/onboarding_job_deletion.rs"]
 mod onboarding_job_deletion;
+#[path = "all/outbound_call_config_update.rs"]
+mod outbound_call_config_update;
 #[path = "all/signing_name_path_claim.rs"]
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]

@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    DialerConfig, EncryptionConfig, InstanceOnboardingJobStatus, OutboundCallConfig,
+    AnswerMachineDetectionConfig, DialerConfig, EncryptionConfig, InstanceOnboardingJobStatus,
+    OutboundCallConfig,
 };
 
 /// This service's sigv4 signing name and ARN namespace (see `OPERATIONS.md`), used
@@ -423,6 +424,57 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         Some(AmendApplied::Amended)
     }
 
+    /// Amend the outbound-call config of one campaign with the members an amendment
+    /// CARRIES, and report what that did. `None` when no campaign is stored under that
+    /// id, in which case nothing is written.
+    ///
+    /// The one place that config is amended, so the operation that updates it and every
+    /// later reader of it cannot disagree about what an update does: a member the
+    /// amendment carries replaces the stored one, a member it omits leaves the stored one
+    /// exactly as it was, and no other part of the campaign — its id, ARN, name,
+    /// instance, dialer config, tags, run state or creation order — moves. The stored
+    /// queue id is among what stays: the update request models no member for it, so no
+    /// amendment can name one.
+    ///
+    /// An amendment every member of which already matches what is stored is reported as
+    /// [`AmendApplied::Unchanged`] and nothing is written, which is what makes the update
+    /// idempotent: a retry after a timeout, and an amendment that carries no member at
+    /// all, each succeed and leave one stored config behind.
+    pub fn amend_outbound_call_config(
+        &mut self,
+        id: &str,
+        amendment: OutboundCallConfigAmendment<'_>,
+    ) -> Option<AmendApplied> {
+        let config = &mut self.campaigns.get_mut(id)?.outbound_call_config;
+        let mut amended = false;
+
+        if let Some(contact_flow_id) = amendment.connect_contact_flow_id {
+            if config.connect_contact_flow_id != contact_flow_id {
+                config.connect_contact_flow_id = contact_flow_id.to_string();
+                amended = true;
+            }
+        }
+        if let Some(source_phone_number) = amendment.connect_source_phone_number {
+            if config.connect_source_phone_number.as_deref() != Some(source_phone_number) {
+                config.connect_source_phone_number = Some(source_phone_number.to_string());
+                amended = true;
+            }
+        }
+        if let Some(detection) = amendment.answer_machine_detection_config {
+            if !same_answer_machine_detection(config.answer_machine_detection_config.as_ref(), detection)
+            {
+                config.answer_machine_detection_config = Some(detection.clone());
+                amended = true;
+            }
+        }
+
+        Some(if amended {
+            AmendApplied::Amended
+        } else {
+            AmendApplied::Unchanged
+        })
+    }
+
     /// Every campaign in creation order — the order `ListCampaigns` pages over.
     pub fn campaigns_in_creation_order(&self) -> Vec<&StoredCampaign> {
         let mut all: Vec<&StoredCampaign> = self.campaigns.values().collect();
@@ -471,6 +523,35 @@ pub enum AmendApplied {
     Amended,
     /// The campaign already carried that value, so nothing was written.
     Unchanged,
+}
+
+/// The members one amendment of a campaign's outbound-call config carries, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::amend_outbound_call_config`]
+/// takes them.
+///
+/// A member left `None` here is one the request did not carry, and the stored value of it
+/// is left alone — so the absent member and a member asking for a new value are kept
+/// apart rather than collapsed into one "replace the whole config" step.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutboundCallConfigAmendment<'a> {
+    pub connect_contact_flow_id: Option<&'a str>,
+    pub connect_source_phone_number: Option<&'a str>,
+    pub answer_machine_detection_config: Option<&'a AnswerMachineDetectionConfig>,
+}
+
+/// Whether a stored answering-machine-detection config already says what `wanted` says,
+/// member by member.
+///
+/// The modelled shape carries no equality of its own, so the comparison lives here —
+/// beside the amendment that needs it — rather than being open-coded per caller.
+fn same_answer_machine_detection(
+    stored: Option<&AnswerMachineDetectionConfig>,
+    wanted: &AnswerMachineDetectionConfig,
+) -> bool {
+    stored.is_some_and(|stored| {
+        stored.enable_answer_machine_detection == wanted.enable_answer_machine_detection
+            && stored.await_answer_machine_prompt == wanted.await_answer_machine_prompt
+    })
 }
 
 /// Why this store took no dial request for a campaign, as
