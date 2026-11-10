@@ -17,6 +17,8 @@ mod blueprint_lifecycle;
 mod blueprint_optimization;
 #[path = "all/blueprint_stage_copy.rs"]
 mod blueprint_stage_copy;
+#[path = "all/constraint_requirement_wording.rs"]
+mod constraint_requirement_wording;
 #[path = "all/data_automation_library_lifecycle.rs"]
 mod data_automation_library_lifecycle;
 #[path = "all/data_automation_library_listing.rs"]

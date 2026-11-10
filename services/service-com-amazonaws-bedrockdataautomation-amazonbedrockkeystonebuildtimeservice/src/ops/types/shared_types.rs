@@ -574,7 +574,7 @@ pub const DOCUMENT_OUTPUT_TEXT_FORMAT_TYPE_VALUES: &[&str] = &["CSV", "HTML", "M
 
 
 /// The values `EntityType` accepts on the wire.
-pub const ENTITY_TYPE_VALUES: &[&str] = &["VOCABULARY"];
+pub const ENTITY_TYPE_VALUES: &[&str] = &["RECOGNIZED_PERSON", "VOCABULARY"];
 
 
 /// The values `ImageExtractionCategoryType` accepts on the wire.

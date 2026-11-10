@@ -53,7 +53,8 @@
 //!
 //! ## Input
 //!
-//! * `entityType` (EntityType, one of: VOCABULARY) **required** — The entity type for which
+//! * `entityType` (EntityType, one of: RECOGNIZED_PERSON | VOCABULARY) **required** — The
+//!   entity type for which
 //!   the entity list is requested
 //! * `libraryArn` (DataAutomationLibraryArn, len ..128, pattern
 //!   ^arn:aws(|-cn|-iso|-iso-[a-z]|-us-gov):bedrock:[a-zA-Z0-9-]*:[0-9]{12}:data-automation-library/[a-zA-Z0-9-]{12,36}$)

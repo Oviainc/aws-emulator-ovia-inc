@@ -22,8 +22,10 @@
 //!    sentence per resource kind, which does not carry the requested name;
 //! 3. a value outside a constraint its member declares is stated with the member path and
 //!    the requirement, with a `@pattern` quoted WITHOUT the `^`/`$` a whole-value pattern
-//!    is written with, and with NO value at all for a member the model marks
-//!    `@sensitive`.
+//!    is written with, and with NO value at all where the requirement IS the set of values
+//!    the member admits (a `@pattern`, an enumerated type's value set) or the member is one
+//!    the model marks `@sensitive` — while a clause whose requirement is a BOUND on the
+//!    value keeps the value half.
 
 use std::sync::Arc;
 
@@ -457,7 +459,8 @@ const NAME_PATTERN: &str = "[a-zA-Z0-9-_]+";
 
 /// The unanchored form of the expression `ClientToken` declares
 /// (`^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,256}$`, source: `smithy_query(shape="ClientToken")`).
-/// `ClientToken` is NOT `@sensitive`, so a clause about it still echoes its value.
+/// `ClientToken` is NOT `@sensitive`, so a clause about its `@length` bound still echoes
+/// its value — but a clause about this expression states the expression and no value.
 const CLIENT_TOKEN_PATTERN: &str = "[a-zA-Z0-9](-*[a-zA-Z0-9]){0,256}";
 
 /// A clause as this service states one: the member path, the requirement, and the value
@@ -530,7 +533,8 @@ fn validation_cases() -> Vec<ValidationCase> {
             ),
         },
         ValidationCase {
-            case: "clientToken outside its pattern: a member whose value is NOT withheld",
+            case: "clientToken outside its pattern: a member the model does not mark, whose \
+                   requirement is the expression itself",
             uri: "/blueprints/",
             body: json!({
                 "blueprintName": "well-formed",
@@ -538,13 +542,30 @@ fn validation_cases() -> Vec<ValidationCase> {
                 "schema": "{}",
                 "clientToken": spaced_token,
             }),
-            withheld: None,
+            withheld: Some(spaced_token.clone()),
             expected: one_error(
-                Some(&spaced_token),
+                None,
                 "clientToken",
                 &format!(
                     "Member must satisfy regular expression pattern: {CLIENT_TOKEN_PATTERN}"
                 ),
+            ),
+        },
+        ValidationCase {
+            case: "clientToken under its length lower bound: a BOUND on a member the model \
+                   does not mark, which keeps the value half",
+            uri: "/blueprints/",
+            body: json!({
+                "blueprintName": "well-formed",
+                "type": "DOCUMENT",
+                "schema": "{}",
+                "clientToken": "abc",
+            }),
+            withheld: None,
+            expected: one_error(
+                Some("abc"),
+                "clientToken",
+                "Member must have length greater than or equal to 33",
             ),
         },
         ValidationCase {
@@ -610,8 +631,9 @@ fn validation_cases() -> Vec<ValidationCase> {
 /// RULE: a value outside a constraint its member declares is refused `400`
 /// `ValidationException` naming the member path and the requirement, with a `@pattern`
 /// quoted WITHOUT the `^`/`$` a whole-value pattern wraps it in, and with no value at all
-/// for a member the model marks `@sensitive` — while a member the model does not mark
-/// keeps the value half.
+/// where the requirement IS the set of values the member admits or the member is one the
+/// model marks `@sensitive` — while a clause whose requirement is a BOUND on a member the
+/// model does not mark keeps the value half.
 #[tokio::test]
 async fn a_constraint_refusal_withholds_a_sensitive_value_and_drops_the_pattern_anchors() {
     let router = emulator();

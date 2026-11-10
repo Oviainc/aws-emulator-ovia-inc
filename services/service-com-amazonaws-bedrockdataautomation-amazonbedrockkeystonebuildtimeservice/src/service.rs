@@ -67,30 +67,17 @@ pub mod authorization;
 /// control plane's front door for the paths both models bind.
 pub mod tagging_target;
 
+/// How this service words the framework's boundary refusal of a request: the one rule its
+/// `override_refusal` below states, for every constrained member of every operation.
+pub mod validation;
+
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
     Refused, ServerHttpProtocol, Service,
 };
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, LazyLock};
-
-/// This service's Smithy model: the one source for which of its members are
-/// `@sensitive`, and so for which values a boundary refusal states none.
-const MODEL_JSON: &str = include_str!(
-    "../smithy-model/com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservice.json"
-);
-
-/// The members of this model whose value a refusal WITHHOLDS, read off [`MODEL_JSON`]
-/// rather than listed here, so the decision cannot drift from the model as the model
-/// grows a `@sensitive` member.
-///
-/// This model marks the two resource NAMES (`BlueprintName`,
-/// `DataAutomationProjectName`) and the library name beside them, so a request refused
-/// for the shape of a name it submitted is told which member and which requirement, and
-/// never handed the name back.
-static WITHHELD_MEMBERS: LazyLock<service_common::sensitive_members::WithheldMembers> =
-    LazyLock::new(|| service_common::sensitive_members::WithheldMembers::from_model(MODEL_JSON));
+use std::sync::Arc;
 
 pub mod date_time_timestamps;
 
@@ -180,23 +167,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) and leaves the words
-        // to the service. This service states them the shared AWS way: the framework's
-        // envelope, clauses, member paths and requirements, with two renderings the
-        // framework has no way to apply itself —
-        //
-        // * a `@pattern` requirement is quoted WITHOUT the `^`/`$` a whole-value
-        //   pattern is written with, so a caller that lifts the expression out of the
-        //   message compiles the expression this service advertises;
-        // * a clause about a member the model marks `@sensitive` ([`WITHHELD_MEMBERS`])
-        //   states NO value: a refusal does not hand back a value the model says not to
-        //   disclose.
+        // to the service. This service states them the shared AWS way — the framework's
+        // envelope, clauses, member paths and requirements — with the renderings
+        // [`validation`] owns: a `@pattern` quoted without its whole-value anchors, and
+        // no value at all in a clause whose requirement is the set of values the member
+        // admits or whose member the model marks `@sensitive`.
         //
         // The code stays `ValidationException`, which is both the modelled client-input
         // error of this service and what the framework already answered, so nothing a
         // client branches on changes — only the words.
-        service_common::validation_message::aws_validation_refusal_withholding(refusal, |path| {
-            WITHHELD_MEMBERS.withholds_value(path)
-        })
+        validation::refused(refusal)
     }
 
     fn override_routing_error(
