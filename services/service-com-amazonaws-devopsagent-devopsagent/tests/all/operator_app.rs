@@ -13,13 +13,18 @@
 //! and `GetOperatorApp` reports exactly the stored flows plus the URL operators reach
 //! the app at. An AgentSpace that exists but has no flow enabled has nothing configured,
 //! which the read reports as the empty configuration; an `agentSpaceId` naming no
-//! AgentSpace names no Operator App either, which the read refuses as not found.
+//! AgentSpace names no Operator App either, which the read refuses as not found with
+//! the wording this service's control plane uses for a lookup that resolved nothing:
+//! HTTP 404 `ResourceNotFoundException` naming both the identifier the request carried
+//! and the account the lookup ran in, each double-quoted.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::agent_space_not_found::{assert_not_found, missing_identifiers};
 
 /// The `AuthFlow` value set, from the model's enum
 /// (`smithy_query(query="shape", shape="AuthFlow")`). Every value is enabled by some
@@ -386,25 +391,18 @@ async fn an_agent_space_with_no_enabled_flow_reports_the_empty_configuration() {
 #[tokio::test]
 async fn reading_the_operator_app_of_an_agent_space_that_does_not_exist_is_refused() {
     let router = new_router();
-    // One minted-looking id and one that is merely well formed: neither names a
-    // stored AgentSpace, so neither names an Operator App.
-    for case in ["as-0000000000000000", "no-such-agent-space"] {
-        let (status, refused) = get_operator_app(&router, case, REGION).await;
-        assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404, got {status} ({refused})"
+    // A stored AgentSpace, so each refusal below is decided from what the store holds
+    // rather than from the store being empty.
+    let present = create_space(&router, "a-space-that-exists", REGION).await;
+
+    for agent_space_id in missing_identifiers() {
+        assert_ne!(
+            agent_space_id, present,
+            "the table must not name the stored AgentSpace"
         );
-        assert_eq!(
-            error_code(&refused),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {refused}"
-        );
-        assert!(
-            refused["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(case)),
-            "case {case:?}: the refusal must name the agent space, got {refused}"
-        );
+        let case = format!("GetOperatorApp {agent_space_id:?}");
+        let (status, refused) = get_operator_app(&router, &agent_space_id, REGION).await;
+        assert_not_found(&case, &agent_space_id, status, &refused);
     }
 }
 
@@ -633,25 +631,23 @@ async fn an_enablement_whose_flow_is_not_configured_is_refused_and_stores_nothin
 #[tokio::test]
 async fn enabling_the_operator_app_of_an_agent_space_that_does_not_exist_is_refused() {
     let router = new_router();
+    // A stored AgentSpace, so each refusal below is decided from what the store holds
+    // rather than from the store being empty.
+    let present = create_space(&router, "a-space-that-exists", REGION).await;
     let body = json!({
         "authFlow": "iam",
         "operatorAppRoleArn": role_arn("aws", "123456789012", "OperatorAppRole"),
     });
 
-    for case in ["as-0000000000000000", "no-such-agent-space"] {
-        let (status, refused) = enable_operator_app(&router, case, body.clone(), REGION).await;
-        assert_eq!(status, 404, "case {case:?}: expected 404, got {status} ({refused})");
-        assert_eq!(
-            error_code(&refused),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {refused}"
+    for agent_space_id in missing_identifiers() {
+        assert_ne!(
+            agent_space_id, present,
+            "the table must not name the stored AgentSpace"
         );
-        assert!(
-            refused["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(case)),
-            "case {case:?}: the refusal must name the agent space, got {refused}"
-        );
+        let case = format!("EnableOperatorApp {agent_space_id:?}");
+        let (status, refused) =
+            enable_operator_app(&router, &agent_space_id, body.clone(), REGION).await;
+        assert_not_found(&case, &agent_space_id, status, &refused);
     }
 }
 

@@ -22,6 +22,11 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::agent_space_not_found::{
+    assert_not_found, caller_account, expected_message, missing_identifiers,
+    AGENT_SPACE_ID_MAX_LEN,
+};
+
 /// A SigV4 credential scope naming this service's signing name (`aidevops`), which
 /// is how the router resolves which service claims a request. Signature
 /// verification is switched off for these tests, so the signature is a placeholder.
@@ -29,11 +34,6 @@ const AUTHORIZATION: &str = concat!(
     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-west-2/aidevops/aws4_request, ",
     "SignedHeaders=host, Signature=0123456789abcdef"
 );
-
-/// The published bounds of `AgentSpaceId`'s `^[a-zA-Z0-9-]{1,64}$`, from
-/// `smithy_query(query="shape", shape="AgentSpaceId")`.
-const AGENT_SPACE_ID_MIN_LEN: usize = 1;
-const AGENT_SPACE_ID_MAX_LEN: usize = 64;
 
 /// One emulator: a single shared engine behind the production router.
 fn new_router() -> MultiServiceRouter {
@@ -82,34 +82,6 @@ async fn call(
         })
     };
     (status, parsed)
-}
-
-/// The wire error code (`__type`) of an error response.
-fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        .rsplit(['#', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The account every request this emulator serves is signed for, which is the
-/// account scope an AgentSpace lookup runs in.
-fn caller_account() -> &'static str {
-    ::emulator_server::emulator_account_id()
-}
-
-/// The not-found wording this service's control plane answers with: fixed text
-/// around two double-quoted slots, the requested identifier and the account the
-/// lookup ran in. Written out here rather than reused from the service so the test
-/// pins the text itself.
-fn expected_message(agent_space_id: &str) -> String {
-    format!(
-        "Could not find Agent Space with provided agentSpaceId \"{agent_space_id}\" in accountId \"{}\"",
-        caller_account()
-    )
 }
 
 /// One control-plane call that resolves an `agentSpaceId`.
@@ -193,41 +165,6 @@ async fn create_space(router: &MultiServiceRouter, name: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("case {name:?}: no agentSpaceId in {body}"))
         .to_string()
-}
-
-/// Identifiers that satisfy `AgentSpaceId`'s `^[a-zA-Z0-9-]{1,64}$` and name no
-/// stored AgentSpace: the shortest admissible one, a digit-only one, one in the
-/// form this service mints, a mixed-case hyphenated one, an all-hyphen one, and one
-/// at the pattern's maximum length.
-fn missing_identifiers() -> Vec<String> {
-    vec![
-        "a".repeat(AGENT_SPACE_ID_MIN_LEN),
-        "7".to_string(),
-        "as-0000000000000000".to_string(),
-        "Mixed-Case-Agent-Space-42".to_string(),
-        "---".to_string(),
-        "z".repeat(AGENT_SPACE_ID_MAX_LEN),
-    ]
-}
-
-/// Assert one call's refusal: HTTP 404, `ResourceNotFoundException`, and exactly
-/// the not-found wording for the identifier the request carried.
-fn assert_not_found(case: &str, agent_space_id: &str, status: u16, body: &Value) {
-    assert_eq!(
-        status, 404,
-        "case {case:?}: expected 404 for an agentSpaceId naming no AgentSpace, got {status} ({body})"
-    );
-    assert_eq!(
-        error_code(body),
-        "ResourceNotFoundException",
-        "case {case:?}: expected ResourceNotFoundException, got {body}"
-    );
-    let actual = body["message"].as_str().unwrap_or("<no message>");
-    assert_eq!(
-        actual,
-        expected_message(agent_space_id),
-        "case {case:?}: expected the not-found wording naming the agentSpaceId and the account, got {actual:?}"
-    );
 }
 
 #[tokio::test]
