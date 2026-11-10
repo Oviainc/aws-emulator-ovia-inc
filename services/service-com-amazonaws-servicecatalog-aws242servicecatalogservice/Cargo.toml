@@ -10,6 +10,12 @@ build = "build.rs"
 # The shared request-claim rule for a SigV4 signing name several services share.
 service-common = { path = "../common" }
 engine = { workspace = true }
+# A provisioning artifact NAMES its CloudFormation template (a URL, or the stack that
+# contains it) rather than holding it, and the template is CloudFormation's to read: the
+# client `DescribeProvisioningParameters` summarises that template through, over the
+# in-process callback into this same emulator (no network client feature: the transport
+# is the emulator's own).
+aws-sdk-cloudformation = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -33,6 +39,15 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The service that OWNS a CloudFormation template, and the object store a staged template
+# lives in, mounted beside Service Catalog on the one engine the test router builds — the
+# same shape `core/router/src/lib.rs` mounts them in: the parameters a product version
+# declares are read through CloudFormation, which reads the staged object out of Amazon S3.
+service-com-amazonaws-cloudformation-cloudformation = { workspace = true }
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# URL-form-encodes the CloudFormation request the suite that stages a SOURCE STACK sends
+# (the encoder behind the `url` crate), so no suite hand-rolls a percent-encoder.
+form_urlencoded = "1"
 
 [lints]
 workspace = true

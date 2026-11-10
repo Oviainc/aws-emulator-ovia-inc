@@ -31,6 +31,8 @@ mod portfolios_for_product;
 mod product_copies;
 #[path = "all/provisioned_products.rs"]
 mod provisioned_products;
+#[path = "all/provisioning_parameters.rs"]
+mod provisioning_parameters;
 #[path = "all/resources_for_tag_option.rs"]
 mod resources_for_tag_option;
 #[path = "all/state_roundtrip.rs"]

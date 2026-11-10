@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeProvisioningParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeProvisioningParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeProvisioningParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +96,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The shared reading of the id-or-name pair every resource this request names is
+// addressed by, and the sentences this service refuses an unresolved one with.
+use crate::state::{Addressed, KIND_LAUNCH_PATH, KIND_PROVISIONING_ARTIFACT};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -174,18 +169,499 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeProvisioningParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeProvisioningParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeProvisioningParameters"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // A pure read: everything this answer takes from this service's own store is
+        // read here, under the lock, and nothing is written — so a later caller sees
+        // exactly what this one saw. The lock is released before the version's
+        // template is read, so no store lock is held across an await.
+        let launch = {
+            let state = state.lock();
+            resolve(&state, &input)?
+        };
+
+        // "Information about the parameters used to provision the product": the
+        // parameters the version's TEMPLATE declares. The template is CloudFormation's
+        // to read — a provisioning artifact names it rather than holding it — so the
+        // declarations come from CloudFormation's own summary of that template, which
+        // is the read Service Catalog documents an end user's permissions must allow
+        // (`cloudformation:GetTemplateSummary`) for this very call.
+        let provisioning_artifact_parameters =
+            template_parameters(ctx, &launch.template).await;
+
+        Ok(DescribeProvisioningParametersOutput {
+            provisioning_artifact_parameters: Some(provisioning_artifact_parameters),
+            constraint_summaries: Some(launch.constraint_summaries),
+            // "Any additional metadata specifically related to the provisioning of the
+            // product": metadata a product's seller publishes beside the version.
+            // Nothing in this service stores any — no operation takes it — so this
+            // launch carries none rather than an invented instruction.
+            usage_instructions: Some(Vec::new()),
+            tag_options: Some(launch.tag_options),
+            provisioning_artifact_preferences: launch.preferences,
+            // "The keys and descriptions of the outputs" are the OUTPUTS the version's
+            // template declares. The template read above is a SUMMARY of that template,
+            // which reports what it declares as parameters and not what it declares as
+            // outputs, and nothing in this service holds the template itself — so no
+            // output is reported rather than one derived from something else. (The
+            // deprecated `ProvisioningArtifactOutputs` reports the same reading, so the
+            // two members cannot disagree.)
+            provisioning_artifact_outputs: None,
+            provisioning_artifact_output_keys: None,
+        })
     }
+}
+
+/// What this call resolved out of the store: the launch the request named, and
+/// everything about it this service itself holds.
+struct Launch {
+    /// Where the version's template is, as the version's `Info` names it.
+    template: TemplateSource,
+    /// The constraints that govern launching this product through this path.
+    constraint_summaries: Vec<ConstraintSummary>,
+    /// The TagOptions this launch offers, one entry per key.
+    tag_options: Vec<TagOptionSummary>,
+    /// The accounts and Regions a STACKSET constraint governs this launch with, or
+    /// `None` where no such constraint does.
+    preferences: Option<ProvisioningArtifactPreferences>,
+}
+
+/// Where the template of one provisioning artifact is, as that version's `Info` names
+/// it: "specify the template source with one of the following options, but not both.
+/// Keys accepted: [ LoadTemplateFromURL, ImportFromPhysicalId ]."
+///
+/// Both are addresses rather than bodies, and CloudFormation is what resolves either —
+/// a URL names an object in this account's object store, and a physical id names a
+/// CloudFormation stack ("currently supports CloudFormation stack ARN") whose own
+/// template is the version's.
+enum TemplateSource {
+    /// `LoadTemplateFromURL`: "the URL of the CloudFormation template in Amazon S3 or
+    /// GitHub in JSON format".
+    Url(String),
+    /// `ImportFromPhysicalId`: "the physical id of the resource that contains the
+    /// template".
+    Stack(String),
+    /// A version whose `Info` names neither, so no template is addressed at all.
+    Unaddressed,
+}
+
+/// Resolve the launch the request names out of the store: the product, the path it is
+/// launched through, and the version to launch — then everything this service holds
+/// about that launch.
+///
+/// Every resource is resolved BEFORE anything is reported, so a request naming one
+/// that does not resolve is refused rather than answered in part. This is the END-USER
+/// view of a product, which reaches a product only through a launch path, exactly as
+/// `DescribeProduct` and `ProvisionProduct` do.
+fn resolve(
+    state: &crate::state::ComAmazonawsServicecatalogAws242servicecatalogserviceState,
+    input: &DescribeProvisioningParametersInput,
+) -> Result<Launch, DescribeProvisioningParametersError> {
+    // The product is addressed by id or by name — "You must provide the product name
+    // or ID, but not both" — and a request that addresses it by neither names no
+    // product to report on.
+    let addressed_product = crate::state::addressed(
+        input.product_id.as_deref(),
+        input.product_name.as_deref(),
+        "ProductId",
+        "ProductName",
+    )
+    .map_err(invalid_parameters)?
+    .ok_or_else(|| {
+        invalid_parameters(crate::state::either_required("ProductId", "ProductName"))
+    })?;
+    let product = match addressed_product {
+        Addressed::Id(id) => state.products.get(id),
+        Addressed::Name(name) => state.products.values().find(|product| product.name == name),
+    };
+
+    // A launch path is the product's relationship with a portfolio it can be launched
+    // through, so a product that sits in no portfolio — and a product id or name
+    // nothing stored carries, which resolves no path either — has no launch to describe
+    // the configuration of, and the request is refused as a not-found resource naming
+    // the product. This is NOT a parameter error about the optional `PathId`/`PathName`:
+    // no path can be named for a product that has none.
+    let paths: Vec<(String, String)> = product
+        .map(|product| {
+            state
+                .launch_path_portfolios(&product.id)
+                .into_iter()
+                .map(|portfolio| (portfolio.id.clone(), portfolio.display_name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let product = match product.filter(|_| !paths.is_empty()) {
+        Some(product) => product,
+        None => {
+            return Err(not_found_resource(crate::state::no_launch_paths_message(
+                addressed_product.identifier(),
+            )))
+        }
+    };
+
+    // The path this launch goes through: the one the request names, or the product's
+    // default path. `PathId` "is optional if the product has a default path, and
+    // required if the product has more than one path", and a product reachable through
+    // exactly one portfolio needs no disambiguation — the same derivation
+    // `ProductViewSummary$HasDefaultPath` reports.
+    let path_id = match crate::state::addressed(
+        input.path_id.as_deref(),
+        input.path_name.as_deref(),
+        "PathId",
+        "PathName",
+    )
+    .map_err(invalid_parameters)?
+    {
+        Some(addressed_path) => {
+            let found = paths.iter().find(|(id, name)| match addressed_path {
+                Addressed::Id(path_id) => id == path_id,
+                Addressed::Name(path_name) => name == path_name,
+            });
+            match found {
+                Some((id, _)) => id.clone(),
+                None => {
+                    return Err(not_found_resource(crate::state::not_found_message(
+                        KIND_LAUNCH_PATH,
+                        addressed_path.identifier(),
+                    )))
+                }
+            }
+        }
+        None => match paths.as_slice() {
+            [(id, _)] => id.clone(),
+            _ => return Err(invalid_parameters(crate::state::PATH_REQUIRED.to_string())),
+        },
+    };
+
+    // The version whose configuration this is, addressed by id or by name the same way
+    // and resolved among THIS product's provisioning artifacts: an artifact of another
+    // product is no version of this one.
+    let addressed_artifact = crate::state::addressed(
+        input.provisioning_artifact_id.as_deref(),
+        input.provisioning_artifact_name.as_deref(),
+        "ProvisioningArtifactId",
+        "ProvisioningArtifactName",
+    )
+    .map_err(invalid_parameters)?
+    .ok_or_else(|| {
+        invalid_parameters(crate::state::either_required(
+            "ProvisioningArtifactId",
+            "ProvisioningArtifactName",
+        ))
+    })?;
+    let artifact = match addressed_artifact {
+        Addressed::Id(id) => product.provisioning_artifacts.get(id),
+        Addressed::Name(name) => product
+            .provisioning_artifacts
+            .values()
+            .find(|artifact| artifact.name.as_deref() == Some(name)),
+    }
+    .ok_or_else(|| {
+        not_found_resource(crate::state::not_found_message(
+            KIND_PROVISIONING_ARTIFACT,
+            addressed_artifact.identifier(),
+        ))
+    })?;
+
+    // "Information about the constraints used to provision the product": the
+    // constraints stored ON this launch — the portfolio-product pair the path IS — in
+    // constraint-id order, which is the one order every list over that map walks.
+    // `ConstraintSummary` carries a type and a description and no status, so every
+    // stored constraint of the pair is reported.
+    let constraints: Vec<&crate::state::Constraint> = state
+        .constraints
+        .values()
+        .filter(|constraint| {
+            constraint.portfolio_id == path_id && constraint.product_id == product.id
+        })
+        .collect();
+
+    Ok(Launch {
+        template: template_source(&artifact.info),
+        constraint_summaries: constraints
+            .iter()
+            .map(|constraint| constraint.summary())
+            .collect(),
+        tag_options: tag_option_summaries(state, &path_id, &product.id),
+        preferences: stack_set_preferences(&constraints),
+    })
+}
+
+/// Where the version's template is, read from the `Info` map the version was created
+/// with ([`TemplateSource`]). A map naming both keys is not one `CreateProduct` stores
+/// — it refuses that request — so the URL is read first and the physical id answers for
+/// a version that names one instead.
+fn template_source(info: &std::collections::BTreeMap<String, String>) -> TemplateSource {
+    if let Some(url) = info
+        .get(LOAD_TEMPLATE_FROM_URL)
+        .filter(|url| !url.is_empty())
+    {
+        return TemplateSource::Url(url.clone());
+    }
+    match info
+        .get(IMPORT_FROM_PHYSICAL_ID)
+        .filter(|id| !id.is_empty())
+    {
+        Some(physical_id) => TemplateSource::Stack(physical_id.clone()),
+        None => TemplateSource::Unaddressed,
+    }
+}
+
+/// The `Info` key naming a template to read from a URL
+/// (`ProvisioningArtifactProperties$Info`: "Keys accepted: [ `LoadTemplateFromURL`,
+/// `ImportFromPhysicalId` ]").
+const LOAD_TEMPLATE_FROM_URL: &str = "LoadTemplateFromURL";
+
+/// The `Info` key naming the physical id of a resource that contains the template.
+const IMPORT_FROM_PHYSICAL_ID: &str = "ImportFromPhysicalId";
+
+/// "Information about the TagOptions associated with the resource": the TagOptions this
+/// launch offers, one entry per KEY, with the values the launch may use for it.
+///
+/// A launch is a product reached through a portfolio, so the TagOptions associated with
+/// EITHER of those two resources apply to it — the same stored associations
+/// `AssociateTagOptionWithResource` writes and `DescribeProduct`'s admin view reports.
+/// Only an ACTIVE TagOption is offered: `TagOptionDetail$Active` is what says whether a
+/// TagOption may be used, and `UpdateTagOption` is what sets it.
+///
+/// Where the two resources carry the same key, the values this launch may use are the
+/// ones they AGREE on, which is empty exactly when they agree on none: "if the output
+/// contains a TagOption key with an empty list of values, there is a TagOption conflict
+/// for that key", which this operation's own documentation describes as a conflict the
+/// end user cannot fix and which does not block the launch.
+fn tag_option_summaries(
+    state: &crate::state::ComAmazonawsServicecatalogAws242servicecatalogserviceState,
+    portfolio_id: &str,
+    product_id: &str,
+) -> Vec<TagOptionSummary> {
+    let portfolio_values = active_tag_option_values(state, portfolio_id);
+    let product_values = active_tag_option_values(state, product_id);
+    let mut keys: Vec<&String> = portfolio_values.keys().chain(product_values.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .map(|key| {
+            let values = match (portfolio_values.get(key), product_values.get(key)) {
+                (Some(portfolio), Some(product)) => {
+                    portfolio.intersection(product).cloned().collect()
+                }
+                (Some(only), None) | (None, Some(only)) => only.iter().cloned().collect(),
+                // Unreachable: the key came from one of the two maps.
+                (None, None) => Vec::new(),
+            };
+            TagOptionSummary {
+                key: Some(key.clone()),
+                values: Some(values),
+            }
+        })
+        .collect()
+}
+
+/// The values the ACTIVE TagOptions associated with one resource offer, by TagOption
+/// key: a `BTreeMap` of `BTreeSet`s, so the keys and the values a launch reports are in
+/// one stable order whichever resource contributed them.
+fn active_tag_option_values(
+    state: &crate::state::ComAmazonawsServicecatalogAws242servicecatalogserviceState,
+    resource_id: &str,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut values: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for tag_option in state
+        .resource_tag_option_ids(resource_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|id| state.tag_options.get(id))
+        .filter(|tag_option| tag_option.active)
+    {
+        values
+            .entry(tag_option.key.clone())
+            .or_default()
+            .insert(tag_option.value.clone());
+    }
+    values
+}
+
+/// "An object that contains information about preferences, such as Regions and
+/// accounts, for the provisioning artifact": the accounts and Regions a STACKSET
+/// constraint on this launch governs it with.
+///
+/// A `STACKSET` constraint's `Parameters` document is "a string containing one or more
+/// values: AccountList, RegionList, AdminRole, ExecutionRole" — the accounts and Regions
+/// a stack-set-provisioned product may be deployed to — so a launch governed by one
+/// reports those two lists and a launch governed by none reports no preferences at all
+/// rather than empty ones. The document is read with the JSON reader this crate already
+/// uses; a document that is no JSON object, or whose lists are not lists of strings,
+/// states no preference this service can report.
+fn stack_set_preferences(
+    constraints: &[&crate::state::Constraint],
+) -> Option<ProvisioningArtifactPreferences> {
+    let parameters: ::serde_json::Value = constraints
+        .iter()
+        .find(|constraint| constraint.constraint_type == CONSTRAINT_TYPE_STACKSET)
+        .and_then(|constraint| ::serde_json::from_str(&constraint.parameters).ok())?;
+    let accounts = string_list(&parameters, STACK_SET_ACCOUNT_LIST);
+    let regions = string_list(&parameters, STACK_SET_REGION_LIST);
+    (accounts.is_some() || regions.is_some()).then_some(ProvisioningArtifactPreferences {
+        stack_set_accounts: accounts,
+        stack_set_regions: regions,
+    })
+}
+
+/// One list of strings a constraint's `Parameters` document states under `member`, or
+/// `None` where it states none.
+fn string_list(parameters: &::serde_json::Value, member: &str) -> Option<Vec<String>> {
+    let values = parameters.get(member)?.as_array()?;
+    Some(
+        values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// The `ConstraintType` whose `Parameters` state the accounts and Regions a launch may
+/// deploy to (`smithy_query query="doc" shape="CreateConstraintInput" member="Type"`:
+/// `LAUNCH`, `NOTIFICATION`, `RESOURCE_UPDATE`, `STACKSET`, `TEMPLATE`).
+const CONSTRAINT_TYPE_STACKSET: &str = "STACKSET";
+
+/// The `STACKSET` constraint parameter naming the accounts a launch may deploy to.
+const STACK_SET_ACCOUNT_LIST: &str = "AccountList";
+
+/// The `STACKSET` constraint parameter naming the Regions a launch may deploy to.
+const STACK_SET_REGION_LIST: &str = "RegionList";
+
+/// The parameters the version's template declares, as this operation reports them.
+///
+/// The template belongs to CloudFormation: a provisioning artifact names it — by URL or
+/// by the stack that contains it — and CloudFormation is what reads either and reports
+/// what it declares, which is the permission Service Catalog documents an end user
+/// needs for this call (`cloudformation:GetTemplateSummary`). So the declarations are
+/// asked for rather than derived here, and a template this account's CloudFormation
+/// cannot read declares no parameter this service can report: the version's own answer
+/// (its constraints, its TagOptions, its preferences) is still this service's to give,
+/// so the call is served with no parameters rather than refused.
+///
+/// Nothing here opens a socket or leaves the host: the call goes over the framework's
+/// in-process callback into this same emulator ([`cloudformation_client`]).
+async fn template_parameters(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    template: &TemplateSource,
+) -> Vec<ProvisioningArtifactParameter> {
+    let cloudformation = cloudformation_client(ctx, &crate::state::request_region(ctx));
+    let summary = cloudformation
+        .get_template_summary()
+        // A summary is NOT a deployment: this call reports what the template declares,
+        // so a resource type CloudFormation's own catalogue does not recognise is a
+        // warning on the summary rather than a refusal of it, and the parameters of
+        // such a template are still the version's parameters.
+        .template_summary_config(
+            ::aws_sdk_cloudformation::types::TemplateSummaryConfig::builder()
+                .treat_unrecognized_resource_types_as_warnings(true)
+                .build(),
+        );
+    let summary = match template {
+        TemplateSource::Url(url) => summary.template_url(url),
+        TemplateSource::Stack(physical_id) => summary.stack_name(physical_id),
+        // A version that addresses no template has none to declare parameters.
+        TemplateSource::Unaddressed => return Vec::new(),
+    };
+    match summary.send().await {
+        Ok(summary) => summary
+            .parameters()
+            .iter()
+            .map(provisioning_artifact_parameter)
+            .collect(),
+        Err(error) => {
+            ::tracing::debug!(
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the provisioning artifact's template could not be summarised, so this launch \
+                 reports no provisioning parameters"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// One `ProvisioningArtifactParameter`: what the template declares for one parameter,
+/// as CloudFormation reported it.
+///
+/// `IsNoEcho` is `false` where the declaration states nothing, which is that member's
+/// own modelled default. `ParameterConstraints` carries the allowed values the
+/// declaration permits — the one constraint a template summary reports ("although other
+/// constraints might be defined in the stack template, CloudFormation returns only the
+/// AllowedValues property"), so the other members of that shape are left unstated
+/// rather than guessed at — and the EMPTY list for a parameter whose declaration
+/// permits any value of its type.
+fn provisioning_artifact_parameter(
+    declared: &::aws_sdk_cloudformation::types::ParameterDeclaration,
+) -> ProvisioningArtifactParameter {
+    ProvisioningArtifactParameter {
+        parameter_key: declared.parameter_key().map(str::to_string),
+        default_value: declared.default_value().map(str::to_string),
+        parameter_type: declared.parameter_type().map(str::to_string),
+        is_no_echo: declared.no_echo().unwrap_or(false),
+        description: declared.description().map(str::to_string),
+        parameter_constraints: Some(ParameterConstraints {
+            allowed_values: Some(
+                declared
+                    .parameter_constraints()
+                    .map(|constraints| constraints.allowed_values().to_vec())
+                    .unwrap_or_default(),
+            ),
+            ..ParameterConstraints::default()
+        }),
+    }
+}
+
+/// A CloudFormation client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated service:
+/// it routes in process, so no socket is opened, no name is resolved and nothing outside
+/// this process is reachable from it. The endpoint URL is addressing for that transport,
+/// built from the Region alone, and the credentials are the emulator's own — the
+/// caller's `Authorization` header is never forwarded. The transport is in-process, so
+/// there is nothing to retry, time out or watch for a stalled stream, and each of those
+/// would need a sleep implementation this client is not given.
+fn cloudformation_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_cloudformation::Client {
+    let config = ::aws_sdk_cloudformation::Config::builder()
+        .behavior_version(::aws_sdk_cloudformation::config::BehaviorVersion::latest())
+        .region(::aws_sdk_cloudformation::config::Region::new(
+            region.to_string(),
+        ))
+        .endpoint_url(format!("https://cloudformation.{region}.amazonaws.com"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        .retry_config(::aws_sdk_cloudformation::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_cloudformation::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_cloudformation::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_cloudformation::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_cloudformation::Client::from_conf(config)
+}
+
+/// This operation's parameter error, carrying `message`.
+fn invalid_parameters(message: String) -> DescribeProvisioningParametersError {
+    DescribeProvisioningParametersErrorModeled::InvalidParametersException(
+        InvalidParametersException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// This operation's not-found error, carrying `message`: the sentences are this
+/// service's own, shared with every other operation that resolves the same launch.
+fn not_found_resource(message: String) -> DescribeProvisioningParametersError {
+    DescribeProvisioningParametersErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

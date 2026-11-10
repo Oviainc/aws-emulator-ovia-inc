@@ -97,6 +97,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The shared reading of the id-or-name pair every resource this request names is
+// addressed by, and the sentences this service refuses an unresolved one with.
+use crate::state::{Addressed, KIND_LAUNCH_PATH, KIND_PROVISIONING_ARTIFACT};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -191,14 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The product is addressed by id or by name — "You must provide the name or
         // ID, but not both" — and a request that addresses it by neither names no
         // product to provision.
-        let addressed_product = addressed(
+        let addressed_product = crate::state::addressed(
             input.product_id.as_deref(),
             input.product_name.as_deref(),
             "ProductId",
             "ProductName",
         )
         .map_err(invalid_parameters)?
-        .ok_or_else(|| invalid_parameters(either_required("ProductId", "ProductName")))?;
+        .ok_or_else(|| {
+            invalid_parameters(crate::state::either_required("ProductId", "ProductName"))
+        })?;
         let product = match addressed_product {
             Addressed::Id(id) => state.products.get(id),
             Addressed::Name(name) => {
@@ -232,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // required if the product has more than one path", and a product reachable
         // through exactly one portfolio needs no disambiguation — the same derivation
         // `ProductViewSummary$HasDefaultPath` reports.
-        let path_id = match addressed(
+        let path_id = match crate::state::addressed(
             input.path_id.as_deref(),
             input.path_name.as_deref(),
             "PathId",
@@ -252,20 +258,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => match paths.as_slice() {
                 [(id, _)] => id.clone(),
-                _ => {
-                    return Err(invalid_parameters(
-                        "A path is required when the product has more than one path. To list the \
-                         paths for a product, use ListLaunchPaths."
-                            .to_string(),
-                    ))
-                }
+                _ => return Err(invalid_parameters(crate::state::PATH_REQUIRED.to_string())),
             },
         };
 
         // The product version to launch, addressed by id or by name the same way and
         // resolved among THIS product's provisioning artifacts: an artifact of another
         // product is no version of this one.
-        let artifact = addressed(
+        let artifact = crate::state::addressed(
             input.provisioning_artifact_id.as_deref(),
             input.provisioning_artifact_name.as_deref(),
             "ProvisioningArtifactId",
@@ -273,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(invalid_parameters)?
         .ok_or_else(|| {
-            invalid_parameters(either_required(
+            invalid_parameters(crate::state::either_required(
                 "ProvisioningArtifactId",
                 "ProvisioningArtifactName",
             ))
@@ -392,59 +392,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Which of the two members that address one resource the request gave.
-///
-/// Several of this operation's inputs come in that pair — a product, a launch path and
-/// a provisioning artifact — and every pair carries the same contract: "You must
-/// provide the name or ID, but not both."
-#[derive(Debug, Clone, Copy)]
-enum Addressed<'a> {
-    Id(&'a str),
-    Name(&'a str),
-}
-
-impl Addressed<'_> {
-    /// The value the request addressed the resource by, which a refusal names.
-    fn identifier(&self) -> &str {
-        match self {
-            Addressed::Id(id) => id,
-            Addressed::Name(name) => name,
-        }
-    }
-}
-
-/// How the request addressed one resource: by `id`, by `name`, or by neither
-/// (`None`). `Err` carries the refusal for a request that gave BOTH, which the
-/// members' own documentation forbids.
-///
-/// An empty string addresses nothing: the modelled minimum length of each of these
-/// members is 1, so a member that arrives empty names no resource.
-fn addressed<'a>(
-    id: Option<&'a str>,
-    name: Option<&'a str>,
-    id_member: &str,
-    name_member: &str,
-) -> Result<Option<Addressed<'a>>, String> {
-    match (
-        id.filter(|value| !value.is_empty()),
-        name.filter(|value| !value.is_empty()),
-    ) {
-        (Some(_), Some(_)) => Err(format!(
-            "{id_member} and {name_member} cannot both be provided: you must provide the name or \
-             ID, but not both."
-        )),
-        (Some(id), None) => Ok(Some(Addressed::Id(id))),
-        (None, Some(name)) => Ok(Some(Addressed::Name(name))),
-        (None, None) => Ok(None),
-    }
-}
-
-/// The refusal for a request that named a resource it must address by neither of the
-/// two members that address it.
-fn either_required(id_member: &str, name_member: &str) -> String {
-    format!("Either {id_member} or {name_member} must be provided.")
-}
-
 /// This operation's parameter error, carrying `message`.
 fn invalid_parameters(message: String) -> ProvisionProductError {
     ProvisionProductErrorModeled::InvalidParametersException(InvalidParametersException {
@@ -454,26 +401,23 @@ fn invalid_parameters(message: String) -> ProvisionProductError {
 }
 
 /// This operation's not-found error for a product that resolves no launch path: the
-/// product sits in no portfolio, or nothing stored carries the identifier at all.
+/// product sits in no portfolio, or nothing stored carries the identifier at all. The
+/// sentence is this service's own ([`crate::state::no_launch_paths_message`]), shared
+/// with the read that resolves the same triple.
 fn no_launch_paths(identifier: &str) -> ProvisionProductError {
     ProvisionProductErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("No launch paths found for resource: {identifier}")),
+        message: Some(crate::state::no_launch_paths_message(identifier)),
     })
     .into()
 }
 
 /// This operation's not-found error for an identifier that resolves to nothing: the
 /// message names the KIND of resource the request addressed and the identifier it used,
-/// the shape every not-found in this service reports.
+/// the shape every not-found in this service reports
+/// ([`crate::state::not_found_message`]).
 fn not_found(kind: &str, identifier: &str) -> ProvisionProductError {
     ProvisionProductErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("{kind} not found: {identifier}")),
+        message: Some(crate::state::not_found_message(kind, identifier)),
     })
     .into()
 }
-
-/// The resource kind a launch path is, as its not-found names it.
-const KIND_LAUNCH_PATH: &str = "Launch path";
-
-/// The resource kind a product version is, as its not-found names it.
-const KIND_PROVISIONING_ARTIFACT: &str = "Provisioning artifact";

@@ -191,6 +191,31 @@ pub(crate) async fn create_product_of_type(
     product_type: &str,
     token: &str,
 ) -> String {
+    create_product_with_info(
+        router,
+        name,
+        product_type,
+        // The accepted `Info` keys are the model's own:
+        // `ProvisioningArtifactProperties$Info` documents
+        // "Keys accepted: [ LoadTemplateFromURL, ImportFromPhysicalId ]".
+        &json!({"LoadTemplateFromURL": "https://example.invalid/template.json"}),
+        token,
+    )
+    .await
+}
+
+/// Create one product of `product_type` whose first version names `info` as its template
+/// source, and answer the id the service minted.
+///
+/// The one `CreateProduct` caller of this crate's suites, so a suite that needs a version
+/// pointing at a template it staged does not spell a second create of its own.
+pub(crate) async fn create_product_with_info(
+    router: &MultiServiceRouter,
+    name: &str,
+    product_type: &str,
+    info: &Value,
+    token: &str,
+) -> String {
     let artifact_type = match product_type {
         "MARKETPLACE" => "MARKETPLACE_AMI",
         shared => shared,
@@ -205,10 +230,7 @@ pub(crate) async fn create_product_of_type(
             "ProvisioningArtifactParameters": {
                 "Name": "v1",
                 "Type": artifact_type,
-                // The accepted `Info` keys are the model's own:
-                // `ProvisioningArtifactProperties$Info` documents
-                // "Keys accepted: [ LoadTemplateFromURL, ImportFromPhysicalId ]".
-                "Info": {"LoadTemplateFromURL": "https://example.invalid/template.json"},
+                "Info": info,
             },
             "IdempotencyToken": token,
         }),

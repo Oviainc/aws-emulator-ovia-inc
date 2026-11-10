@@ -129,6 +129,88 @@ pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
         .collect()
 }
 
+/// Which of the two members that address one resource the request gave.
+///
+/// Several of this service's inputs come in that pair — a product, a launch path, a
+/// product version — and every pair carries the same contract: "You must provide the
+/// name or ID, but not both." Shared, so the operations that resolve the same triple
+/// (a provisioning request and the read that precedes it) cannot read one request two
+/// different ways.
+#[derive(Debug, Clone, Copy)]
+pub enum Addressed<'a> {
+    Id(&'a str),
+    Name(&'a str),
+}
+
+impl Addressed<'_> {
+    /// The value the request addressed the resource by, which a refusal names.
+    pub fn identifier(&self) -> &str {
+        match self {
+            Addressed::Id(id) => id,
+            Addressed::Name(name) => name,
+        }
+    }
+}
+
+/// How the request addressed one resource: by `id`, by `name`, or by neither
+/// (`None`). `Err` carries the refusal for a request that gave BOTH, which the
+/// members' own documentation forbids.
+///
+/// An empty string addresses nothing: the modelled minimum length of each of these
+/// members is 1, so a member that arrives empty names no resource.
+pub fn addressed<'a>(
+    id: Option<&'a str>,
+    name: Option<&'a str>,
+    id_member: &str,
+    name_member: &str,
+) -> Result<Option<Addressed<'a>>, String> {
+    match (
+        id.filter(|value| !value.is_empty()),
+        name.filter(|value| !value.is_empty()),
+    ) {
+        (Some(_), Some(_)) => Err(format!(
+            "{id_member} and {name_member} cannot both be provided: you must provide the name or \
+             ID, but not both."
+        )),
+        (Some(id), None) => Ok(Some(Addressed::Id(id))),
+        (None, Some(name)) => Ok(Some(Addressed::Name(name))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The refusal for a request that named a resource it must address by neither of the
+/// two members that address it.
+pub fn either_required(id_member: &str, name_member: &str) -> String {
+    format!("Either {id_member} or {name_member} must be provided.")
+}
+
+/// The sentence this service refuses a request for a product that resolves no launch
+/// path with: the product sits in no portfolio, or nothing stored carries the
+/// identifier at all.
+pub fn no_launch_paths_message(identifier: &str) -> String {
+    format!("No launch paths found for resource: {identifier}")
+}
+
+/// The sentence every not-found in this service reports for an identifier that
+/// resolves to nothing: the KIND of resource the request addressed and the identifier
+/// it used.
+pub fn not_found_message(kind: &str, identifier: &str) -> String {
+    format!("{kind} not found: {identifier}")
+}
+
+/// The resource kind a launch path is, as its not-found names it.
+pub const KIND_LAUNCH_PATH: &str = "Launch path";
+
+/// The resource kind a product version is, as its not-found names it.
+pub const KIND_PROVISIONING_ARTIFACT: &str = "Provisioning artifact";
+
+/// The refusal for a request that names no path for a product that has several, which
+/// is when `PathId`/`PathName` stops being optional: "This value is optional if the
+/// product has a default path, and required if the product has more than one path. To
+/// list the paths for a product, use ListLaunchPaths."
+pub const PATH_REQUIRED: &str = "A path is required when the product has more than one path. To \
+                                 list the paths for a product, use ListLaunchPaths.";
+
 /// A persisted constraint — the record `CreateConstraint` mints and
 /// `DescribeConstraint` reports.
 #[derive(Debug, Clone)]
