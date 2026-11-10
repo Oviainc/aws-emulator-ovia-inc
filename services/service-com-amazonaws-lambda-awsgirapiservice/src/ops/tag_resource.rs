@@ -20,10 +20,14 @@
 //! had, rather than the prefix of the request that still fitted.
 //!
 //! A tag is stored only under a key Lambda stores tags under at all
-//! ([`crate::state::tag_keys_are_storable`]): a key in the `aws:` namespace is AWS's own,
-//! an empty key names nothing, and a key named twice in one request says two things about
-//! one tag. Such a request is refused with the modelled 400 and leaves the resource's tag
-//! set untouched. A request naming NO tag at all applies none, so it too is refused
+//! ([`crate::state::tag_keys_are_storable_from`]): a key in the `aws:` namespace is AWS's
+//! own, an empty key names nothing, and a key named twice in one request says two things
+//! about one tag. Such a request is refused with the modelled 400 and leaves the
+//! resource's tag set untouched. The reserved namespace is a rule about a CALLER, so a
+//! request another emulated service made in-process while provisioning a resource writes
+//! those keys ([`crate::state::tag_key_origin`]) — which is how the records a provisioning
+//! service keeps about what it created reach the resource's own tag set.
+//! A request naming NO tag at all applies none, so it too is refused
 //! ([`crate::state::EMPTY_TAGS_MESSAGE`]) rather than answered as a write that stored
 //! nothing.
 //!
@@ -206,7 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if !crate::state::tag_keys_are_storable(input.tags.keys().map(String::as_str)) {
+        // The reserved-namespace half of that rule binds a CALLER, so which path the
+        // request arrived on is part of it ([`crate::state::tag_key_origin`]).
+        if !crate::state::tag_keys_are_storable_from(
+            input.tags.keys().map(String::as_str),
+            crate::state::tag_key_origin(ctx),
+        ) {
             return Err(invalid_tags());
         }
 

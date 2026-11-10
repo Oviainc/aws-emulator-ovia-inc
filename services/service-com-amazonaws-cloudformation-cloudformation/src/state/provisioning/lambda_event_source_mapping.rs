@@ -477,12 +477,15 @@ fn function_of(properties: &Value) -> Result<String, Refusal> {
 
 /// The tags of a declared mapping that Lambda will STORE: the ones the declaration asks for
 /// and the ones CloudFormation propagates ([`tags_of`]), less every key in the namespace
-/// Lambda reserves — the same rule a function's tags are held to, because it is the same
-/// service's tag-writing rule.
+/// Lambda reserves that is not CloudFormation's own — the same rule a function's tags are
+/// held to ([`super::lambda_function`]), because it is the same service's tag-writing rule.
 fn storable_tags(properties: &Value, propagated: &[(String, String)]) -> Vec<(String, String)> {
     tags_of(properties, propagated)
         .into_iter()
-        .filter(|(key, _)| !key.to_ascii_lowercase().starts_with(RESERVED_TAG_PREFIX))
+        .filter(|(key, _)| {
+            super::is_stack_provenance_tag(key)
+                || !key.to_ascii_lowercase().starts_with(RESERVED_TAG_PREFIX)
+        })
         .collect()
 }
 

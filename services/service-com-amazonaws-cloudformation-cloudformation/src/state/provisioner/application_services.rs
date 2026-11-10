@@ -1999,12 +1999,7 @@ pub(crate) fn tags_of(
 /// Whether `key` is one of the three tags CloudFormation records on every resource it
 /// provisions, which no declaration of its own may displace.
 pub(super) fn is_cloudformation_tag(key: &str) -> bool {
-    [
-        super::provisioning::STACK_NAME_TAG,
-        super::provisioning::STACK_ID_TAG,
-        super::provisioning::LOGICAL_ID_TAG,
-    ]
-    .contains(&key)
+    super::provisioning::is_stack_provenance_tag(key)
 }
 
 /// The tags a resource's own declaration asks for, in the order it writes them.

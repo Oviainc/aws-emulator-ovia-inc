@@ -199,12 +199,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // The tags of the request are the ones the new provider will carry, so they are
-        // judged by the rule a stored tag has to meet before anything is created.
-        if !crate::state::tag_keys_are_storable(
+        // judged by the rule a stored tag has to meet before anything is created — a rule
+        // whose reserved-namespace half binds a CALLER, so which path the request arrived
+        // on is part of it ([`crate::state::tag_key_origin`]).
+        if !crate::state::tag_keys_are_storable_from(
             input
                 .tags
                 .iter()
                 .flat_map(|tags| tags.keys().map(String::as_str)),
+            crate::state::tag_key_origin(ctx),
         ) {
             return Err(invalid_parameter(
                 crate::state::INVALID_TAGS_MESSAGE.to_string(),

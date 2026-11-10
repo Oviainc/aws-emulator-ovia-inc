@@ -754,22 +754,30 @@ fn base64_encoded(bytes: &[u8]) -> String {
 
 /// The tags of a declared function that Lambda will STORE: the ones the declaration asks
 /// for and the ones CloudFormation propagates ([`tags_of`]), less every key in the
-/// namespace Lambda reserves.
+/// namespace Lambda reserves that is not CloudFormation's own.
 ///
-/// "Tag keys beginning with `aws:` are reserved" is Lambda's own rule for every caller of
-/// its tag-writing API — it refuses the whole request on one such key — so the three records
+/// "Tag keys beginning with `aws:` are reserved" is Lambda's rule for a CALLER of its
+/// tag-writing API — it refuses the whole request on one such key. The three records
 /// CloudFormation keeps about a resource it provisioned (the stack's name, its id and the
-/// resource's logical id) are left in CloudFormation's own records rather than sent to a
-/// call that would refuse the function outright. Every other tag travels, which is what a
-/// stack's tags being "propagated to the resources that CloudFormation creates" means here.
+/// resource's logical id) are AWS's own tags, set by the service that provisions the
+/// resource rather than by anybody calling it, and Lambda admits them on the in-process
+/// path this provider calls it over — so they TRAVEL, and a client's own `ListTags` on the
+/// function the stack published reports them beside the declaration's tags. Every other
+/// key in that namespace is a caller's to have supplied and is dropped here rather than
+/// sent to a call that would refuse the function outright: a deployment must not fail over
+/// tags a template merely spelled.
 ///
-/// The namespace is the one this crate defines once
-/// ([`crate::state::stack_tags::is_reserved_tag_key`]), since Lambda reserves the same
-/// prefix every other tag-writing API does.
+/// The namespace and CloudFormation's own three keys are each the reading this crate states
+/// once ([`crate::state::stack_tags::is_reserved_tag_key`],
+/// [`super::is_stack_provenance_tag`]), since Lambda reserves the same prefix every other
+/// tag-writing API does.
 fn storable_tags(properties: &Value, propagated: &[(String, String)]) -> Vec<(String, String)> {
     tags_of(properties, propagated)
         .into_iter()
-        .filter(|(key, _)| !crate::state::stack_tags::is_reserved_tag_key(key))
+        .filter(|(key, _)| {
+            super::is_stack_provenance_tag(key)
+                || !crate::state::stack_tags::is_reserved_tag_key(key)
+        })
         .collect()
 }
 

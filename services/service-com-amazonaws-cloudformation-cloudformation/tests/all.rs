@@ -197,6 +197,8 @@ mod initiating_resource_events;
 mod in_place_resource_updates;
 #[path = "all/kept_failed_create.rs"]
 mod kept_failed_create;
+#[path = "all/lambda_function_stack_tags.rs"]
+mod lambda_function_stack_tags;
 #[path = "all/lambda_layer_version_reference.rs"]
 mod lambda_layer_version_reference;
 #[path = "all/lambda_permission_stack_updates.rs"]

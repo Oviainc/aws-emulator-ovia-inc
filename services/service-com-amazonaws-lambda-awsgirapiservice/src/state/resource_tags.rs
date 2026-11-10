@@ -176,8 +176,49 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
 }
 
-/// Whether every key in `keys` is one Lambda will store: not empty, not in the reserved
-/// namespace, and named at most once.
+/// Who named the tag keys one request carries, which is what decides whether a key in the
+/// namespace [`RESERVED_TAG_KEY_PREFIX`] reserves may be stored ([`tag_keys_are_storable_from`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagKeyOrigin {
+    /// A request a CLIENT made. "Don't use the `aws:` prefix in tag keys, because it is
+    /// reserved for Amazon Web Services use" binds exactly this request, so a key in that
+    /// namespace is refused.
+    Caller,
+    /// A request another emulated service made in-process while provisioning a resource on
+    /// a caller's behalf — the path the tags AWS applies from inside itself arrive on. A
+    /// key in the reserved namespace travels on it, which is how the records a provisioning
+    /// service keeps about a resource it created reach that resource's tag set.
+    Service,
+}
+
+/// Where the tag keys this request names came from.
+///
+/// The two are told apart by where the request CAME FROM and by nothing in it: the
+/// framework stamps a request a handler sent through its in-process callback with that
+/// chain's depth ([`::smithy_server_runtime::CallbackRecursionDepth`]), and a request that
+/// arrived from a client carries none. The stamp is a typed request extension of this
+/// process, so nothing a client can send — on any socket, signed with any credential —
+/// sets it.
+///
+/// The allowance is on the path, not on which key is named: Lambda cannot tell which
+/// service is calling, so a service that takes tags from its own caller and forwards them
+/// has to drop the reserved ones itself.
+#[must_use]
+pub fn tag_key_origin(ctx: &::smithy_server_runtime::OperationContext<'_>) -> TagKeyOrigin {
+    let stamped = ctx
+        .parts()
+        .extensions
+        .get::<::smithy_server_runtime::CallbackRecursionDepth>()
+        .is_some_and(|depth| depth.0 > 0);
+    if stamped {
+        TagKeyOrigin::Service
+    } else {
+        TagKeyOrigin::Caller
+    }
+}
+
+/// Whether every key in `keys` is one Lambda will store, for a request a CLIENT made: not
+/// empty, not in the reserved namespace, and named at most once.
 ///
 /// This is the whole of what [`INVALID_TAGS_MESSAGE`] states, asked of the keys a single
 /// request carries, so every operation that STORES tags asks it the same way and refuses
@@ -187,9 +228,25 @@ pub fn tag_keys_are_storable<'a, I>(keys: I) -> bool
 where
     I: IntoIterator<Item = &'a str>,
 {
+    tag_keys_are_storable_from(keys, TagKeyOrigin::Caller)
+}
+
+/// [`tag_keys_are_storable`] for a request from a stated [`TagKeyOrigin`].
+///
+/// An empty key is not a tag and a key named twice is one tag written two ways, whoever
+/// sent the request; the reserved namespace is the one condition the origin decides, since
+/// it is a rule about a caller rather than about the tag set a resource may hold.
+#[must_use]
+pub fn tag_keys_are_storable_from<'a, I>(keys: I, origin: TagKeyOrigin) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
     let mut seen: BTreeSet<&str> = BTreeSet::new();
-    keys.into_iter()
-        .all(|key| !key.is_empty() && !is_reserved_tag_key(key) && seen.insert(key))
+    keys.into_iter().all(|key| {
+        !key.is_empty()
+            && (origin == TagKeyOrigin::Service || !is_reserved_tag_key(key))
+            && seen.insert(key)
+    })
 }
 
 /// Why a `TaggableResource` — the `Resource` label of the `/2017-03-31/tags/{Resource}`

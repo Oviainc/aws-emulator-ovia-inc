@@ -57,6 +57,14 @@ const ACCOUNT: &str = "000000000000";
 const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
 
+/// The tag keys CloudFormation records on every resource it provisions. Source: the
+/// `aws:cloudformation:*` tags CloudFormation's own documentation names (this emulator's
+/// `service-com-amazonaws-cloudformation-cloudformation`
+/// `state::provisioning::{STACK_NAME_TAG, STACK_ID_TAG, LOGICAL_ID_TAG}`).
+const STACK_NAME_TAG: &str = "aws:cloudformation:stack-name";
+const STACK_ID_TAG: &str = "aws:cloudformation:stack-id";
+const LOGICAL_ID_TAG: &str = "aws:cloudformation:logical-id";
+
 /// The emulator with the three services this suite exercises, mounted on ONE engine exactly
 /// as `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
 /// suite here; the in-process callback CloudFormation makes signs its request either way
@@ -640,10 +648,14 @@ async fn a_stack_provisions_the_lambda_function_its_template_declares() {
             );
         }
 
-        // The tags the declaration asked for, read through Lambda's own tagging call.
-        // Lambda refuses a tag key beginning with `aws:` from any caller, so the three
-        // records CloudFormation keeps about a resource it provisioned never reach the
-        // function and nothing in the reserved namespace is on it.
+        // The tags the declaration asked for, read through Lambda's own tagging call,
+        // BESIDE the three records CloudFormation keeps about a resource it provisioned.
+        // The reserved `aws:` namespace binds a CALLER; the service that provisions the
+        // resource is what sets those three, so they reach Lambda's own tag store and a
+        // client's `ListTags` reports them. Their values are computed here from the stack's
+        // name, the id `DescribeStacks` reported for it and the row's logical id.
+        let stack_id = opt_element(&described, "StackId")
+            .unwrap_or_else(|| panic!("case {case:?}: no <StackId> in {described}"));
         let (status, listed) =
             lambda(&router, "GET", &format!("/2017-03-31/tags/{arn}"), None).await;
         assert_eq!(
@@ -657,19 +669,18 @@ async fn a_stack_provisions_the_lambda_function_its_template_declares() {
             .iter()
             .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
             .collect();
-        for (key, value) in row.expected_tags {
-            assert_eq!(
-                reported.get(*key).map(String::as_str),
-                Some(*value),
-                "case {case:?}: expected tag {key:?} to be {value:?}, got {reported:?}"
-            );
-        }
+        let mut expected: BTreeMap<String, String> = row
+            .expected_tags
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        expected.insert(STACK_NAME_TAG.to_string(), stack_name.clone());
+        expected.insert(STACK_ID_TAG.to_string(), stack_id);
+        expected.insert(LOGICAL_ID_TAG.to_string(), row.logical_id.to_string());
         assert_eq!(
-            reported.len(),
-            row.expected_tags.len(),
-            "case {case:?}: expected exactly the {} tag(s) the template declared, got \
-             {reported:?}",
-            row.expected_tags.len()
+            reported, expected,
+            "case {case:?}: expected exactly the tag(s) the template declared plus the three \
+             CloudFormation records {expected:?}, got {reported:?}"
         );
 
         // Deleting the stack deletes the function Lambda holds for it.

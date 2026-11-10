@@ -261,15 +261,29 @@ mod owner;
 /// case-insensitively, as the services that refuse it match it.
 pub(super) const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// Whether `key` is one of the three tags CloudFormation records on every resource it
+/// provisions ([`STACK_NAME_TAG`], [`STACK_ID_TAG`], [`LOGICAL_ID_TAG`]).
+///
+/// They sit inside the namespace [`is_reserved_tag_key`] names, and that is the point: they
+/// are AWS's own tags, which CloudFormation — not a caller — sets. So a provider whose owning
+/// service admits the reserved namespace on the in-process path it is called over sends these
+/// three and drops every OTHER reserved key, which is a caller's to have supplied.
+pub(super) fn is_stack_provenance_tag(key: &str) -> bool {
+    [STACK_NAME_TAG, STACK_ID_TAG, LOGICAL_ID_TAG].contains(&key)
+}
+
 /// Whether `key` is in that namespace — the ONE reading of the rule for the per-type providers
 /// beside this algorithm, so a second provider cannot come to read it differently.
 ///
-/// A service refuses such a key on every call that takes a caller's tag set ("Your TagKey
+/// A service refuses such a key on every call that takes a CALLER's tag set ("Your TagKey
 /// cannot be prefixed with aws:"), and the three `aws:cloudformation:*` tags AWS sets from
-/// inside itself have no public call to set them through here — so a provider leaves them off
-/// rather than sending them to be refused: a deployment must not fail over tags CloudFormation
-/// adds of its own accord. ([`super::provisioner::Provisioner::applicable_tags`] is the
-/// catalogue's own reading of it, for the types it carries.)
+/// inside itself have no public call to set them through — so a provider whose owning service
+/// does not tell a caller's request from a provisioning one leaves them off rather than sending
+/// them to be refused: a deployment must not fail over tags CloudFormation adds of its own
+/// accord. A provider whose owning service DOES tell the two apart sends them, and the
+/// resource carries them ([`is_stack_provenance_tag`]).
+/// ([`super::provisioner::Provisioner::applicable_tags`] is the catalogue's own reading of it,
+/// for the types it carries.)
 pub(super) fn is_reserved_tag_key(key: &str) -> bool {
     key.get(..RESERVED_TAG_KEY_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
