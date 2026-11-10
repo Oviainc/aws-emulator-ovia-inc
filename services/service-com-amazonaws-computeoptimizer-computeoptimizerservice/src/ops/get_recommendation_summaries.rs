@@ -381,7 +381,12 @@ fn summarise(
         .sum();
     let idle_savings = idle_monthly_cost;
 
-    let finding_summaries = finding_summaries(resource_type, resources);
+    // Whether the service RIGHTSIZES this group or only CLASSIFIES it
+    // ([`crate::state::reports_rightsizing_recommendations`]): the blocks beside the finding
+    // counts all describe a recommended configuration, so a group the service recommends none
+    // for carries none of them rather than carrying them at zero.
+    let reports_rightsizing = crate::state::reports_rightsizing_recommendations(resource_type);
+    let finding_summaries = finding_summaries(resource_type, resources, reports_rightsizing);
     let inferred_workload_savings = inferred_workload_savings(resources);
     // Whether the idle analysis covers this group at all: a group it covers carries a count
     // at each `IdleFinding` — zero where nothing of it was found idle — and a group outside
@@ -399,18 +404,23 @@ fn summarise(
         idle_summaries: reports_idle.then(|| idle_summaries(idle_resources)),
         recommendation_resource_type: Some(resource_type.to_string()),
         account_id: Some(account_id.to_string()),
-        savings_opportunity: Some(savings_opportunity(rightsizing_savings, current_monthly_cost)),
+        savings_opportunity: reports_rightsizing
+            .then(|| savings_opportunity(rightsizing_savings, current_monthly_cost)),
         idle_savings_opportunity: reports_idle
             .then(|| savings_opportunity(idle_savings, idle_monthly_cost)),
         // "The savings opportunity for recommendations of a given resource type": every
         // recommendation the service holds for this resource type, so the rightsizing
         // opportunity and the idle one together, as a percentage of what all of those
-        // resources cost.
-        aggregated_savings_opportunity: Some(savings_opportunity(
-            rightsizing_savings + idle_savings,
-            current_monthly_cost + idle_monthly_cost,
-        )),
-        current_performance_risk_ratings: Some(performance_risk_ratings(resources)),
+        // resources cost — and nothing at all for a group the service makes neither kind of
+        // recommendation for, which has no opportunity to aggregate.
+        aggregated_savings_opportunity: (reports_rightsizing || reports_idle).then(|| {
+            savings_opportunity(
+                rightsizing_savings + idle_savings,
+                current_monthly_cost + idle_monthly_cost,
+            )
+        }),
+        current_performance_risk_ratings: reports_rightsizing
+            .then(|| performance_risk_ratings(resources)),
         inferred_workload_savings: (!inferred_workload_savings.is_empty())
             .then_some(inferred_workload_savings),
     }
@@ -440,9 +450,13 @@ fn idle_summaries(idle_resources: &[&crate::state::IdleResourceAnalysis]) -> Vec
 /// rather than only the findings that occurred. Each finding also carries how many of the
 /// resources at it name each `FindingReasonCode`, by the same rule: a count at every value
 /// of the vocabulary `ReasonCodeSummary$name` admits, zero where no resource names it.
+/// A count also carries its reason codes only where the service recommends a configuration
+/// for the group (`reports_reason_codes`): a reason code states what a recommendation would
+/// change, so a group the service only classifies counts findings and no reasons.
 fn finding_summaries(
     resource_type: &str,
     resources: &[&crate::state::AnalysedResource],
+    reports_reason_codes: bool,
 ) -> Vec<Summary> {
     crate::state::findings_reported_for(resource_type)
         .iter()
@@ -454,7 +468,7 @@ fn finding_summaries(
             Summary {
                 name: Some((*reported_as).to_string()),
                 value: at_finding.len() as f64,
-                reason_code_summaries: Some(
+                reason_code_summaries: reports_reason_codes.then(|| {
                     crate::state::finding_reason_codes_reported_for()
                         .iter()
                         .map(|reason_code| ReasonCodeSummary {
@@ -469,8 +483,8 @@ fn finding_summaries(
                                 })
                                 .count() as f64,
                         })
-                        .collect(),
-                ),
+                        .collect()
+                }),
             }
         })
         .collect()

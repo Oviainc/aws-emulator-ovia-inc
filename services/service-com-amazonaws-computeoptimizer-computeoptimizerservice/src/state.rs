@@ -1842,6 +1842,18 @@ pub const SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE: &str = "RdsDBInstanceStorage";
 /// See [`SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE`].
 pub const SOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE: &str = "AuroraDBClusterStorage";
 
+/// The `RecommendationSourceType` values this service CLASSIFIES rather than rightsizes:
+/// the two naming a database's storage ([`SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE`]), whose
+/// analysis reaches a finding (`RDSDBRecommendation$storageFinding`) and no recommended
+/// configuration of its own — the recommendation options, the costs and the performance
+/// risk a database recommendation carries are its INSTANCE's
+/// (`RDSDBRecommendation$instanceFinding`, whose group is
+/// [`SOURCE_TYPE_RDS_DB_INSTANCE`]). See [`reports_rightsizing_recommendations`].
+pub const CLASSIFIED_ONLY_SOURCE_TYPES: &[&str] = &[
+    SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE,
+    SOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE,
+];
+
 /// Every `RecommendationSourceType` this service TRACKS — the whole vocabulary
 /// `RecommendationSummary$recommendationResourceType` names — in the order the model
 /// declares it, which is the order `GetRecommendationSummaries` reports one summary per
@@ -1898,11 +1910,12 @@ pub const TRACKED_SOURCE_TYPES: &[&str] = &[
 /// type the model gives a finding enum of its own is counted at that enum and in its
 /// spelling — `EBSFinding` for a volume, `LambdaFunctionRecommendationFinding` for a
 /// function, `ECSServiceRecommendationFinding` for an Amazon ECS service,
-/// `RDSInstanceFinding` for a database and `RDSStorageFinding` for its storage. Every other
-/// tracked resource type is counted at the `Finding` vocabulary itself, which the instance
-/// surface spells in upper snake case ([`SUMMARY_FINDING_UNDERPROVISIONED`]) — so an EC2
-/// instance count is reported under `OPTIMIZED` while an EBS volume count is reported under
-/// `Optimized`, each as the surface that produced the finding names it.
+/// `RDSInstanceFinding` for a database and `RDSStorageFinding` for its storage — narrowed in
+/// each case to the classifications THAT resource type's analysis can reach. An EC2 instance
+/// and an Auto Scaling group are counted at the `Finding` vocabulary itself, which the
+/// instance surface spells in upper snake case ([`SUMMARY_FINDING_UNDERPROVISIONED`]) — so an
+/// EC2 instance count is reported under `OPTIMIZED` while an EBS volume count is reported
+/// under `Optimized`, each as the surface that produced the finding names it.
 ///
 /// Each vocabulary is narrowed to the values `Summary$name` can carry, the model's `Finding`
 /// enum: a license's documented `InsufficientMetrics` is a `LicenseFinding` value outside
@@ -1957,15 +1970,50 @@ pub fn findings_reported_for(resource_type: &str) -> &'static [(&'static str, &'
             (FINDING_OVERPROVISIONED, FINDING_OVERPROVISIONED),
             (FINDING_OPTIMIZED, FINDING_OPTIMIZED),
         ],
-        // `RDSStorageFinding`.
-        SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE | SOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE => &[
-            (FINDING_UNDERPROVISIONED, FINDING_UNDERPROVISIONED),
+        // `RDSStorageFinding` narrowed to the classifications the storage of a DB INSTANCE
+        // can reach: that storage is PROVISIONED, so the analysis sizes it and classifies it
+        // `Optimized`, `Overprovisioned` or `Underprovisioned` — the three the instance beside
+        // it carries. `RDSStorageFinding`'s fourth value is the Aurora cluster group's, below:
+        // the enum spans both storage groups, and each is counted at the part of it its own
+        // analysis can reach.
+        SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE => &[
+            (FINDING_OPTIMIZED, FINDING_OPTIMIZED),
             (FINDING_OVERPROVISIONED, FINDING_OVERPROVISIONED),
+            (FINDING_UNDERPROVISIONED, FINDING_UNDERPROVISIONED),
+        ],
+        // `RDSStorageFinding` narrowed to the classifications the storage of an AURORA DB
+        // CLUSTER can reach: a cluster's storage grows and shrinks with the data it holds
+        // rather than being provisioned for it, so the analysis does not size it — it reads
+        // whether the storage CONFIGURATION the cluster runs is the one its I/O pattern calls
+        // for, which is the `Optimized`/`NotOptimized` pair and neither provisioning value.
+        SOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE => &[
             (FINDING_OPTIMIZED, FINDING_OPTIMIZED),
             (FINDING_NOT_OPTIMIZED, FINDING_NOT_OPTIMIZED),
         ],
         _ => &[],
     }
+}
+
+/// Whether this service RIGHTSIZES resources of `source_type` — whether its analysis of one
+/// reaches a RECOMMENDED CONFIGURATION for it, and not only a classification of the one it
+/// runs.
+///
+/// What a summary of the group carries follows from that, because every block beside the
+/// finding counts describes a recommended configuration: the `FindingReasonCode` counts
+/// explaining what a finding would change (`Summary$reasonCodeSummaries`), what adopting the
+/// recommendations would save (`RecommendationSummary$savingsOpportunity` and the aggregate
+/// beside it) and the risk the current configurations run
+/// (`RecommendationSummary$currentPerformanceRiskRatings`). A group the service only
+/// CLASSIFIES ([`CLASSIFIED_ONLY_SOURCE_TYPES`]) has no such configuration, so its summary is
+/// the finding counts alone rather than those blocks reported at zero — a zero there would
+/// claim the service priced and rated a recommendation it never makes for the group.
+///
+/// `false` for a `RecommendationSourceType` this service does not track
+/// ([`TRACKED_SOURCE_TYPES`]) and for any other string, by the same rule: no analysis, so
+/// nothing recommended.
+pub fn reports_rightsizing_recommendations(source_type: &str) -> bool {
+    TRACKED_SOURCE_TYPES.contains(&source_type)
+        && !CLASSIFIED_ONLY_SOURCE_TYPES.contains(&source_type)
 }
 
 /// The `FindingReasonCode` values a summary reports a count at, beside the finding they

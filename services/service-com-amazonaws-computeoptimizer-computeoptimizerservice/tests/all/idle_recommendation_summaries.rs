@@ -29,7 +29,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::IDLE_FINDING_VALUES;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, IdleResourceAnalysis, ANALYSIS_DELAY,
+    reports_rightsizing_recommendations, service_state, IdleResourceAnalysis, ANALYSIS_DELAY,
 };
 
 use crate::harness::{call, emulator_with_engine, opt_in};
@@ -450,6 +450,17 @@ async fn the_aggregated_saving_is_the_rightsizing_saving_plus_the_idle_one() {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        // A group the service only CLASSIFIES carries no savings opportunity at all — it has
+        // no recommended configuration to price — so there is nothing of it to aggregate.
+        if !reports_rightsizing_recommendations(&case) {
+            assert!(
+                summary["savingsOpportunity"].is_null()
+                    && summary["aggregatedSavingsOpportunity"].is_null(),
+                "case {case:?}: a group the service only classifies states no saving, got \
+                 {summary}"
+            );
+            continue;
+        }
         let rightsizing = saving_of(summary, "savingsOpportunity", &case);
         let aggregated = saving_of(summary, "aggregatedSavingsOpportunity", &case);
         let idle = idle_by_group

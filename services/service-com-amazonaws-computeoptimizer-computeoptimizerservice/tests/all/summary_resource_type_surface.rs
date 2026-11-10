@@ -63,7 +63,10 @@ fn caller_account() -> String {
 /// `LambdaFunctionRecommendationFinding`, `ECSServiceRecommendationFinding`,
 /// `RDSInstanceFinding`, `RDSStorageFinding`, `LicenseFinding` — all camel case), and every
 /// other one at the `Finding` vocabulary as the instance surface spells it, in upper snake
-/// case.
+/// case. A vocabulary is narrowed to the classifications THAT resource type's analysis can
+/// reach, which is why a DB instance's storage carries the three provisioning
+/// classifications while an Aurora cluster's storage — which the service does not size —
+/// carries only the `Optimized`/`NotOptimized` pair.
 const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
     (
         "Ec2Instance",
@@ -83,22 +86,9 @@ const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
     ),
     (
         "RdsDBInstanceStorage",
-        &[
-            "Underprovisioned",
-            "Overprovisioned",
-            "Optimized",
-            "NotOptimized",
-        ],
+        &["Optimized", "Overprovisioned", "Underprovisioned"],
     ),
-    (
-        "AuroraDBClusterStorage",
-        &[
-            "Underprovisioned",
-            "Overprovisioned",
-            "Optimized",
-            "NotOptimized",
-        ],
-    ),
+    ("AuroraDBClusterStorage", &["Optimized", "NotOptimized"]),
     ("NatGateway", &["NOT_OPTIMIZED", "OPTIMIZED"]),
     ("DynamoDBTable", &["NOT_OPTIMIZED", "OPTIMIZED"]),
     ("ElastiCacheCluster", &["NOT_OPTIMIZED", "OPTIMIZED"]),
@@ -201,7 +191,8 @@ fn idle_counts(summary: &Value, case: &str) -> f64 {
 }
 
 /// How many resources `summary` counts across the `Finding` values it reports, plus the
-/// `CurrentPerformanceRisk` ratings it rates and the idle resources it counts.
+/// `CurrentPerformanceRisk` ratings it rates and the idle resources it counts. A summary that
+/// states no ratings at all — a group the service only classifies — rates nothing.
 fn counted(summary: &Value, case: &str) -> f64 {
     let findings: f64 = summary["summaries"]
         .as_array()
@@ -212,7 +203,14 @@ fn counted(summary: &Value, case: &str) -> f64 {
         .sum();
     let rated: f64 = ["high", "medium", "low", "veryLow"]
         .iter()
-        .map(|rating| number(&summary["currentPerformanceRiskRatings"][*rating], case))
+        .map(|rating| {
+            let value = &summary["currentPerformanceRiskRatings"][*rating];
+            if value.is_null() {
+                0.0
+            } else {
+                number(value, case)
+            }
+        })
         .sum();
     let idle: f64 = summary["idleSummaries"]
         .as_array()
@@ -313,14 +311,16 @@ async fn an_enrolled_account_is_summarised_per_resource_type_the_service_reports
             0.0,
             "case {row:?}: no resource has been analysed, so every count is zero, got {summary}"
         );
-        assert_eq!(
-            number(
-                &summary["savingsOpportunity"]["estimatedMonthlySavings"]["value"],
-                &row
-            ),
-            0.0,
-            "case {row:?}: with nothing analysed there is nothing to save, got {summary}"
-        );
+        // A group the service recommends no configuration for states no rightsizing saving at
+        // all; where one is stated, with nothing analysed it is nothing.
+        let stated_saving = &summary["savingsOpportunity"]["estimatedMonthlySavings"]["value"];
+        if !stated_saving.is_null() {
+            assert_eq!(
+                number(stated_saving, &row),
+                0.0,
+                "case {row:?}: with nothing analysed there is nothing to save, got {summary}"
+            );
+        }
         assert_eq!(
             idle_counts(summary, &row),
             0.0,

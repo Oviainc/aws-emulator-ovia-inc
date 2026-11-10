@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES;
-use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::ANALYSIS_DELAY;
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
+    reports_rightsizing_recommendations, ANALYSIS_DELAY,
+};
 
 use crate::harness::{call, emulator, error_code, opt_in};
 
@@ -45,10 +47,13 @@ fn caller_account() -> String {
 /// restricted to what `Summary$name` can carry, the model's `Finding` enum (`NotOptimized`
 /// | `Optimized` | `Overprovisioned` | `Underprovisioned`), which is why a license's
 /// documented `InsufficientMetrics` (a `LicenseFinding` value) is not expected here — and
-/// to the vocabulary of the resource type's OWN recommendations, which is why a database
-/// instance is counted at the three `RDSInstanceFinding` values while its storage carries
-/// the four of `RDSStorageFinding`. A tracked resource type the documentation names no
-/// vocabulary for is counted at the generic classification pair.
+/// vocabulary of the resource type's OWN recommendations, which is why a database
+/// instance is counted at the three `RDSInstanceFinding` values while its storage is counted
+/// at the `RDSStorageFinding` values THAT storage can reach — the three provisioning
+/// classifications for the storage a DB instance provisions, and the `Optimized`/`NotOptimized`
+/// pair for an Aurora cluster's storage, which the service does not size. A tracked resource
+/// type the documentation names no vocabulary for is counted at the generic classification
+/// pair.
 ///
 /// Under WHICH NAME: a resource type whose recommendations carry a finding vocabulary of
 /// their own is counted in that vocabulary's spelling (`EBSFinding`,
@@ -75,22 +80,9 @@ const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
     ),
     (
         "RdsDBInstanceStorage",
-        &[
-            "Underprovisioned",
-            "Overprovisioned",
-            "Optimized",
-            "NotOptimized",
-        ],
+        &["Optimized", "Overprovisioned", "Underprovisioned"],
     ),
-    (
-        "AuroraDBClusterStorage",
-        &[
-            "Underprovisioned",
-            "Overprovisioned",
-            "Optimized",
-            "NotOptimized",
-        ],
-    ),
+    ("AuroraDBClusterStorage", &["Optimized", "NotOptimized"]),
     ("NatGateway", &["NOT_OPTIMIZED", "OPTIMIZED"]),
     ("DynamoDBTable", &["NOT_OPTIMIZED", "OPTIMIZED"]),
     ("ElastiCacheCluster", &["NOT_OPTIMIZED", "OPTIMIZED"]),
@@ -336,6 +328,33 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
             }
         }
         let idle_counts = summary["idleSummaries"].as_array().cloned();
+
+        // The reason codes behind a finding, the performance-risk ratings and every savings
+        // opportunity describe a RECOMMENDED CONFIGURATION, so a group the service only
+        // CLASSIFIES carries none of them — its summary is the finding counts alone.
+        if !reports_rightsizing_recommendations(&resource_type) {
+            for entry in &finding_summaries {
+                assert!(
+                    entry["reasonCodeSummaries"].is_null(),
+                    "case {case:?}: a group the service only classifies states no reason for a \
+                     finding, got {entry}"
+                );
+            }
+            for member in [
+                "savingsOpportunity",
+                "idleSavingsOpportunity",
+                "aggregatedSavingsOpportunity",
+                "currentPerformanceRiskRatings",
+                "idleSummaries",
+            ] {
+                assert!(
+                    summary[member].is_null(),
+                    "case {case:?}: a group the service only classifies reports no {member}, got \
+                     {summary}"
+                );
+            }
+            continue;
+        }
 
         let ratings = &summary["currentPerformanceRiskRatings"];
         let rated = ["high", "medium", "low", "veryLow"]

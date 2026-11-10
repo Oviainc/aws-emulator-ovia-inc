@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    reports_idle_recommendations, service_state, AnalysedResource, RdsDatabaseDetail,
-    ANALYSIS_DELAY, SOURCE_TYPE_RDS_DB_INSTANCE,
+    reports_idle_recommendations, reports_rightsizing_recommendations, service_state,
+    AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -144,20 +144,38 @@ fn assert_counts_are_zero(case: &str, entry: &Value) {
              zero resources, got {count}"
         );
     }
-    for rating in ["high", "medium", "low", "veryLow"] {
+    // The risk ratings and the rightsizing saving are reported exactly where the service
+    // recommends a configuration for the group; a group it only classifies carries neither,
+    // so there is nothing of them to be zero.
+    let rightsizes = reports_rightsizing_recommendations(resource_type);
+    assert_eq!(
+        entry["currentPerformanceRiskRatings"].is_object(),
+        rightsizes,
+        "case {case:?}/{resource_type}: the risk ratings are reported exactly where the service \
+         recommends a configuration, got {entry}"
+    );
+    assert_eq!(
+        entry["savingsOpportunity"].is_object(),
+        rightsizes,
+        "case {case:?}/{resource_type}: the rightsizing saving is reported exactly where the \
+         service recommends a configuration, got {entry}"
+    );
+    if rightsizes {
+        for rating in ["high", "medium", "low", "veryLow"] {
+            assert_eq!(
+                entry["currentPerformanceRiskRatings"][rating].as_f64(),
+                Some(0.0),
+                "case {case:?}/{resource_type}: nothing is analysed yet, so no resource runs the \
+                 {rating} risk, got {entry}"
+            );
+        }
         assert_eq!(
-            entry["currentPerformanceRiskRatings"][rating].as_f64(),
+            entry["savingsOpportunity"]["estimatedMonthlySavings"]["value"].as_f64(),
             Some(0.0),
-            "case {case:?}/{resource_type}: nothing is analysed yet, so no resource runs the \
-             {rating} risk, got {entry}"
+            "case {case:?}/{resource_type}: nothing is analysed yet, so there is nothing to \
+             save, got {entry}"
         );
     }
-    assert_eq!(
-        entry["savingsOpportunity"]["estimatedMonthlySavings"]["value"].as_f64(),
-        Some(0.0),
-        "case {case:?}/{resource_type}: nothing is analysed yet, so there is nothing to save, \
-         got {entry}"
-    );
     let idle = entry["idleSummaries"].as_array().cloned();
     assert_eq!(
         idle.is_some(),
