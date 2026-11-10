@@ -1453,14 +1453,16 @@ pub fn invalid_local_gateway_id_malformed<E>(id: &str) -> Scaffolded<E> {
 }
 
 /// Refuse a well-formed local gateway id this account holds no gateway for: HTTP 400
-/// [`INVALID_LOCAL_GATEWAY_ID_NOT_FOUND`], worded the way AWS words it for this family
-/// ("The LocalGateway ID '…' does not exist", the sentence
-/// [`invalid_local_gateway_route_table_id_not_found`] carries for the route table on it).
+/// [`INVALID_LOCAL_GATEWAY_ID_NOT_FOUND`], worded the way AWS words it for this resource —
+/// "The local-gateway ID '…' does not exist", naming the resource by the one spelling
+/// [`RESOURCE_TYPE_LOCAL_GATEWAY`] holds, as the recorded wire corpus behind this surface
+/// shows and as [`invalid_local_gateway_id_malformed`] already names it in the sentence for
+/// the form of the same id.
 pub fn invalid_local_gateway_id_not_found<E>(id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_LOCAL_GATEWAY_ID_NOT_FOUND,
         400,
-        format!("The LocalGateway ID '{id}' does not exist"),
+        format!("The {RESOURCE_TYPE_LOCAL_GATEWAY} ID '{id}' does not exist"),
     )
 }
 

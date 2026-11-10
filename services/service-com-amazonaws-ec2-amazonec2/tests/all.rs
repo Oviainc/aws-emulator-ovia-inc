@@ -15,6 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The LOCAL GATEWAYS an account's Outposts put it behind, as `DescribeLocalGateways`
+// reports them: every stored gateway with each member of the modelled shape, the narrowing
+// its documented filters and `LocalGatewayIds` do, the pages it cuts the store into, the
+// bounds on one request's match, and what it refuses. Declared beside `prefix_lists` for
+// the reason the note above gives: the sorted neighbourhood and the tail of this file are
+// where every new ec2 suite inserts its lines.
+#[path = "all/local_gateways.rs"]
+mod local_gateways;
 // `RunInstances` driven from a LAUNCH TEMPLATE: the version's parameters overlaid with the
 // request's own, which version a request names, and what a template the account does not hold
 // refuses. Declared beside `prefix_lists` for the reason the note above gives: the sorted
@@ -333,8 +341,6 @@ mod capacity_manager_data_exports;
 mod fpga_image_id_form;
 // The buckets the rules-per-security-group quota is counted in — one per group, direction
 // and address family — and what a filled bucket refuses. Declared beside `prefix_lists` for
-// the reason the note above gives: the sorted neighbourhood and the tail of this file are
-// where every new ec2 suite inserts its lines.
 #[path = "all/security_group_rule_quota_buckets.rs"]
 mod security_group_rule_quota_buckets;
 // What `AcceptReservedInstancesExchangeQuote` exchanges: which Convertible Reserved Instances
