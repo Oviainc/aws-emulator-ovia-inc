@@ -43,6 +43,9 @@ mod dedicated_ips;
 /// The order this service states an enumerated type's values in when it refuses a
 /// value outside them.
 mod enum_value_sets;
+/// The account's pricing plane: the plan ladder, and where a requested plan lands on
+/// the account's pricing attributes.
+mod pricing;
 /// The suppression-list plane: one suppressed address and how a list's entries are
 /// keyed.
 mod suppression;
@@ -54,6 +57,7 @@ pub mod template_rendering;
 pub use configuration_sets::*;
 pub use dedicated_ips::*;
 pub use enum_value_sets::*;
+pub use pricing::*;
 pub use suppression::*;
 
 /// How long after `CreateEmailIdentity` an identity's `PENDING` -> `SUCCESS`

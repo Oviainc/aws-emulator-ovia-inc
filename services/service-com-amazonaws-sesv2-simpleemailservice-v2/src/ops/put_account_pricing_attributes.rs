@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountPricingAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountPricingAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountPricingAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the requested pricing plan to the account-level attributes of this
+//! account in this Region, which `GetAccount` reports as `PricingAttributes`: a plan
+//! above the one currently active becomes active at once, and any other plan is
+//! staged for the start of the next billing cycle. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +134,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountPricingAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountPricingAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountPricingAttributes"))
+        // The account this applies to is the one the request was signed for, and the
+        // emulator serves one; `ctx` carries nothing else this needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutAccountPricingAttributes without the shared emulator state",
+            ));
+        };
+
+        // `Plan` is required and its value set is refused on the request boundary, so
+        // reaching here means the request names one of the plans the account may be
+        // on.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A read of the account reports settled state, so settle here too: this write
+        // lands on the same record a read would have reported, and the decision an
+        // earlier request was already owed is recorded before this one is judged.
+        store.settle(now);
+        let account = &mut store.account;
+
+        // "If there is already an ongoing account details update under review": the
+        // account's billing is not changed while that review is running.
+        if account.production_access_review_pending(now) {
+            return Err(PutAccountPricingAttributesErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        "There is already an ongoing account details update under review."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Where the requested plan lands — active now, or staged for the next cycle —
+        // is the account record's own rule, so `GetAccount` reports this write and a
+        // later one the same way.
+        account.request_pricing_plan(&input.plan);
+
+        // `PutAccountPricingAttributesResponse` carries no members: the plan that was
+        // applied is read back with `GetAccount` as `PricingAttributes`.
+        Ok(PutAccountPricingAttributesOutput {})
     }
 }
