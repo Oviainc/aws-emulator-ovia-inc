@@ -1396,19 +1396,6 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         self.searches.get(&search_key(workspace_name, search_id))
     }
 
-    /// The dashboard a create carrying `client_token` already minted, if any.
-    ///
-    /// What makes `CreateDashboard` idempotent on its token: a retry of a create
-    /// that carried one answers from the dashboard that create minted. Not
-    /// scoped to a project — a `dashboardId` identifies a dashboard across every
-    /// project, so the token of the create that minted one is enough to
-    /// recognise its retry.
-    pub fn dashboard_for_client_token(&self, client_token: &str) -> Option<&DashboardRecord> {
-        self.dashboards
-            .values()
-            .find(|record| record.matches_client_token(client_token))
-    }
-
     /// How many searches `workspace` holds — what the per-workspace bound reads.
     pub fn searches_in_workspace(&self, workspace_name: &str) -> usize {
         self.searches

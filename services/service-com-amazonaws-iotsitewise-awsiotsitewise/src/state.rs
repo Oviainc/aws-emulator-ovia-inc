@@ -4556,21 +4556,18 @@ pub struct DashboardRecord {
     pub definition: String,
     pub creation_date: SystemTime,
     pub last_update_date: SystemTime,
-    /// The `clientToken` the create that minted this dashboard carried, if any:
-    /// what a retry of that create is recognised by, so it answers from this
-    /// record instead of minting a second dashboard. Not the update's to
-    /// change.
+    /// The `clientToken` the create that minted this dashboard carried, if it
+    /// carried one, recorded as part of what that call asked for. Not the
+    /// update's to change. What recognises a RETRY of that create is the store's
+    /// registry of spent tokens
+    /// ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::idempotent_verdict`]),
+    /// which compares the request too: a token alone says only that some call
+    /// used it, not that this one repeats it.
     pub client_token: Option<String>,
     pub tags: HashMap<String, String>,
 }
 
 impl DashboardRecord {
-    /// The dashboard a create carrying `client_token` already minted, if this
-    /// store holds one — see [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dashboard_for_client_token`].
-    fn matches_client_token(&self, client_token: &str) -> bool {
-        self.client_token.as_deref() == Some(client_token)
-    }
-
     /// Replace the caller-owned members with what an update stated, and record
     /// that instant as the dashboard's last update.
     ///

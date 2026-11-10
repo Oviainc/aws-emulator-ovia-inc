@@ -24,10 +24,11 @@
 //!   stores nothing, while the same member AT its bound is accepted;
 //! * the store is bounded: with the dashboard map at its ceiling a create is the
 //!   modelled quota refusal, and it is accepted again as soon as there is room;
-//! * `clientToken` makes the create idempotent: a retry carrying the token of a
-//!   create this store already served answers from the dashboard THAT create
-//!   minted and writes nothing, while a create carrying no token, or a token no
-//!   create has spent, mints a dashboard of its own.
+//! * `clientToken` makes the create idempotent: a RETRY — the same request under
+//!   the token of a create this store already served — answers from the dashboard
+//!   THAT create minted and writes nothing, while a create carrying no token, a
+//!   token no create has spent, or a request differing from the call its token was
+//!   spent on mints a dashboard of its own.
 //!
 //! The HTTP harness (`call`, `router`, `error_code`, `is_modelled_id`) is the one
 //! the asset suite already has; this suite reuses it rather than growing a second.
@@ -849,30 +850,48 @@ async fn a_retry_under_a_spent_client_token_replays_the_create_and_writes_nothin
             stored_dashboards(&engine)
         );
 
-        // A retry whose other members differ is still that token's create: it
-        // answers the dashboard the token minted and writes nothing, so the
-        // stored dashboard keeps what the first call gave it.
+        // A request differing from the call the token was spent on repeats no
+        // call: it is served as the create it is, mints a dashboard of its own,
+        // and leaves the first one exactly as the first call left it.
         let mut differing = body.clone();
         differing["dashboardName"] = Value::String(format!("rewritten-{at}"));
         differing["dashboardDefinition"] = Value::String(definition_of(128));
-        let (status, replayed) = create_dashboard(&router, differing).await;
+        let (status, answered) = create_dashboard(&router, differing).await;
         assert_eq!(
             status, 201,
-            "case {:?}: a differing retry expected 201, got {status} {replayed}",
+            "case {:?}: a differing create under the spent token expected 201, got {status} \
+             {answered}",
             case.label
         );
-        assert_eq!(
-            replayed, created,
-            "case {:?}: a differing retry under a spent clientToken must still answer the \
-             dashboard that token minted, got {replayed}",
+        assert_ne!(
+            answered["dashboardId"], created["dashboardId"],
+            "case {:?}: a differing create must answer with its OWN dashboardId, got {answered} \
+             after {created}",
             case.label
         );
         assert_eq!(
             stored_dashboards(&engine),
-            held,
-            "case {:?}: a replayed create must write nothing, the store holds {}",
+            held + 1,
+            "case {:?}: a differing create must mint one dashboard of its own, the store holds {}",
             case.label,
             stored_dashboards(&engine)
+        );
+        let minted_id = answered["dashboardId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (status, minted) = describe_dashboard(&router, &minted_id).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the dashboard the differing create minted expected 200, got {status} \
+             {minted}",
+            case.label
+        );
+        assert_eq!(
+            minted["dashboardName"],
+            Value::String(format!("rewritten-{at}")),
+            "case {:?}: that dashboard must hold what THIS request asked for, got {minted}",
+            case.label
         );
         let (status, again) = describe_dashboard(&router, &id).await;
         assert_eq!(
@@ -882,7 +901,7 @@ async fn a_retry_under_a_spent_client_token_replays_the_create_and_writes_nothin
         );
         assert_eq!(
             again, described,
-            "case {:?}: a replayed create must leave the stored dashboard alone",
+            "case {:?}: a differing create must leave the first dashboard alone",
             case.label
         );
     }

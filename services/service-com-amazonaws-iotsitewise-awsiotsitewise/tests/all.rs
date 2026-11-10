@@ -32,6 +32,13 @@
 #[path = "all/asset_model_definition_validation.rs"]
 mod asset_model_definition_validation;
 
+// `create_dashboard_client_token` is declared HERE, beside the suite above, for
+// the reason the notes above give: the sorted list and the END of this file are
+// both stretches every concurrent iotsitewise change puts a declaration of its
+// own in. Fold it into the list once the churn settles.
+#[path = "all/create_dashboard_client_token.rs"]
+mod create_dashboard_client_token;
+
 // `asset_model_delete_interface_applications` is declared HERE, beside the
 // suites below, for the reason the notes above give. Fold it into the list once
 // the churn settles.

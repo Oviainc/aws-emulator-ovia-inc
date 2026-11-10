@@ -3,8 +3,10 @@
 //! @op CreateDashboard
 //! IMPLEMENTED: creates an IoT SiteWise Monitor dashboard from the request and
 //! persists it in this service's state; `DescribeDashboard` reads it back. A
-//! retry carrying the `clientToken` of a create this store already served
-//! answers from the dashboard THAT create minted and writes nothing.
+//! retry — the SAME request under the `clientToken` of a create this store
+//! already served — answers from the dashboard THAT create minted and writes
+//! nothing, while a request differing from it is the different create it is,
+//! whatever token it carries.
 //!
 //! ## Shape of an operation
 //!
@@ -203,21 +205,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // `clientToken` makes the create idempotent, as the member documents: "A
+        // `clientToken` makes this create idempotent, as the member documents: "A
         // unique case-sensitive identifier that you can provide to ensure the
-        // idempotency of the request." A dashboard is named by the id this call
-        // mints, so the token of the create that minted one is what its retry is
-        // recognised by: the retry answers from that dashboard and writes nothing,
-        // which is also why it is answered BEFORE the request is resolved against
-        // the store — a replay stays the answer the first call gave, whatever has
-        // changed since.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = store.dashboard_for_client_token(token) {
-                return Ok(CreateDashboardOutput {
-                    dashboard_id: existing.id.clone(),
-                    dashboard_arn: existing.arn.clone(),
-                });
+        // idempotency of the request." A RETRY carries the token of the call it
+        // repeats AND repeats that call's request, so it answers from the dashboard
+        // THAT call minted and writes nothing. It is the FIRST thing decided,
+        // because the call it repeats was already served — a replay stays the
+        // answer the first call gave, whatever has changed since.
+        //
+        // A token already spent on a DIFFERENT request repeats no call, and this
+        // create's answer carries nothing but the dashboard it minted: answering
+        // from the earlier call would hand this caller a dashboard it never asked
+        // for — under another name, with another definition, in whatever project
+        // that call named — and mint nothing for the request it actually sent. Such
+        // a request is therefore served as the fresh create it is, and the token's
+        // record moves to the dashboard it mints: the token stops a repeat from
+        // creating a second dashboard, it never turns another request into a
+        // success that created nothing. The same rule every other create in this
+        // crate applies, and the one `UpdateDashboard` applies to this resource.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.project_id,
+                &input.dashboard_name,
+                &input.dashboard_description,
+                &input.dashboard_definition,
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // One deleted since leaves the retry nothing to answer from, so that
+                // retry is served as the fresh create it now is.
+                if let Some(existing) = store.dashboards.get(&replayed) {
+                    return Ok(CreateDashboardOutput {
+                        dashboard_id: existing.id.clone(),
+                        dashboard_arn: existing.arn.clone(),
+                    });
+                }
             }
+            // A request that differs from the call its token was spent on is a
+            // different create, served below exactly like one carrying no token.
+            crate::state::TokenVerdict::Spent(_) | crate::state::TokenVerdict::Serve => {}
         }
 
         // A dashboard is created IN a project, so a `projectId` that resolves to no
@@ -271,8 +299,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             definition: input.dashboard_definition,
             creation_date: now,
             last_update_date: now,
-            // The token this create carried, which is what recognises its retry.
-            client_token: input.client_token,
+            // The token this create carried, recorded as part of what it asked for.
+            client_token: input.client_token.clone(),
             tags: input.tags.unwrap_or_default(),
         };
 
@@ -282,6 +310,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         store.dashboards.insert(record.id.clone(), record);
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &dashboard_id,
+            now,
+        );
 
         Ok(output)
     }

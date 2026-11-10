@@ -97,6 +97,7 @@ pub(crate) enum Kind {
     Project,
     AccessPolicy,
     Dataset,
+    Dashboard,
 }
 
 /// How many resources of `kind` the store holds — the only way to tell a retry
@@ -109,6 +110,7 @@ pub(crate) fn held(engine: &Arc<engine::InMemoryEngine>, kind: Kind) -> usize {
         Kind::Project => store.projects.len(),
         Kind::AccessPolicy => store.access_policies.len(),
         Kind::Dataset => store.datasets.len(),
+        Kind::Dashboard => store.dashboards.len(),
     }
 }
 
