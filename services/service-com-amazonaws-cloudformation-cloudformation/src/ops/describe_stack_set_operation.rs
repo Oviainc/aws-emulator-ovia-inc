@@ -238,8 +238,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        Ok(DescribeStackSetOperationOutput {
+        let answered = DescribeStackSetOperationOutput {
             stack_set_operation: Some(stack_set_operation(stack_set, operation)),
-        })
+        };
+        // The settle above is what moved this operation to its terminal status, and that
+        // change owes the account's default event bus an Operation Status Change
+        // ([`crate::state::stack_set_events`]). The store's lock is RELEASED first: the work
+        // that publishes takes it itself, and this service's lock is not reentrant.
+        drop(store);
+        crate::state::stack_set_events::publish_pending(
+            ::std::sync::Arc::clone(&self.engine),
+            ctx.callback().clone(),
+            region,
+        );
+        Ok(answered)
     }
 }

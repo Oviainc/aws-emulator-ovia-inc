@@ -528,6 +528,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // What this operation owes the account's default event bus: the Operation Status
+        // Change its START is, published here, and the conclusion the clock has made due by
+        // the time the settle below runs ([`crate::state::stack_set_events`]) — so a client
+        // gating on these events, which never polls, observes the deletion finish.
+        crate::state::stack_set_events::publish_and_settle(
+            &self.engine,
+            ctx.callback(),
+            crate::state::stack_set_events::SettlingOperation {
+                region,
+                stack_set_id,
+                operation_id: operation_id.clone(),
+            },
+        );
+
         Ok(DeleteStackInstancesOutput {
             operation_id: Some(operation_id),
         })

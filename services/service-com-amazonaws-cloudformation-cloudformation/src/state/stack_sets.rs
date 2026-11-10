@@ -834,6 +834,15 @@ pub struct StoredStackSet {
     /// is the order `StoredStackSet::operations_newest_first` reverses for the read.
     /// Bounded at [`MAX_OPERATIONS_PER_STACK_SET`].
     pub operations: Vec<StoredStackSetOperation>,
+    /// The status-change events this stack set's lifecycle owes the account's default event
+    /// bus and nothing has published yet, in the order the changes happened
+    /// ([`super::stack_set_events`]).
+    ///
+    /// A change is recorded under this store's lock and published with it released, so the
+    /// event waits here in between; claiming it is taking it, so each is published exactly
+    /// once. Bounded at [`super::stack_set_events::MAX_PENDING_EVENTS`], oldest reclaimed
+    /// first.
+    pub pending_events: Vec<super::stack_set_events::StackSetEvent>,
 }
 
 impl StoredStackSet {
@@ -863,7 +872,39 @@ impl StoredStackSet {
             client_request_token: None,
             instances: Vec::new(),
             operations: Vec::new(),
+            pending_events: Vec::new(),
         }
+    }
+
+    /// Queue the event `change` reports about this stack set, as of `at`
+    /// ([`super::stack_set_events`]).
+    ///
+    /// Bounded at [`super::stack_set_events::MAX_PENDING_EVENTS`]: a queue nothing drains —
+    /// an emulator with no EventBridge mounted — reclaims its oldest entries rather than
+    /// growing without limit.
+    pub fn queue_event(&mut self, change: super::stack_set_events::StackSetChange, at: SystemTime) {
+        self.pending_events
+            .push(super::stack_set_events::StackSetEvent {
+                region: self.region.clone(),
+                stack_set_arn: self.stack_set_arn.clone(),
+                change,
+                at,
+            });
+        if self.pending_events.len() > super::stack_set_events::MAX_PENDING_EVENTS {
+            let excess = self.pending_events.len() - super::stack_set_events::MAX_PENDING_EVENTS;
+            self.pending_events.drain(..excess);
+        }
+    }
+
+    /// Queue the event the `StackSetStatus` this record NOW carries owes, as of `at`: what
+    /// the call that created this stack set, or the one that deleted it, has just written
+    /// ([`status`]).
+    pub fn note_status_change(&mut self, at: SystemTime) {
+        let status = self.status.clone();
+        self.queue_event(
+            super::stack_set_events::StackSetChange::StackSet { status },
+            at,
+        );
     }
 
     /// The operation this stack set holds under `operation_id`, if it holds one.
@@ -1002,6 +1043,15 @@ impl StoredStackSet {
     ///
     /// Bounded at [`MAX_OPERATIONS_PER_STACK_SET`], oldest reclaimed first.
     pub fn record_operation(&mut self, operation: StoredStackSetOperation) {
+        // The operation STARTING is a status change of its own, published the way its
+        // conclusion is ([`super::stack_set_events`]): recorded as of the instant the
+        // operation was initiated, which is before the conclusion the clock owes it.
+        let started = super::stack_set_events::StackSetChange::Operation {
+            operation_id: operation.operation_id.clone(),
+            action: operation.action.clone(),
+            status: operation.status.clone(),
+        };
+        let creation = operation.creation;
         match self
             .operations
             .iter_mut()
@@ -1010,6 +1060,7 @@ impl StoredStackSet {
             Some(held) => *held = operation,
             None => self.operations.push(operation),
         }
+        self.queue_event(started, creation);
         if self.operations.len() > MAX_OPERATIONS_PER_STACK_SET {
             let excess = self.operations.len() - MAX_OPERATIONS_PER_STACK_SET;
             self.operations.drain(..excess);
@@ -1176,6 +1227,40 @@ impl StoredStackSet {
                     instance.last_operation_id != concluded.operation_id
                         || instance.detailed_status != detailed_status::SUCCEEDED
                 });
+            }
+            // What this conclusion owes the account's default event bus
+            // ([`super::stack_set_events`]): the operation's own terminal status, and the
+            // status every instance it acted on was left in — each stamped with the instant
+            // the conclusion fell due, which is when the changes happened.
+            let at = concluded.end.unwrap_or(now);
+            let mut owed: Vec<super::stack_set_events::StackSetChange> = Vec::new();
+            // A DETECTION reports what an instance has DRIFTED to rather than moving its
+            // deployment status, so its conclusion changes no instance status and publishes
+            // no instance event; and an instance a deletion removed above has no record
+            // left to report a status off.
+            if concluded.action != operation_action::DETECT_DRIFT {
+                for instance in &self.instances {
+                    if instance.last_operation_id != concluded.operation_id {
+                        continue;
+                    }
+                    let Some(stack_id) = instance.stack_id.clone() else {
+                        continue;
+                    };
+                    owed.push(super::stack_set_events::StackSetChange::StackInstance {
+                        stack_id,
+                        status: instance.status.clone(),
+                        detailed_status: instance.detailed_status.clone(),
+                        status_reason: instance.status_reason.clone(),
+                    });
+                }
+            }
+            owed.push(super::stack_set_events::StackSetChange::Operation {
+                operation_id: concluded.operation_id.clone(),
+                action: concluded.action.clone(),
+                status: concluded.status.clone(),
+            });
+            for change in owed {
+                self.queue_event(change, at);
             }
         }
     }

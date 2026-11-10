@@ -181,7 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds no record for is the modelled `OperationNotFoundException`, and an operation
         // that has already ended is the modelled `InvalidOperationException` — neither is a
         // stop that silently did nothing.
-        {
+        //
+        // The ACTION of the operation this call moved to STOPPING, which is what the status
+        // change it publishes states ([`crate::state::stack_set_events`]). Every path that
+        // writes nothing answers before this binding, so a stop that wrote nothing publishes
+        // nothing either.
+        let stopping = {
             let Some(operation) = stack_set
                 .operations
                 .iter_mut()
@@ -238,7 +243,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             operation.status = operation_status::STOPPING.to_string();
-        }
+            operation.action.clone()
+        };
 
         // "StackSets will cancel all the unstarted stack instance deployments and wait for
         // those are in-progress to complete": a deployment of this operation that had not
@@ -253,6 +259,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 instance.detailed_status = detailed_status::CANCELLED.to_string();
             }
         }
+
+        // "STOPPING: The operation is in the process of stopping, at user request" is a
+        // status change of the operation, so it is published onto the account's default
+        // event bus the way every other change of one is
+        // ([`crate::state::stack_set_events`]); the STOPPED conclusion the clock now owes it
+        // is published by the settle below.
+        stack_set.queue_event(
+            crate::state::stack_set_events::StackSetChange::Operation {
+                operation_id: input.operation_id.clone(),
+                action: stopping,
+                status: operation_status::STOPPING.to_string(),
+            },
+            now,
+        );
+        let stack_set_id = stack_set.stack_set_id.clone();
+        // The store's lock is RELEASED before the publication and the settle below: both
+        // take it themselves, and this service's lock is not reentrant.
+        drop(store);
+        crate::state::stack_set_events::publish_and_settle(
+            &self.engine,
+            ctx.callback(),
+            crate::state::stack_set_events::SettlingOperation {
+                region,
+                stack_set_id,
+                operation_id: input.operation_id.clone(),
+            },
+        );
 
         // The model gives this operation no output members: the stop is reported by the
         // status the operation now holds, which `DescribeStackSetOperation` reads back.

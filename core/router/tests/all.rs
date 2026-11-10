@@ -17,6 +17,11 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records: the
+// StackSet status-change events a stack set's lifecycle publishes onto the default event
+// bus, which span CloudFormation, EventBridge, Amazon SQS and Systems Manager at once.
+#[path = "all/cloudformation_stackset_status_change_events.rs"]
+mod cloudformation_stackset_status_change_events;
 // Declared here, in this same head region, for the reason the entry above records: what a
 // CodePipeline execution publishes onto the default event bus, and which rule's SQS target
 // receives it, spans four crates at once (CodePipeline, Amazon S3, EventBridge, Amazon SQS).
@@ -36,7 +41,6 @@ mod migrationhub_signing_name_routing;
 // test target can mount both and ask which of them claims a request.
 #[path = "all/agent_registry_signing_name_routing.rs"]
 mod agent_registry_signing_name_routing;
-// Declared here, in this same head region, for the reason the entry above records: the
 // account's verified sending identity, which one SES surface records and the other
 // discovers.
 #[path = "all/ses_v1_discovers_a_verified_sending_identity.rs"]
@@ -622,9 +626,6 @@ mod sfn_parallel_branch_cancellation;
 mod sfn_athena_run_a_job_sync;
 #[path = "all/cloudformation_sfn_fifo_queue_stack.rs"]
 mod cloudformation_sfn_fifo_queue_stack;
-// Declared beside the other Step Functions suites, for the reason the lines above give.
-#[path = "all/sfn_management_events.rs"]
-mod sfn_management_events;
 // Declared HERE, in the sorted list at its own name, rather than at the head or the tail
 // of this file: both of those are where every concurrently landing suite puts its line, so
 // a declaration there conflicts with all of them, while these neighbouring lines are
@@ -1303,6 +1304,8 @@ mod cloudformation_stack_update_redirects_a_schedule;
 // ask, since the ARN has to cross from one service to the other.
 #[path = "all/efs_access_point_mounted_by_lambda.rs"]
 mod efs_access_point_mounted_by_lambda;
+#[path = "all/sfn_management_events.rs"]
+mod sfn_management_events;
 // Declared here, in this same head region, for the reason the entry above records: the tags
 // a bucket a stack created carries, which CloudFormation stamps and Amazon S3 reports.
 #[path = "all/cloudformation_stamps_s3_bucket_stack_provenance.rs"]

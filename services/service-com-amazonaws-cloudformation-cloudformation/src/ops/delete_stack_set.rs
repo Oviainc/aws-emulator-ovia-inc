@@ -160,12 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // emulator holds one administrator account's StackSets, so either value writes the
         // same store, and the operation models no error to refuse one with.
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Every status transition the clock had already made due is materialised before this
         // call decides anything: an operation whose conclusion was owed is concluded, so a
         // StackSet is not told an operation is in progress on the strength of a record the
         // clock had already retired.
-        store.settle(::std::time::SystemTime::now());
+        store.settle(now);
 
         // "The name or unique ID of the StackSet that you're deleting." The operation models
         // NO not-found failure — `OperationInProgressException` and
@@ -210,6 +211,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // out of everything that RESOLVES one, since a deleted StackSet is no longer
         // addressable.
         stack_set.status = status::DELETED.to_string();
+        // That status is a change of the stack set, so it is published onto the account's
+        // default event bus the way every other change of one is
+        // ([`crate::state::stack_set_events`]), stamped with the instant this call wrote it.
+        stack_set.note_status_change(now);
+        // The store's lock is RELEASED before the publication below: the work that publishes
+        // takes it itself, and this service's lock is not reentrant.
+        drop(store);
+        crate::state::stack_set_events::publish_pending(
+            ::std::sync::Arc::clone(&self.engine),
+            ctx.callback().clone(),
+            region,
+        );
 
         // `DeleteStackSetOutput` models no member: the deletion is immediate, so there is no
         // StackSet operation for a caller to monitor.

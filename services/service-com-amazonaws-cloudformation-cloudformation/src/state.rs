@@ -433,6 +433,11 @@ pub mod organizations_access;
 /// `UpdateStackSet` and `UpdateStackInstances` share.
 pub mod stack_set_rollout;
 
+/// The STACK SET status-change events this service publishes onto the account's default
+/// EventBridge bus: one per change of a stack set, of a stack-set operation and of a stack
+/// instance ([`stack_set_events`]).
+pub mod stack_set_events;
+
 /// The rule a CALLER's `Tags` are held to: the tag keys AWS reserves for itself, which no
 /// operation that takes a `Tags` list admits from a request.
 pub mod stack_tags;

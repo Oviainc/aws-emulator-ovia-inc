@@ -14,6 +14,10 @@ engine = { workspace = true }
 # `state::provisioner`.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# Publishes this service's own StackSet status-change events onto the account's default
+# EventBridge bus, over the in-process callback into this same emulator (no network client
+# feature: the transport is the emulator's own). See `state::stack_set_events`.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

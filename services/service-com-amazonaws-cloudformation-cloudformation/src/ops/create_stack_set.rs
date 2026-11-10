@@ -525,9 +525,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let stack_set_id = stack_set.stack_set_id.clone();
+        // "A stack set that CreateStackSet has created is ACTIVE": that status is a change
+        // of the stack set, so it is published onto the account's default event bus the way
+        // every other change of one is ([`crate::state::stack_set_events`]), stamped with
+        // the instant this call wrote it.
+        stack_set.note_status_change(now);
         // The ONE way a StackSet enters the store, so this write and the reads over it
         // cannot disagree about what the store holds.
         store.record_stack_set(stack_set);
+        // The store's lock is RELEASED before the publication below: the work that publishes
+        // takes it itself, and this service's lock is not reentrant.
+        drop(store);
+        crate::state::stack_set_events::publish_pending(
+            ::std::sync::Arc::clone(&self.engine),
+            ctx.callback().clone(),
+            region,
+        );
 
         Ok(CreateStackSetOutput {
             stack_set_id: Some(stack_set_id),
