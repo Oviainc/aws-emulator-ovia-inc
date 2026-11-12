@@ -1,3 +1,5 @@
+> **Ovia Inc fork** — We maintain this fork of [aws/aws-emulator](https://github.com/aws/aws-emulator). Ovia Inc modifications: documentation and evaluation notes are added at the top of this README over time; the code and content are otherwise unchanged from the fork point. Upstream credit: AWS. License: CC0-1.0 (see LICENSE).
+
 # AWS Emulator README
 
 AWS Emulator is a local emulator of the AWS APIs. You use it to test your software without calling AWS, on your own machine, on a development server, or in continuous integration (CI). You don’t need an AWS account. Your requests go to the emulator, not to AWS. So you work with emulated resources instead of AWS resources. AWS Emulator has no additional service fee. You pay only for AWS resources when you deploy on AWS.
